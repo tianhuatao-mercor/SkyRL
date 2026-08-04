@@ -311,6 +311,10 @@ class BasePPOExp:
                 # external tracker run so a rejected provider session does not
                 # leave behind an empty W&B run.
                 tracker = self.get_tracker()
+                tracker.set_metrics_provider(
+                    runtime.usage_metrics,
+                    summary_provider=runtime.usage_summary,
+                )
                 inference_engine_client = FireworksInferenceClient(
                     runtime=runtime,
                     default_sampling_params=get_sampling_params_for_backend(

@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 
 from skyrl.backends.fireworks.runtime import FireworksRuntime
@@ -42,6 +44,43 @@ def test_fireworks_provider_preflight_runs_before_tracker(monkeypatch, tmp_path)
         exp._setup_trainer()
 
     assert not tracker_started
+
+
+def test_fireworks_runtime_usage_is_registered_with_tracker(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.strategy = "fireworks"
+    cfg.trainer.fireworks.base_model = "accounts/fireworks/models/test"
+    cfg.trainer.fireworks.training_shape_id = "accounts/fireworks/trainingShapes/test"
+    cfg.trainer.fireworks.trainer_job_id = "skyrl-smoke-test-trainer"
+    cfg.trainer.fireworks.deployment_id = "skyrl-smoke-test-rollout"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.export_path = str(tmp_path / "exports")
+    cfg.trainer.ckpt_path = str(tmp_path / "checkpoints")
+
+    exp = object.__new__(BasePPOExp)
+    exp.cfg = cfg
+    exp.tokenizer = object()
+    exp.train_dataset = object()
+    exp.eval_dataset = object()
+    exp._fireworks_runtime = None
+
+    runtime = MagicMock()
+    tracker = MagicMock()
+    trainer = MagicMock()
+    monkeypatch.setattr(FireworksRuntime, "connect", lambda **_kwargs: runtime)
+    monkeypatch.setattr(exp, "get_tracker", lambda: tracker)
+    monkeypatch.setattr(exp, "get_generator", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(exp, "get_trainer", lambda **_kwargs: trainer)
+    monkeypatch.setattr(exp, "get_trajectory_logger", lambda: object())
+
+    exp._setup_trainer()
+
+    tracker.set_metrics_provider.assert_called_once_with(
+        runtime.usage_metrics,
+        summary_provider=runtime.usage_summary,
+    )
 
 
 def test_direct_entrypoint_selects_fully_async_scheduler() -> None:
