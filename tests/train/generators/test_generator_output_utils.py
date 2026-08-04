@@ -30,6 +30,7 @@ def test_generator_output_concatenation():
         "rollout_metrics",
         "rollout_logprobs",
         "rollout_expert_indices",
+        "sampler_versions",
         # optional but present in the signature
         "trajectory_ids",
         "trajectory_generation_times",
@@ -71,7 +72,12 @@ def test_generator_output_concatenation():
     assert concatenated_output["rewards"] == [1.0, 2.0, 2.0, 3.0]
     assert concatenated_output["loss_masks"] == [[1, 1], [1, 1], [1, 1, 1], [1]]
     assert concatenated_output["stop_reasons"] == ["stop", "stop", "stop", "stop"]
-    assert concatenated_output["rollout_logprobs"] == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6, 0.7], [0.8]]
+    assert concatenated_output["rollout_logprobs"] == [
+        [0.1, 0.2],
+        [0.3, 0.4],
+        [0.5, 0.6, 0.7],
+        [0.8],
+    ]
 
     # Validate rollout metrics
     expected_rollout_metrics = {
@@ -100,7 +106,10 @@ def test_time_split_rollout_metrics():
         responses=[[1, 2]] * 4,
         rewards=[1.0] * 4,
         trajectory_completion_times=[10.0, 20.0, 30.0, 40.0],
-        trajectory_time_splits={"llm": [4.0, 8.0, 12.0, 16.0], "env": [5.0, 10.0, 15.0, 20.0]},
+        trajectory_time_splits={
+            "llm": [4.0, 8.0, 12.0, 16.0],
+            "env": [5.0, 10.0, 15.0, 20.0],
+        },
     )
     assert metrics["generate/trajectory_time_llm_mean"] == 10.0
     assert metrics["generate/trajectory_time_llm_p90"] == pytest.approx(np.percentile([4.0, 8.0, 12.0, 16.0], 90))
@@ -128,7 +137,10 @@ def test_time_splits_concatenation():
     out2 = make_output([30.0, 40.0], {"llm": [12.0, 16.0], "env": [15.0, 20.0]})
     concatenated = concatenate_generator_outputs([out1, out2])
 
-    assert concatenated["trajectory_time_splits"] == {"llm": [4.0, 8.0, 12.0, 16.0], "env": [5.0, 10.0, 15.0, 20.0]}
+    assert concatenated["trajectory_time_splits"] == {
+        "llm": [4.0, 8.0, 12.0, 16.0],
+        "env": [5.0, 10.0, 15.0, 20.0],
+    }
     # Aggregates are recomputed over the combined sample, not combined from per-group aggregates.
     concat_metrics = concatenated["rollout_metrics"]
     assert concat_metrics["generate/trajectory_time_llm_p90"] == pytest.approx(
@@ -159,7 +171,12 @@ def test_time_splits_concatenation_partial_is_none():
         concatenated = concatenate_generator_outputs(outputs)
         assert concatenated["trajectory_time_splits"] is None
         # generation_times has its own None-ness, so it still concatenates fully.
-        assert sorted(concatenated["trajectory_generation_times"]) == [10.0, 20.0, 30.0, 40.0]
+        assert sorted(concatenated["trajectory_generation_times"]) == [
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+        ]
 
 
 def test_get_metrics_from_generator_output():
@@ -628,8 +645,20 @@ class TestMergeStepwiseOutput:
             "prompt_token_ids": [
                 [1],  # turn 1
                 [1, 2, 3],  # turn 2: prompt[0]+resp[0]=[1,2] is prefix of [1,2,3] ✓
-                [1, 23, 4, 5],  # turn 3: prompt[1]+resp[1]=[1,2,3,4] is NOT prefix of [1,23,4,5] ✗
-                [1, 23, 4, 5, 6, 7],  # turn 4: prompt[2]+resp[2]=[1,23,4,5,6] is prefix ✓
+                [
+                    1,
+                    23,
+                    4,
+                    5,
+                ],  # turn 3: prompt[1]+resp[1]=[1,2,3,4] is NOT prefix of [1,23,4,5] ✗
+                [
+                    1,
+                    23,
+                    4,
+                    5,
+                    6,
+                    7,
+                ],  # turn 4: prompt[2]+resp[2]=[1,23,4,5,6] is prefix ✓
             ],
             "response_ids": [
                 [2],  # turn 1

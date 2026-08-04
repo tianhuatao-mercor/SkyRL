@@ -731,6 +731,36 @@ class TestMaxSeqLenValidation:
         validate_cfg(cfg)
 
 
+class TestOffPolicyCorrectionValidation:
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda correction: setattr(correction, "outlier_token_is_threshold_low", 0.1),
+            lambda correction: setattr(correction, "outlier_token_is_threshold_high", 10.0),
+            lambda correction: (
+                setattr(correction, "token_mask_is_threshold_low", 0.1),
+                setattr(correction, "token_mask_is_threshold_high", 10.0),
+            ),
+        ],
+    )
+    def test_all_active_modes_enable_rollout_logprobs(self, mutate) -> None:
+        cfg = _make_validated_test_config()
+        cfg.generator.sampling_params.logprobs = None
+        mutate(cfg.trainer.algorithm.off_policy_correction)
+
+        validate_cfg(cfg)
+
+        assert cfg.generator.sampling_params.logprobs == 1
+
+    def test_outlier_token_correction_rejects_incompatible_loss(self) -> None:
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.policy_loss_type = "clip_cov"
+        cfg.trainer.algorithm.off_policy_correction.outlier_token_is_threshold_low = 0.1
+
+        with pytest.raises(NotImplementedError, match="off_policy_correction"):
+            validate_cfg(cfg)
+
+
 class TestTorchProfilerConfigValidation:
     """TorchProfilerConfig validation coverage."""
 

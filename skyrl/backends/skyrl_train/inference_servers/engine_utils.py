@@ -52,7 +52,9 @@ def build_engine_runtime_env(
     return {"env_vars": env_vars}
 
 
-def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig]) -> Dict[str, Any]:
+def get_vllm_sampling_params(
+    sampling_params: Union[SamplingParams, DictConfig],
+) -> Dict[str, Any]:
     stop_val = sampling_params.stop
     vllm_sampling_params = {
         "min_tokens": 1,
@@ -83,7 +85,9 @@ def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig])
 
 
 def get_sampling_params_for_backend(backend: str, sampling_params: Union[SamplingParams, DictConfig]) -> Dict[str, Any]:
-    if backend == "vllm":
+    if backend in ("vllm", "fireworks", "tinker"):
+        # Hosted clients consume this normalized OpenAI/vLLM-shaped dictionary
+        # and map the supported subset to tinker.SamplingParams.
         return get_vllm_sampling_params(sampling_params)
     else:
         raise ValueError(f"Unsupported generation backend: {backend}")

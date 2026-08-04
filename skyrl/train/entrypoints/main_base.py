@@ -14,6 +14,9 @@ from loguru import logger
 from ray.util.placement_group import placement_group
 
 from skyrl.backends.skyrl_train.inference_servers.base import InferenceEngineInterface
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
+    get_sampling_params_for_backend,
+)
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
@@ -64,6 +67,8 @@ class BasePPOExp:
         self._prefill_server_groups = None
         self._decode_server_groups = None
         self._inference_router = None
+        self._fireworks_runtime = None
+        self._tinker_runtime = None
 
     @staticmethod
     def get_cfg_as_str(cfg: SkyRLTrainConfig) -> str:
@@ -271,13 +276,122 @@ class BasePPOExp:
                 PolicyWorker,
                 RefWorker,
             )
+        elif self.cfg.trainer.strategy in ("fireworks", "tinker"):
+            PolicyWorker = CriticWorker = RefWorker = None
         else:
             raise ValueError(f"Unknown strategy type: {self.cfg.trainer.strategy}")
 
-        # NOTE (sumanthrh): Instantiate tracker before trainer init.
+        if self.cfg.trainer.strategy == "fireworks":
+            from skyrl.backends.fireworks.inference import FireworksInferenceClient
+            from skyrl.backends.fireworks.runtime import FireworksRuntime
+            from skyrl.backends.fireworks.training_backend import (
+                FireworksPolicyDispatch,
+            )
+
+            base_model = self.cfg.trainer.fireworks.base_model
+            if not base_model:
+                raise ValueError("trainer.fireworks.base_model is required")
+            runtime = FireworksRuntime.connect(
+                config=self.cfg.trainer.fireworks,
+                tokenizer=self.tokenizer,
+                tokenizer_model=self.cfg.trainer.policy.model.path,
+                lora_rank=self.cfg.trainer.policy.model.lora.rank,
+                lora_alpha=self.cfg.trainer.policy.model.lora.alpha,
+                learning_rate=self.cfg.trainer.policy.optimizer_config.lr,
+            )
+            self._fireworks_runtime = runtime
+            logger.info(
+                "Connected dedicated Fireworks runtime (trainer_job_id={}, deployment_id={})",
+                runtime.trainer_job_id,
+                runtime.deployment_id,
+            )
+            try:
+                # Opening the hosted runtime is the Fireworks entitlement and
+                # model-availability preflight. Do it before starting an
+                # external tracker run so a rejected provider session does not
+                # leave behind an empty W&B run.
+                tracker = self.get_tracker()
+                inference_engine_client = FireworksInferenceClient(
+                    runtime=runtime,
+                    default_sampling_params=get_sampling_params_for_backend(
+                        "fireworks", self.cfg.generator.sampling_params
+                    ),
+                )
+                generator = self.get_generator(self.cfg, self.tokenizer, inference_engine_client)
+                trainer = self.get_trainer(
+                    cfg=self.cfg,
+                    tracker=tracker,
+                    tokenizer=self.tokenizer,
+                    train_dataset=self.train_dataset,
+                    eval_dataset=self.eval_dataset,
+                    inference_engine_client=inference_engine_client,
+                    generator=generator,
+                    colocate_pg=None,
+                )
+                trainer.trajectory_logger = self.get_trajectory_logger()
+                trainer.dispatch = FireworksPolicyDispatch(self.cfg, runtime)
+                self.trainer = trainer
+                return trainer
+            except Exception:
+                asyncio.run(runtime.close())
+                self._fireworks_runtime = None
+                raise
+
+        if self.cfg.trainer.strategy == "tinker":
+            from skyrl.backends.tinker.inference import TinkerInferenceClient
+            from skyrl.backends.tinker.runtime import TinkerRuntime
+            from skyrl.backends.tinker.training_backend import TinkerPolicyDispatch
+
+            runtime = TinkerRuntime.connect(
+                config=self.cfg.trainer.tinker,
+                tokenizer=self.tokenizer,
+                lora_rank=self.cfg.trainer.policy.model.lora.rank,
+                run_name=self.cfg.trainer.run_name,
+            )
+            self._tinker_runtime = runtime
+            logger.info(
+                "Connected hosted Tinker runtime (base_model={}, project_id={})",
+                runtime.model_name,
+                self.cfg.trainer.tinker.project_id or "<default>",
+            )
+            try:
+                # Opening the hosted training session is the entitlement,
+                # model-availability, and billing preflight. Do it before an
+                # external tracker run.
+                tracker = self.get_tracker()
+                tracker.set_metrics_provider(
+                    runtime.usage_metrics,
+                    summary_provider=runtime.usage_summary,
+                )
+                inference_engine_client = TinkerInferenceClient(
+                    runtime=runtime,
+                    default_sampling_params=get_sampling_params_for_backend(
+                        "tinker", self.cfg.generator.sampling_params
+                    ),
+                )
+                generator = self.get_generator(self.cfg, self.tokenizer, inference_engine_client)
+                trainer = self.get_trainer(
+                    cfg=self.cfg,
+                    tracker=tracker,
+                    tokenizer=self.tokenizer,
+                    train_dataset=self.train_dataset,
+                    eval_dataset=self.eval_dataset,
+                    inference_engine_client=inference_engine_client,
+                    generator=generator,
+                    colocate_pg=None,
+                )
+                trainer.trajectory_logger = self.get_trajectory_logger()
+                trainer.dispatch = TinkerPolicyDispatch(self.cfg, runtime)
+                self.trainer = trainer
+                return trainer
+            except Exception:
+                asyncio.run(runtime.close())
+                self._tinker_runtime = None
+                raise
+
+        # NOTE (sumanthrh): Instantiate tracker before local trainer init.
         # We have custom validation before this step to give better error messages.
         tracker = self.get_tracker()
-
         inference_engine_client = self.get_inference_client()
 
         generator: GeneratorInterface = self.get_generator(self.cfg, self.tokenizer, inference_engine_client)
@@ -317,8 +431,21 @@ class BasePPOExp:
         self.trainer = None
         try:
             trainer = self._setup_trainer()
+
+            async def _train_and_close_remote_runtime():
+                try:
+                    await trainer.train()
+                finally:
+                    # Fireworks owns asyncio synchronization primitives used by
+                    # sampling and publication. Close it on the same loop that
+                    # ran training rather than constructing a second loop.
+                    if self._fireworks_runtime is not None or self._tinker_runtime is not None:
+                        await trainer.inference_engine_client.teardown()
+                        self._fireworks_runtime = None
+                        self._tinker_runtime = None
+
             # Start the training loop
-            asyncio.run(trainer.train())
+            asyncio.run(_train_and_close_remote_runtime())
         except Exception as e:
             # OOMs raised inside actor init (e.g. FSDPPolicyWorkerBase.init_model)
             # surface here as RayTaskError. Without this they only land in Ray
@@ -333,6 +460,11 @@ class BasePPOExp:
             else:
                 logger.error(f"Setup failed before tracker was initialized:\n{e}")
             raise
+        finally:
+            if self._fireworks_runtime is not None:
+                asyncio.run(self._fireworks_runtime.close())
+            if self._tinker_runtime is not None:
+                asyncio.run(self._tinker_runtime.close())
 
 
 @ray.remote(num_cpus=1)

@@ -689,7 +689,6 @@ class RefConfig(BaseConfig):
 
 @dataclass
 class KLCtrlConfig(BaseConfig):
-
     type: str = "fixed"
     """``"fixed"`` or ``"adaptive"``."""
     kl_target: float = 0.1
@@ -747,7 +746,6 @@ class KLCovConfig(BaseConfig):
 
 @dataclass
 class CISPOConfig(BaseConfig):
-
     cispo_eps_clip_low: float = 1.0
     """Offset for lower bound of importance sampling ratio clipping (as opposed to PPO token update clipping).
     
@@ -1279,7 +1277,8 @@ class GeneratorConfig(BaseConfig):
 
         if self.eval_sampling_params is None:
             self.eval_sampling_params = SamplingParams(
-                temperature=0.0, max_generate_length=self.sampling_params.max_generate_length
+                temperature=0.0,
+                max_generate_length=self.sampling_params.max_generate_length,
             )
 
 
@@ -1327,6 +1326,121 @@ class MTPConfig(BaseConfig):
 
 
 @dataclass
+class FireworksConfig(BaseConfig):
+    """Dedicated Fireworks Training API settings.
+
+    The API credential is intentionally absent: it is read from
+    ``FIREWORKS_API_KEY`` at runtime so it cannot leak through config logging or
+    checkpoint metadata.
+    """
+
+    base_url: str = "https://api.fireworks.ai"
+    base_model: Optional[str] = None
+    """Fireworks resource name, for example ``accounts/fireworks/models/qwen3p6-27b``."""
+    max_seq_len: Optional[int] = None
+    """Maximum submitted model-input length."""
+    request_timeout_s: int = 3600
+    sampling_timeout_s: int = 600
+    trainer_timeout_s: int = 900
+    deployment_timeout_s: int = 900
+    hotload_timeout_s: int = 600
+    adam_eps: float = 1e-8
+    snapshot_prefix: str = "skyrl"
+    """Prefix for unique in-session sampler snapshot names. It must not contain secrets."""
+    training_shape_id: Optional[str] = None
+    """Training shape resource name."""
+    trainer_job_id: Optional[str] = None
+    """Stable trainer ID, used for audit and failure cleanup."""
+    trainer_replica_count: int = 1
+    """Number of data-parallel HSDP trainer replicas for dedicated training.
+
+    The training shape owns each replica's topology. Increasing this value
+    replicates that shape; it does not change the shape's model-parallel or
+    pipeline-parallel topology.
+    """
+    deployment_id: Optional[str] = None
+    """Stable rollout deployment ID."""
+    replica_count: int = 1
+    """Number of rollout replicas managed by Fireworks."""
+    cleanup_on_exit: bool = True
+    cleanup_deployment_on_close: str = "delete"
+    """``"delete"`` or ``"scale_to_zero"`` for the SDK-created deployment."""
+    billing_gpu_type: Optional[str] = None
+    """GPU label used only for cost reporting, for example ``"B200"``."""
+    billing_trainer_gpus_per_replica: Optional[int] = None
+    """GPUs in one training-shape replica, used only for cost reporting."""
+    billing_rollout_gpus_per_replica: Optional[int] = None
+    """GPUs in one rollout replica, used only for cost reporting."""
+    billing_gpu_price_per_hour_usd: Optional[float] = None
+    """Configured per-GPU hourly rate used for the local Fireworks cost estimate."""
+
+
+@dataclass
+class TinkerTrainingConfig(BaseConfig):
+    """Hosted Tinker training and sampling settings.
+
+    ``TINKER_API_KEY`` is read from the environment so it cannot appear in
+    resolved configs, logs, or checkpoints.
+    """
+
+    base_url: Optional[str] = None
+    """Optional Tinker API override. ``None`` uses the SDK default."""
+    base_model: Optional[str] = None
+    """Tinker model name, for example ``Qwen/Qwen3.5-4B``."""
+    project_id: Optional[str] = None
+    """Optional Tinker project. ``None`` uses the environment/account default."""
+    max_seq_len: Optional[int] = None
+    """Maximum submitted model-input length."""
+    request_timeout_s: int = 3600
+    sampling_timeout_s: int = 600
+    close_timeout_s: int = 600
+    service_bootstrap_max_attempts: int = 3
+    """Maximum ServiceClient construction attempts, including the first.
+
+    Only SDK connection failures during the initial read-only bootstrap are
+    retried. Training-client creation and later provider operations are never
+    retried by this setting.
+    """
+    service_bootstrap_retry_backoff_s: float = 5.0
+    """Initial bootstrap retry delay; subsequent delays double up to 30 seconds."""
+    adam_eps: float = 1e-8
+    seed: Optional[int] = None
+    train_mlp: bool = True
+    train_attn: bool = True
+    train_unembed: bool = True
+    checkpoint_ttl_seconds: Optional[int] = 604800
+    """Persistent checkpoint lifetime. ``None`` requests no expiry."""
+    publish_sampler_model_path: bool = False
+    """Publish each sampler as a named model path for out-of-process workers.
+
+    Normal SkyRL generators sample through the in-process ``SamplingClient``
+    and should leave this disabled. External workers can enable it and create
+    clients from the immutable path captured for each trajectory.
+    """
+    sampler_checkpoint_ttl_seconds: Optional[int] = 86400
+    """Lifetime of named sampler paths used by out-of-process workers."""
+    prefill_price_per_million_tokens: Optional[float] = None
+    """Uncached sampling-prefill price used for local cost estimates."""
+    cached_prefill_price_per_million_tokens: Optional[float] = None
+    """Cached sampling-prefill price used for local cost estimates.
+
+    When omitted, the runtime applies Tinker's standard 80% cache discount to
+    ``prefill_price_per_million_tokens``.
+    """
+    sample_price_per_million_tokens: Optional[float] = None
+    """Sampled-output price used for local cost estimates."""
+    train_price_per_million_tokens: Optional[float] = None
+    """Training-token price used for local cost estimates."""
+    max_estimated_cost_usd: Optional[float] = None
+    """Abort after recorded provider usage exceeds this local cost estimate.
+
+    This is a best-effort watchdog rather than a provider billing limit:
+    already-running sampling calls can finish before SkyRL observes their
+    usage. All token prices must be configured when the watchdog is enabled.
+    """
+
+
+@dataclass
 class TrainerConfig(BaseConfig):
     placement: PlacementConfig = field(default_factory=PlacementConfig)
     use_expandable_segments: bool = True
@@ -1350,6 +1464,8 @@ class TrainerConfig(BaseConfig):
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     mtp: MTPConfig = field(default_factory=MTPConfig)
     fully_async: FullyAsyncConfig = field(default_factory=FullyAsyncConfig)
+    fireworks: FireworksConfig = field(default_factory=FireworksConfig)
+    tinker: TinkerTrainingConfig = field(default_factory=TinkerTrainingConfig)
     gradient_checkpointing: bool = True
     """Use gradient checkpointing (activation recomputation) to trade compute for memory."""
     gradient_checkpointing_use_reentrant: bool = False
@@ -1817,7 +1933,8 @@ class SkyRLTrainConfig(BaseConfig):
                 "`trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters` instead"
             )
         inference_rope_parameters = _get_nested_value(
-            overrides, "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters"
+            overrides,
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters",
         )
         if inference_rope_parameters is not _MISSING:
             trainer_strategy = _get_nested_value(overrides, "trainer.strategy")

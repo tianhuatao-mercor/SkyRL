@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
+from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
 
@@ -52,6 +52,8 @@ class GeneratorOutput(TypedDict):
     # record its split.
     trajectory_time_splits: Optional[Dict[str, List[float]]]
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
+    # Exact hosted sampler version used for each output row, when available.
+    sampler_versions: NotRequired[Optional[List[int]]]
     # Applicable only for step-wise training
     is_last_step: Optional[List[bool]]
     # Per-row env metrics (one dict per row in the flattened batch). Used by

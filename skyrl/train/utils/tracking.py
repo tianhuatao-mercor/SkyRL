@@ -21,7 +21,7 @@ import traceback
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
@@ -43,11 +43,19 @@ class Tracking:
     ):
         assert backend in self.supported_backends, f"{backend} is not supported"
         self.backend = backend
+        self._metrics_provider: Optional[Callable[[], Dict[str, Any]]] = None
+        self._summary_provider: Optional[Callable[[], Dict[str, Any]]] = None
+        self._finished = False
 
         if backend == "wandb":
             import wandb
 
-            wandb.init(project=project_name, name=experiment_name, config=get_config_as_dict(config), tags=tags)
+            wandb.init(
+                project=project_name,
+                name=experiment_name,
+                config=get_config_as_dict(config),
+                tags=tags,
+            )
             self.logger: Any = wandb
         elif backend == "mlflow":
             self.logger = _MlflowLoggingAdapter(project_name, experiment_name, config)
@@ -76,25 +84,56 @@ class Tracking:
 
         self._exception_logged = False
 
+    def set_metrics_provider(
+        self,
+        provider: Callable[[], Dict[str, Any]],
+        *,
+        summary_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> None:
+        """Merge external cumulative usage into logs and the final run summary."""
+
+        self._metrics_provider = provider
+        self._summary_provider = summary_provider or provider
+
+    def _provided_metrics(self, provider: Optional[Callable[[], Dict[str, Any]]]) -> Dict[str, Any]:
+        if provider is None:
+            return {}
+        try:
+            return dict(provider())
+        except Exception as e:
+            logger.warning(f"Failed to collect external tracking metrics: {e}")
+            return {}
+
     def log(self, data, step, commit=False):
+        provided_metrics = self._provided_metrics(self._metrics_provider)
+        if provided_metrics:
+            data = {**data, **provided_metrics}
         if self.backend == "wandb":
             self.logger.log(data=data, step=step, commit=commit)
         else:
             self.logger.log(data=data, step=step)
 
     def finish(self):
+        if self._finished:
+            return
         if self.backend == "console":
+            self._finished = True
             return
         # NOTE (sumanthrh): We use a try-except block here while finishing tracking.
         # This is because wandb often errors out with a BrokenPipeError when closing.
         # https://github.com/wandb/wandb/issues/6449
         try:
             if self.backend == "wandb":
+                run = getattr(self.logger, "run", None)
+                if run is not None:
+                    run.summary.update(self._provided_metrics(self._summary_provider))
                 self.logger.finish(exit_code=0)
             else:
                 self.logger.finish()
         except Exception as e:
             logger.warning(f"Attempted to finish tracking with backend {self.backend} but got error {e}")
+        finally:
+            self._finished = True
 
     def log_exception(self, e: BaseException, step: int = 0) -> None:
         """Log the active exception's traceback to the configured backend.
@@ -224,7 +263,12 @@ class _TensorboardAdapter:
 
 
 class _MlflowLoggingAdapter:
-    def __init__(self, project_name, experiment_name, config: Optional[Union[SkyRLTrainConfig, DictConfig]] = None):
+    def __init__(
+        self,
+        project_name,
+        experiment_name,
+        config: Optional[Union[SkyRLTrainConfig, DictConfig]] = None,
+    ):
         import os
 
         import mlflow
@@ -261,11 +305,17 @@ def _compute_mlflow_params_from_objects(params) -> Dict[str, Any]:
     if isinstance(params, DictConfig):
         params = OmegaConf.to_container(params, resolve=True)
 
-    return _flatten_dict(_transform_params_to_json_serializable(params, convert_list_to_dict=True), sep="/")
+    return _flatten_dict(
+        _transform_params_to_json_serializable(params, convert_list_to_dict=True),
+        sep="/",
+    )
 
 
 def _transform_params_to_json_serializable(x, convert_list_to_dict: bool):
-    _transform = partial(_transform_params_to_json_serializable, convert_list_to_dict=convert_list_to_dict)
+    _transform = partial(
+        _transform_params_to_json_serializable,
+        convert_list_to_dict=convert_list_to_dict,
+    )
 
     if dataclasses.is_dataclass(x):
         return _transform(dataclasses.asdict(x))

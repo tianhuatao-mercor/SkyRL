@@ -64,7 +64,8 @@ class GeneratedOutputGroup:
         uid (str): The uid of the group. Underlyingly, it is the index of the data in train_dataloader.dataset.
 
         global_step_when_scheduled (int): The global step when the group was scheduled for generation,
-            used for validating the staleness control.
+            used for staleness control when the inference backend does not
+            report an exact sampler version.
 
         group_completion_time_s (Optional[float]): Wall-clock time (seconds) for the whole group to
             finish generation, i.e. the time for the slowest trajectory in the group to complete.
@@ -112,6 +113,28 @@ class _RolloutStat:
     filtered: int = 0
 
 
+def _advance_global_step_after_training(global_step: int, max_training_steps: Optional[int]) -> tuple[int, bool]:
+    """Return the next step cursor and whether the configured cap was reached.
+
+    Keep the cursor on the last completed step when stopping so a final
+    checkpoint resumes from the following step instead of skipping it.
+    """
+
+    if max_training_steps is not None and global_step >= max_training_steps:
+        return global_step, True
+    return global_step + 1, False
+
+
+def _needs_final_checkpoint(
+    ckpt_interval: int,
+    global_step: int,
+    last_checkpoint_step: Optional[int],
+) -> bool:
+    """Avoid paying for a duplicate final checkpoint at the same step."""
+
+    return ckpt_interval > 0 and last_checkpoint_step != global_step
+
+
 class _AsyncStalenessManager:
     """
     A controller that manages the capacity of the generation workers based on staleness control.
@@ -134,7 +157,12 @@ class _AsyncStalenessManager:
     - The idea of this controller is from section 5.1 of AReal's paper: https://arxiv.org/pdf/2505.24298v3
     """
 
-    def __init__(self, max_concurrent_generation_groups: int, mini_batch_size: int, max_staleness_steps: int):
+    def __init__(
+        self,
+        max_concurrent_generation_groups: int,
+        mini_batch_size: int,
+        max_staleness_steps: int,
+    ):
         self.max_concurrent_generation_groups = max_concurrent_generation_groups
         self.mini_batch_size = mini_batch_size
         self.max_staleness_steps = max_staleness_steps
@@ -257,7 +285,9 @@ class _AsyncDataloader:
         self._exhausted: bool = False  # currently not used.
 
     def load_state_from_checkpoint(
-        self, consumed_data_uids_set: Set[str], filtered_data_uids_set: Optional[Set[str]] = None
+        self,
+        consumed_data_uids_set: Set[str],
+        filtered_data_uids_set: Optional[Set[str]] = None,
     ) -> None:
         """
         Load the state from a checkpoint.
@@ -327,7 +357,6 @@ class _AsyncDataloader:
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
-
     def __init__(self, *args, **kwargs):
         # Extract cfg before base init so we can initialize async-specific knobs used by our overrides.
         cfg = kwargs.get("cfg", args[0] if len(args) > 0 else None)
@@ -344,10 +373,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self._gen_buffer_maxsize = self.mini_batch_size * (self.max_staleness_steps + 1)
         self._loop_gauges = ScalarGauges()
         self._loop_gauges.set(
-            "skyrl_mini_batch_size", self.mini_batch_size, "Generation groups consumed per training step."
+            "skyrl_mini_batch_size",
+            self.mini_batch_size,
+            "Generation groups consumed per training step.",
         )
         self._loop_gauges.set(
-            "skyrl_gen_buffer_maxsize", self._gen_buffer_maxsize, "Staleness-bounded generation-buffer capacity."
+            "skyrl_gen_buffer_maxsize",
+            self._gen_buffer_maxsize,
+            "Staleness-bounded generation-buffer capacity.",
         )
 
         assert (
@@ -436,6 +469,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.global_step = 0
         self.epoch = 0
         resumed_start_epoch = None
+        last_checkpoint_step = None
 
         # Load checkpoint state if resumption is enabled. Also load the data UIDs that are already trained on.
         if self.resume_mode != ResumeMode.NONE:
@@ -448,6 +482,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     loaded_epoch,
                 ) = self.load_checkpoints()
                 logger.info(f"Resumed training from global_step {self.global_step}")
+                if self.global_step > 0:
+                    last_checkpoint_step = self.global_step
                 if self.global_step > 0:
                     # Set async dataloader manager and staleness manager to the loaded state.
                     self.async_train_dataloader.load_state_from_checkpoint(
@@ -483,13 +519,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             self._ray_gpu_monitor.start()
 
         # Eval before training
-        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
+        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train and self.global_step == 0:
             with self._phase_gauge.timed_phase("eval", self.all_timings):
                 eval_metrics = await self.eval()
                 self.tracker.log(eval_metrics, step=self.global_step, commit=True)
 
         # main training loop
-        pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Step Progress")
+        pbar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_step,
+            desc="Training Step Progress",
+        )
         start_epoch = resumed_start_epoch if resumed_start_epoch is not None else 0
         self.global_step += 1  # start training at global_step 1
         stop_training = False
@@ -561,6 +601,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             if self.cfg.trainer.ckpt_interval > 0:
                                 with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                                     await asyncio.to_thread(self.save_checkpoints)
+                                last_checkpoint_step = self.global_step
                             if self.cfg.trainer.hf_save_interval > 0:
                                 with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
                                     await asyncio.to_thread(self.save_models)
@@ -605,7 +646,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                     # 5. Set logs for this training step.
                     logger.info(status)
-                    self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
+                    self.all_metrics.update(
+                        {
+                            "trainer/epoch": epoch,
+                            "trainer/global_step": self.global_step,
+                        }
+                    )
                     pbar.update(1)
 
                     # 6. Eval. At interval and at the last step.
@@ -628,6 +674,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         if is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
                             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                                 await asyncio.to_thread(self.save_checkpoints)
+                            last_checkpoint_step = self.global_step
                     if self.cfg.trainer.hf_save_interval > 0:
                         if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
                             with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
@@ -640,12 +687,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         timing_payload.update(await self._vllm_metrics_scraper.sample())
                     self.tracker.log(timing_payload, step=self.global_step, commit=True)
                     self.all_timings = {}
-                    self.global_step += 1
 
-                    if (
-                        self.cfg.trainer.max_training_steps is not None
-                        and self.global_step > self.cfg.trainer.max_training_steps
-                    ):
+                    next_global_step, reached_max_training_steps = _advance_global_step_after_training(
+                        self.global_step, self.cfg.trainer.max_training_steps
+                    )
+                    if reached_max_training_steps:
                         logger.info(
                             f"Reached max_training_steps={self.cfg.trainer.max_training_steps}, stopping early."
                         )
@@ -657,6 +703,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             await asyncio.gather(generators_done_watcher, return_exceptions=True)
                         stop_training = True
                         break
+
+                    self.global_step = next_global_step
 
                     # 8. Notify generation workers that the capacity has increased, unblocking them.
                     await self._staleness_manager.notify_capacity_change(self.global_step)
@@ -710,8 +758,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # does not redo the last epoch (whose consumed UIDs were cleared at its epoch end).
             self.epoch = self.cfg.trainer.epochs
 
-        # safety net: always save final checkpoint at end of training.
-        if self.cfg.trainer.ckpt_interval > 0:
+        # Safety net: save the final state unless this exact step was already
+        # persisted by the interval/epoch path.
+        if _needs_final_checkpoint(
+            self.cfg.trainer.ckpt_interval,
+            self.global_step,
+            last_checkpoint_step,
+        ):
             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                 await asyncio.to_thread(self.save_checkpoints)
                 logger.info("Saved final checkpoint.")
@@ -802,7 +855,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # Buffer occupancy when this step starts waiting.
         self.all_metrics["async/gen_buffer_qsize_at_wait_start"] = generation_output_group_buffer.qsize()
         with self._phase_gauge.timed_phase("wait_for_generation_buffer", self.all_timings):
-            buffer_pbar = tqdm(total=self.mini_batch_size, initial=0, desc="Generation Buffer Progress", position=1)
+            buffer_pbar = tqdm(
+                total=self.mini_batch_size,
+                initial=0,
+                desc="Generation Buffer Progress",
+                position=1,
+            )
             while len(kept_groups) < self.mini_batch_size:
                 # We do finish-time FIFO here (not schedule-time FIFO).
                 if not self.sample_full_batch:
@@ -872,7 +930,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self.cfg.trainer.dump_data_batch:
             # dump data to file
             with Timer("dump_data_batch"):
-                self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
+                self.dump_data(
+                    training_input,
+                    file_name=f"global_step_{self.global_step}_training_input",
+                )
 
         # train policy/critic model
         with Timer("train_critic_and_policy", self.all_timings):
@@ -898,7 +959,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     rand_prompts,
                     self.cfg.generator.n_samples_per_prompt,
                     get_sampling_params_for_backend(
-                        self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
+                        self.cfg.generator.inference_engine.backend,
+                        self.cfg.generator.sampling_params,
                     ),
                     self.cfg.environment.env_class,
                     "train",
@@ -969,6 +1031,36 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 out[f"{suffix}/{k}"] = v
         return out
 
+    def _get_group_staleness(self, generated_group: GeneratedOutputGroup) -> tuple[int, list[int]]:
+        """Return exact hosted staleness, or the scheduler-step fallback."""
+
+        group_sampler_versions = generated_group.generator_output.get("sampler_versions")
+        if group_sampler_versions is None:
+            return self.global_step - generated_group.global_step_when_scheduled, []
+
+        group_size = len(generated_group.generator_output["response_ids"])
+        if len(group_sampler_versions) != group_size:
+            raise ValueError(
+                "sampler_versions must have one entry per generated response: "
+                f"{len(group_sampler_versions)} != {group_size}"
+            )
+        current_sampler_version = getattr(self.inference_engine_client, "weight_version", None)
+        if current_sampler_version is None:
+            raise ValueError(
+                "Generator output reported sampler_versions but the inference client has no weight_version"
+            )
+        versions = [int(version) for version in group_sampler_versions]
+        per_response_staleness = [int(current_sampler_version) - version for version in versions]
+        if any(value < 0 for value in per_response_staleness):
+            raise ValueError(
+                "A rollout reported a sampler version newer than the currently "
+                f"published version {current_sampler_version}: {versions}"
+            )
+
+        # A group may contain requests admitted on adjacent immutable Tinker
+        # clients. Its oldest response determines group-level staleness.
+        return max(per_response_staleness), versions
+
     def convert_generation_group_mini_batch_to_training_input(
         self,
         cur_generation_group_mini_batch: List[GeneratedOutputGroup],
@@ -988,13 +1080,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         uids = []
         stalenesses = []
         staleness_violation_count = 0
+        sampler_versions = []
         # Per-group completion times (seconds) and the intra-group spread (std and coefficient of
         # variation) of per-trajectory completion times. Helpful to understand tail latency
         group_completion_times: List[float] = []
         intra_group_stds: List[float] = []
         intra_group_cvs: List[float] = []
         for cur_generated_output_group in cur_generation_group_mini_batch:
-            cur_staleness = self.global_step - cur_generated_output_group.global_step_when_scheduled
+            cur_staleness, exact_versions = self._get_group_staleness(cur_generated_output_group)
+            sampler_versions.extend(exact_versions)
             stalenesses.append(cur_staleness)
             generator_outputs.append(cur_generated_output_group.generator_output)
             if cur_generated_output_group.prompts is not None:
@@ -1060,7 +1154,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # groups. (Kept reward metrics are uninformative -- pass@n ~1 -- and loss/avg_final_rewards
             # already covers the trained set.)
             dropped_generator_output = concatenate_generator_outputs(
-                [g.generator_output for g in dropped_groups], step_wise=self.cfg.generator.step_wise_trajectories
+                [g.generator_output for g in dropped_groups],
+                step_wise=self.cfg.generator.step_wise_trajectories,
             )
             self.all_metrics.update(self._reprefix_metrics(kept_rollout_metrics, "kept"))
             self.all_metrics.update(self._reprefix_metrics(dropped_generator_output["rollout_metrics"], "dropped"))
@@ -1091,7 +1186,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     dropped_group_intra_group_cvs.append(intra_group_cv)
 
             dropped_metrics = get_group_completion_metrics(
-                dropped_group_completion_times, dropped_group_intra_group_stds, dropped_group_intra_group_cvs
+                dropped_group_completion_times,
+                dropped_group_intra_group_stds,
+                dropped_group_intra_group_cvs,
             )
 
             self.all_metrics.update(self._reprefix_metrics(group_completion_metrics, "kept"))
@@ -1102,7 +1199,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             merged_intra_group_cvs = intra_group_cvs + dropped_group_intra_group_cvs
             # get merged metrics with kept + dropped groups
             group_completion_metrics = get_group_completion_metrics(
-                merged_group_completion_times, merged_intra_group_stds, merged_intra_group_cvs
+                merged_group_completion_times,
+                merged_intra_group_stds,
+                merged_intra_group_cvs,
             )
 
         self.all_metrics.update(group_completion_metrics)
@@ -1121,10 +1220,21 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 "async/staleness_violation_count": staleness_violation_count,
             }
         )
+        if sampler_versions:
+            self.all_metrics.update(
+                {
+                    "async/sampler_version_min": min(sampler_versions),
+                    "async/sampler_version_max": max(sampler_versions),
+                    "async/current_sampler_version": int(self.inference_engine_client.weight_version),
+                }
+            )
 
         # Per-token reward conversion (kept groups only) + reward metrics over the kept+dropped view.
         generator_output, uids = self.postprocess_generator_output(
-            generator_output, uids, metrics_generator_output=metrics_generator_output, metrics_uids=metrics_uids
+            generator_output,
+            uids,
+            metrics_generator_output=metrics_generator_output,
+            metrics_uids=metrics_uids,
         )
 
         # print example just for debugging
@@ -1175,7 +1285,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         logger.info(f"Saved fully-async state to {fully_async_state_path}")
         return global_step_folder
 
-    def load_checkpoints(self) -> Tuple[int, str, Optional[Set[str]], Optional[Set[str]], Optional[int]]:
+    def load_checkpoints(
+        self,
+    ) -> Tuple[int, str, Optional[Set[str]], Optional[Set[str]], Optional[int]]:
         """
         Load the base checkpoint without loading the dataloader state, and load the fully-async state.
 
@@ -1199,4 +1311,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             f"Loaded fully-async state with {len(consumed_data_uids_set)} consumed UIDs "
             f"({len(filtered_data_uids_set)} filtered), epoch={epoch}"
         )
-        return global_step, checkpoint_path, consumed_data_uids_set, filtered_data_uids_set, epoch
+        return (
+            global_step,
+            checkpoint_path,
+            consumed_data_uids_set,
+            filtered_data_uids_set,
+            epoch,
+        )

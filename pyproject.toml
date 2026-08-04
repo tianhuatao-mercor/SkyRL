@@ -45,6 +45,12 @@ tinker = [
     "psycopg2-binary",
 ]
 
+fireworks = [
+    "skyrl[skyrl-train]",
+    "fireworks-ai[training]>=1.2.0a87,<2; python_version < '3.14'",
+    "tinker>=0.3.0",
+]
+
 ray = [
     "ray[default]==2.56.0",
 ]

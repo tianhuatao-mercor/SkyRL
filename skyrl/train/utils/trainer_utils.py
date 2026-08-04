@@ -66,7 +66,9 @@ class ResumeMode(Enum):
 
 
 def get_node_ids(
-    policy_model: PPORayActorGroup, critic_model: Optional[PPORayActorGroup], ref_model: Optional[PPORayActorGroup]
+    policy_model: PPORayActorGroup,
+    critic_model: Optional[PPORayActorGroup],
+    ref_model: Optional[PPORayActorGroup],
 ) -> List[str]:
     """Get the node ids of the policy, critic, and ref models.
 
@@ -99,6 +101,12 @@ def run_on_each_node(node_ids: List[str], fn: Callable, *args, **kwargs):
         **kwargs: Keyword arguments to pass to the function
     """
     node_ids = list(set(node_ids))
+    # Hosted backends have no SkyRL Ray workers. Avoid constructing a remote
+    # function (which implicitly auto-connects Ray) when there is nowhere to
+    # schedule it; the driver-local invocation is handled separately by the
+    # caller.
+    if not node_ids:
+        return []
     task = ray.remote(num_cpus=0.25)(fn)
     refs = []
 
@@ -190,7 +198,11 @@ def cleanup_old_checkpoints(checkpoint_base_path: str, max_checkpoints: int) -> 
 
 
 def validate_consistency_for_latest_checkpoint(
-    root_ckpt_folder: str, ckpt_iteration: int, checkpoint_path: str, latest_checkpoint_file: str, save_interval: int
+    root_ckpt_folder: str,
+    ckpt_iteration: int,
+    checkpoint_path: str,
+    latest_checkpoint_file: str,
+    save_interval: int,
 ):
     """Validate that the checkpoint folder is consistent with the latest checkpoint file.
 
@@ -702,6 +714,7 @@ def validate_generator_output(num_prompts: int, generator_output: GeneratorOutpu
             "stop_reasons",
             "trajectory_ids",
             "rollout_expert_indices",
+            "sampler_versions",
             "is_last_step",
             "pixel_values",
             "image_grid_thw",
@@ -714,7 +727,11 @@ def validate_generator_output(num_prompts: int, generator_output: GeneratorOutpu
     # make sure that each element of response ids and loss masks are all the same length
     # (and token level rewards if used)
     for i, (response_ids, loss_masks, rewards) in enumerate(
-        zip(generator_output["response_ids"], generator_output["loss_masks"], generator_output["rewards"])
+        zip(
+            generator_output["response_ids"],
+            generator_output["loss_masks"],
+            generator_output["rewards"],
+        )
     ):
         assert len(response_ids) == len(loss_masks), (
             f"Response ids and loss masks must have the same length, "
@@ -821,13 +838,16 @@ def _validate_step_wise_fields(generator_output: GeneratorOutput, num_responses:
         else:
             assert is_last_step[i] is not True, (
                 f"is_last_step[{i}] is True but trajectory continues "
-                f"(trajectory '{tid_cur}' at index {i} and {i+1}). "
+                f"(trajectory '{tid_cur}' at index {i} and {i + 1}). "
                 f"is_last_step must only be True at the final step of a trajectory."
             )
 
 
 def build_dataloader(
-    cfg: SkyRLTrainConfig, dataset: PromptDataset, is_train: bool = True, is_fully_async: bool = False
+    cfg: SkyRLTrainConfig,
+    dataset: PromptDataset,
+    is_train: bool = True,
+    is_fully_async: bool = False,
 ) -> StatefulDataLoader:
     """
     Build the dataloader for the training or evaluation dataset.

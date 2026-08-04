@@ -13,8 +13,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from skyrl.train.fully_async_trainer import (
     FullyAsyncRayPPOTrainer,
     GeneratedOutputGroup,
+    _advance_global_step_after_training,
     _AsyncDataloader,
     _AsyncStalenessManager,
+    _needs_final_checkpoint,
 )
 
 
@@ -24,6 +26,19 @@ def _make_async_dataloader(num_prompts: int, mini_batch_size: int) -> _AsyncData
     # batch_size=1 (one prompt per draw) and identity collate so each batch is a list with one dict.
     loader = StatefulDataLoader(dataset, batch_size=1, collate_fn=lambda batch: batch[0])
     return _AsyncDataloader(loader, mini_batch_size)
+
+
+def test_max_training_step_keeps_final_checkpoint_cursor_on_completed_step():
+    assert _advance_global_step_after_training(3, 3) == (3, True)
+    assert _advance_global_step_after_training(3, 60) == (4, False)
+    assert _advance_global_step_after_training(3, None) == (4, False)
+
+
+def test_final_checkpoint_is_not_duplicated_at_same_step():
+    assert _needs_final_checkpoint(10, 60, 60) is False
+    assert _needs_final_checkpoint(10, 60, 50) is True
+    assert _needs_final_checkpoint(10, 60, None) is True
+    assert _needs_final_checkpoint(-1, 60, None) is False
 
 
 # --------------------------------------------------------------------------------------
@@ -236,6 +251,40 @@ def test_reprefix_metrics():
         "environment_dropped/score": 0.5,
         "dropped/bare": 1,
     }
+
+
+def test_exact_sampler_version_staleness_takes_precedence_over_schedule_step():
+    trainer = SimpleNamespace(
+        global_step=20,
+        inference_engine_client=SimpleNamespace(weight_version=5),
+    )
+    group = GeneratedOutputGroup(
+        generator_output={"response_ids": [[1], [2]], "sampler_versions": [3, 4]},
+        uid="u",
+        global_step_when_scheduled=19,
+    )
+
+    staleness, versions = FullyAsyncRayPPOTrainer._get_group_staleness(trainer, group)
+
+    assert staleness == 2
+    assert versions == [3, 4]
+
+
+def test_sampler_staleness_falls_back_to_schedule_step():
+    trainer = SimpleNamespace(
+        global_step=20,
+        inference_engine_client=SimpleNamespace(weight_version=5),
+    )
+    group = GeneratedOutputGroup(
+        generator_output={"response_ids": [[1]], "sampler_versions": None},
+        uid="u",
+        global_step_when_scheduled=18,
+    )
+
+    staleness, versions = FullyAsyncRayPPOTrainer._get_group_staleness(trainer, group)
+
+    assert staleness == 2
+    assert versions == []
 
 
 def test_should_keep_group_token_level_rewards():

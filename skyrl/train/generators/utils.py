@@ -1,7 +1,7 @@
 import copy
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -102,7 +102,9 @@ CUSTOM_CHAT_TEMPLATES = {
 }
 
 
-def get_custom_chat_template(chat_template_config: Optional[Union[dict, ChatTemplateConfig]] = None) -> Optional[str]:
+def get_custom_chat_template(
+    chat_template_config: Optional[Union[dict, ChatTemplateConfig]] = None,
+) -> Optional[str]:
     """
     Get custom chat template based on the new config structure.
 
@@ -293,6 +295,10 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput], step
         "rollout_logprobs": _concat_optional_field(generator_outputs, "rollout_logprobs"),
         "trajectory_generation_times": _concat_optional_field(generator_outputs, "trajectory_generation_times"),
         "trajectory_time_splits": _concat_optional_field(generator_outputs, "trajectory_time_splits"),
+        "sampler_versions": cast(
+            Optional[List[int]],
+            _concat_optional_field(generator_outputs, "sampler_versions"),
+        ),
     }
 
     # propagate additional keys with list values as-is
@@ -660,7 +666,10 @@ def _find_generation_prompt_boundary(cur_token_ids: List[int], generation_prompt
 
 
 def get_response_ids_and_loss_mask_from_messages(
-    messages: ConversationType, tokenizer, assistant_logprobs=None, tokenizer_kwargs: Optional[dict] = None
+    messages: ConversationType,
+    tokenizer,
+    assistant_logprobs=None,
+    tokenizer_kwargs: Optional[dict] = None,
 ):
     """
     Get the response ids and loss mask from a list of messages.
@@ -822,6 +831,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
     is_token_level_rewards = isinstance(gen_out["rewards"][0], list)
     has_logprobs = gen_out.get("rollout_logprobs") is not None
     has_stop_reasons = gen_out.get("stop_reasons") is not None
+    input_sampler_versions = gen_out.get("sampler_versions")
 
     # Per-field output accumulators.
     # Fields that we take from all the entries in the merge group
@@ -836,6 +846,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
     out_stop_reasons: Optional[List[str]] = [] if has_stop_reasons else None
     out_trajectory_ids: list = []
     out_is_last_step: List[bool] = []
+    out_sampler_versions: Optional[List[int]] = [] if input_sampler_versions is not None else None
 
     # Accumulator for the current merge group
     acc_prompt: List[int] = list(gen_out["prompt_token_ids"][0])
@@ -857,6 +868,9 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
             out_stop_reasons.append(gen_out["stop_reasons"][last])
         out_trajectory_ids.append(gen_out["trajectory_ids"][last])
         out_is_last_step.append(gen_out["is_last_step"][last])
+        if input_sampler_versions is not None:
+            assert out_sampler_versions is not None
+            out_sampler_versions.append(input_sampler_versions[last])
 
     for i in range(1, n):
         full_merged = acc_prompt + acc_response
@@ -908,6 +922,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
         "trajectory_ids": out_trajectory_ids,
         "rollout_expert_indices": None,
         "is_last_step": out_is_last_step,
+        "sampler_versions": out_sampler_versions,
     }
 
 

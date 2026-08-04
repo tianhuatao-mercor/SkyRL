@@ -52,6 +52,7 @@ class TrajectoryOutput:
     rollout_logprobs: Optional[List[float]]
     env_metrics: Dict[str, Any]
     rollout_expert_indices: Optional[RoutedExpertIndices] = None
+    sampler_version: Optional[int] = None
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: agent loops may
@@ -130,7 +131,9 @@ class TurnOutput:
         return self.output_logprobs + [0.0] * len(self.obs_ids)
 
 
-def _split_lists(time_splits: List[Optional[Dict[str, float]]]) -> Optional[Dict[str, List[float]]]:
+def _split_lists(
+    time_splits: List[Optional[Dict[str, float]]],
+) -> Optional[Dict[str, List[float]]]:
     """Per-component lists from per-trajectory time splits, or None if any trajectory lacks them."""
     if not time_splits or any(s is None for s in time_splits):
         return None
@@ -171,7 +174,8 @@ class SkyRLGymGenerator(GeneratorInterface):
         self.generation_prompt_ids = get_generation_prompt_ids(tokenizer) if self.use_conversation_multi_turn else None
         if self.skyrl_gym_cfg.max_env_workers > 0:
             self.env_executor = ThreadPoolExecutor(
-                max_workers=self.skyrl_gym_cfg.max_env_workers, thread_name_prefix="skyrl-gym-env-"
+                max_workers=self.skyrl_gym_cfg.max_env_workers,
+                thread_name_prefix="skyrl-gym-env-",
             )
         else:
             self.env_executor = None
@@ -357,6 +361,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             initial_prompt_length = len(initial_input_ids)
             loss_mask = []  # this excludes the prompt
             rollout_logprobs = None
+            trajectory_sampler_version: Optional[int] = None
 
             # `sampling_params` if provided is a dict in the format expected by the inference engine backend
             # we cast default config to a dict for consistency
@@ -382,7 +387,6 @@ class SkyRLGymGenerator(GeneratorInterface):
             )
 
             while not agent_loop_state.done:
-
                 if len(agent_loop_state.input_ids) > max_input_length:
                     stop_reason = "length"
                     break
@@ -415,6 +419,17 @@ class SkyRLGymGenerator(GeneratorInterface):
                 stop_reason = engine_output["stop_reasons"][0]
                 response_logprobs = engine_output.get("response_logprobs", None)
                 rollout_expert_indices = engine_output.get("rollout_expert_indices", None)
+                engine_sampler_versions = engine_output.get("sampler_versions")
+                if engine_sampler_versions is not None:
+                    if len(engine_sampler_versions) != 1:
+                        raise RuntimeError("Expected one sampler version for one trajectory request")
+                    current_sampler_version = int(engine_sampler_versions[0])
+                    if trajectory_sampler_version is not None and current_sampler_version != trajectory_sampler_version:
+                        raise RuntimeError(
+                            "A single trajectory cannot mix hosted sampler versions: "
+                            f"{trajectory_sampler_version} then {current_sampler_version}"
+                        )
+                    trajectory_sampler_version = current_sampler_version
                 if response_logprobs is not None:
                     response_logprobs = response_logprobs[0]
                     if self.custom_chat_template is not None:
@@ -492,6 +507,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                         stop_reason=stop_reason,
                         env_metrics=env.get_metrics() if agent_loop_state.done else {},
                         rollout_expert_indices=turn_output.get_turn_rollout_expert_indices(),
+                        sampler_version=trajectory_sampler_version,
                     )
                     agent_loop_output.step_outputs.append(per_step_output)
 
@@ -591,6 +607,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     rollout_logprobs=rollout_logprobs,
                     env_metrics=env_metrics,
                     rollout_expert_indices=rollout_expert_indices_out,
+                    sampler_version=trajectory_sampler_version,
                 )
 
             agent_loop_output = self._post_process_agent_loop_output(
@@ -606,7 +623,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             await self.inference_engine_client.finish_session(session_id)
 
     def _build_per_token_rewards(
-        self, per_step_rewards: List[Tuple[float, Optional[int]]], response_ids: List[int], appended_eos_token: bool
+        self,
+        per_step_rewards: List[Tuple[float, Optional[int]]],
+        response_ids: List[int],
+        appended_eos_token: bool,
     ) -> Union[float, List[float]]:
         """
         Build reward output from per-step rewards.
@@ -750,7 +770,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             return_dict=False,
         )
         engine_input = InferenceEngineInput(
-            prompt_token_ids=prompt_token_ids, sampling_params=sampling_params, cache_salt=cache_salt
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            cache_salt=cache_salt,
         )
         engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
         outputs = engine_output["responses"]
@@ -758,6 +780,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         stop_reasons = engine_output["stop_reasons"]
         logprobs = engine_output.get("response_logprobs", None)
         raw_rollout_expert_indices = engine_output.get("rollout_expert_indices", None)
+        sampler_versions = engine_output.get("sampler_versions")
 
         truncated_responses = []
         rewards = []
@@ -804,6 +827,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "rollout_metrics": rollout_metrics,
             "rollout_logprobs": truncated_logprobs,
             "rollout_expert_indices": truncated_indices,
+            "sampler_versions": sampler_versions,
         }
 
         return generator_output
@@ -835,7 +859,12 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         if self.batched:
             return await self.generate_batched(
-                prompts, env_classes, env_extras, max_tokens, sampling_params, cache_salt=cache_salt
+                prompts,
+                env_classes,
+                env_extras,
+                max_tokens,
+                sampling_params,
+                cache_salt=cache_salt,
             )
 
         # Async agent loop to generate trajectories in parallel.
@@ -868,6 +897,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         if any(t is None for t in trajectory_generation_times_per_prompt):
             trajectory_generation_times_per_prompt = None
         trajectory_time_splits_per_prompt = _split_lists([getattr(o, "time_splits", None) for o in all_outputs])
+        sampler_versions: Optional[List[int]]
 
         if self.generator_cfg.step_wise_trajectories:
             responses = []
@@ -878,6 +908,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             env_metrics = []
             is_last_step = []
             out_trajectory_ids = []
+            sampler_version_candidates = []
             out_env_classes = []
             out_trajectory_generation_times = []
             out_step_time_splits = []
@@ -891,6 +922,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     env_metrics.append(step_output.env_metrics)
                     is_last_step.append(j == len(output.step_outputs) - 1)
                     out_trajectory_ids.append(trajectory_ids[i])
+                    sampler_version_candidates.append(step_output.sampler_version)
                     out_env_classes.append(env_classes[i])
                     # For trajectory completion per turn we just use the trajectory level times
                     out_trajectory_generation_times.append(getattr(output, "e2e_time", None))
@@ -900,6 +932,11 @@ class SkyRLGymGenerator(GeneratorInterface):
                 out_trajectory_generation_times = None
             out_trajectory_time_splits = _split_lists(out_step_time_splits)
             env_classes = out_env_classes
+            sampler_versions = (
+                None
+                if any(version is None for version in sampler_version_candidates)
+                else [int(version) for version in sampler_version_candidates if version is not None]
+            )
         else:
             responses = [output.response_ids for output in all_outputs]
             rewards = [output.reward for output in all_outputs]
@@ -909,6 +946,12 @@ class SkyRLGymGenerator(GeneratorInterface):
             env_metrics = [output.env_metrics for output in all_outputs]
             is_last_step = None
             out_trajectory_ids = None
+            sampler_version_candidates = [output.sampler_version for output in all_outputs]
+            sampler_versions = (
+                None
+                if any(version is None for version in sampler_version_candidates)
+                else [int(version) for version in sampler_version_candidates if version is not None]
+            )
             # One time per trajectory, already aligned 1:1 with responses (None if not all recorded).
             out_trajectory_generation_times = trajectory_generation_times_per_prompt
             out_trajectory_time_splits = trajectory_time_splits_per_prompt
@@ -976,6 +1019,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "trajectory_generation_times": out_trajectory_generation_times,
             "trajectory_time_splits": out_trajectory_time_splits,
             "rollout_expert_indices": rollout_expert_indices,
+            "sampler_versions": sampler_versions,
             "is_last_step": is_last_step,
             "env_metrics": env_metrics,
         }

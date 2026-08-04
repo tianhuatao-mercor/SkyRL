@@ -298,7 +298,7 @@ class RayPPOTrainer:
 
         # Eval before training. Wrapped in eval callbacks + on_log so that e.g.
         # a best-checkpoint callback sees the baseline reading.
-        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
+        if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train and self.global_step == 0:
             self._fire("on_eval_start")
             with Timer("eval", self.all_timings):
                 eval_metrics = await self.eval()
@@ -311,7 +311,11 @@ class RayPPOTrainer:
             self.reward_kl_controller = get_kl_controller(self.cfg.trainer.algorithm)
 
         # main training loop
-        pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Batches Processed")
+        pbar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_step,
+            desc="Training Batches Processed",
+        )
         self.global_step += 1  # start training at global_step 1
         stop_training = False
 
@@ -348,7 +352,8 @@ class RayPPOTrainer:
                             rand_prompts,
                             self.cfg.generator.n_samples_per_prompt,
                             get_sampling_params_for_backend(
-                                self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
+                                self.cfg.generator.inference_engine.backend,
+                                self.cfg.generator.sampling_params,
                             ),
                             self.cfg.environment.env_class,
                             "train",
@@ -442,7 +447,8 @@ class RayPPOTrainer:
                             # dump data to file
                             with Timer("dump_data_batch"):
                                 self.dump_data(
-                                    training_input, file_name=f"global_step_{self.global_step}_training_input"
+                                    training_input,
+                                    file_name=f"global_step_{self.global_step}_training_input",
                                 )
 
                         # 7. train policy/critic model
@@ -503,7 +509,12 @@ class RayPPOTrainer:
                             train_time * self._num_training_gpus
                         )
                     # log epoch info
-                    self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
+                    self.all_metrics.update(
+                        {
+                            "trainer/epoch": epoch,
+                            "trainer/global_step": self.global_step,
+                        }
+                    )
                     interval_eval = self.cfg.trainer.eval_interval > 0 and (
                         self.global_step % self.cfg.trainer.eval_interval == 0
                         or self.global_step == self.total_training_steps
@@ -947,14 +958,22 @@ class RayPPOTrainer:
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
         is_stepwise = self.cfg.generator.step_wise_trajectories
         training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-            uids, self.cfg.trainer.policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+            uids,
+            self.cfg.trainer.policy_mini_batch_size,
+            train_batch_size,
+            is_stepwise,
+            n_samples_per_prompt,
         )
         # Per-prompt boundaries (used by the `prompt_mean` loss reduction). Policy-only,
         # since advantage normalization only applies to the policy.
         training_input.metadata["policy_prompt_boundaries"] = compute_prompt_boundaries(uids)
         if self.cfg.trainer.critic.model.path is not None:
             training_input.metadata["critic_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-                uids, self.cfg.trainer.critic_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+                uids,
+                self.cfg.trainer.critic_mini_batch_size,
+                train_batch_size,
+                is_stepwise,
+                n_samples_per_prompt,
             )
 
         # 5. Record metadata and metrics.
@@ -1169,7 +1188,14 @@ class RayPPOTrainer:
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
             )
             traj_ids = (
-                torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
+                torch.cat(
+                    [
+                        torch.tensor([False], device=is_last_step.device),
+                        is_last_step[:-1],
+                    ]
+                )
+                .int()
+                .cumsum(dim=0)
             )
             num_traj = traj_ids[-1].item() + 1
             assert num_traj == len(
@@ -1207,7 +1233,8 @@ class RayPPOTrainer:
         data = data.to("cpu")
 
         valid_advantages = torch.masked_select(
-            data["advantages"][: num_samples - pad_size, ...], data["response_mask"][: num_samples - pad_size].bool()
+            data["advantages"][: num_samples - pad_size, ...],
+            data["response_mask"][: num_samples - pad_size].bool(),
         )
         avg_advantages: float = valid_advantages.mean().item()
         avg_advantages_abs: float = valid_advantages.abs().mean().item()
@@ -1619,7 +1646,10 @@ class RayPPOTrainer:
 
         # Handle dynamic sampling using utilities
         processed_output, processed_uids, keep_sampling, updated_state = trainer_utils.handle_dynamic_sampling(
-            generator_output, uids, dynamic_sampling_config, self.dynamic_sampling_state
+            generator_output,
+            uids,
+            dynamic_sampling_config,
+            self.dynamic_sampling_state,
         )
 
         # Check max resample limit, and if we hit it, raise an error
@@ -1842,7 +1872,11 @@ class RayPPOTrainer:
         self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
 
         if self.has_critic:
-            critic_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "critic")
+            critic_export_dir = os.path.join(
+                self.cfg.trainer.export_path,
+                f"global_step_{self.global_step}",
+                "critic",
+            )
             self.dispatch.save_hf_model("critic", critic_export_dir, self.tokenizer)
 
         logger.info("Successfully saved model weights.")

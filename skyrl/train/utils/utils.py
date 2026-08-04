@@ -20,6 +20,9 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
+    off_policy_correction_enabled,
+)
 from skyrl.env_vars import (
     SKYRL_DUMP_INFRA_LOG_TO_STDOUT,
     SKYRL_LD_LIBRARY_PATH_EXPORT,
@@ -270,6 +273,264 @@ def _apply_mtp_config(cfg: SkyRLTrainConfig):
         }
 
 
+def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
+    """Validate the initial policy-only Fireworks GRPO capability set."""
+
+    trainer = cfg.trainer
+    fireworks = trainer.fireworks
+    inference = cfg.generator.inference_engine
+    algorithm = trainer.algorithm
+
+    if trainer.strategy != "fireworks" or inference.backend != "fireworks":
+        raise ValueError(
+            "Fireworks must be selected for both trainer.strategy and " "generator.inference_engine.backend"
+        )
+    if not fireworks.base_model:
+        raise ValueError("trainer.fireworks.base_model is required")
+    if fireworks.max_seq_len is None or fireworks.max_seq_len <= 0:
+        raise ValueError("trainer.fireworks.max_seq_len must be a positive integer")
+    if not trainer.policy.model.path:
+        raise ValueError("trainer.policy.model.path must name the tokenizer matching the Fireworks base model")
+    if trainer.policy.model.lora.rank < 0:
+        raise ValueError("trainer.policy.model.lora.rank must be >= 0")
+    if not fireworks.training_shape_id:
+        raise ValueError("Dedicated Fireworks training requires trainer.fireworks.training_shape_id")
+    if not fireworks.trainer_job_id:
+        raise ValueError("Dedicated Fireworks training requires trainer.fireworks.trainer_job_id for safe audit")
+    if not fireworks.deployment_id:
+        raise ValueError("Dedicated Fireworks training requires trainer.fireworks.deployment_id for safe audit")
+    if fireworks.trainer_replica_count <= 0:
+        raise ValueError("Dedicated Fireworks training requires trainer_replica_count > 0")
+    if fireworks.replica_count <= 0:
+        raise ValueError("Dedicated Fireworks training requires replica_count > 0")
+    if not fireworks.cleanup_on_exit:
+        raise ValueError("The dedicated Fireworks backend requires cleanup_on_exit=true")
+    if fireworks.cleanup_deployment_on_close not in ("delete", "scale_to_zero"):
+        raise ValueError("cleanup_deployment_on_close must be 'delete' or 'scale_to_zero'")
+
+    billing_fields = {
+        "billing_gpu_type": fireworks.billing_gpu_type,
+        "billing_trainer_gpus_per_replica": fireworks.billing_trainer_gpus_per_replica,
+        "billing_rollout_gpus_per_replica": fireworks.billing_rollout_gpus_per_replica,
+        "billing_gpu_price_per_hour_usd": fireworks.billing_gpu_price_per_hour_usd,
+    }
+    configured_billing_fields = {name for name, value in billing_fields.items() if value is not None}
+    if configured_billing_fields and len(configured_billing_fields) != len(billing_fields):
+        missing = sorted(set(billing_fields) - configured_billing_fields)
+        raise ValueError("Fireworks GPU-hour cost reporting is all-or-none; missing " + ", ".join(missing))
+    if configured_billing_fields:
+        if not str(fireworks.billing_gpu_type).strip():
+            raise ValueError("trainer.fireworks.billing_gpu_type must be non-empty")
+        if fireworks.billing_trainer_gpus_per_replica is None or fireworks.billing_trainer_gpus_per_replica <= 0:
+            raise ValueError("trainer.fireworks.billing_trainer_gpus_per_replica must be > 0")
+        if fireworks.billing_rollout_gpus_per_replica is None or fireworks.billing_rollout_gpus_per_replica <= 0:
+            raise ValueError("trainer.fireworks.billing_rollout_gpus_per_replica must be > 0")
+        if fireworks.billing_gpu_price_per_hour_usd is None or fireworks.billing_gpu_price_per_hour_usd <= 0:
+            raise ValueError("trainer.fireworks.billing_gpu_price_per_hour_usd must be > 0")
+
+    if algorithm.advantage_estimator != "grpo":
+        raise ValueError("The initial Fireworks backend is GRPO-only")
+    if algorithm.policy_loss_type not in ("rollout_is", "dppo"):
+        raise ValueError(
+            "The Fireworks GRPO backend requires " "trainer.algorithm.policy_loss_type='rollout_is' or 'dppo'"
+        )
+    if algorithm.policy_loss_type == "dppo" and algorithm.dppo.dppo_type != "binary_tv":
+        raise NotImplementedError("The Fireworks custom DPPO loss currently supports only dppo_type='binary_tv'")
+    if algorithm.policy_loss_type == "dppo" and algorithm.temperature != 1.0:
+        raise NotImplementedError("The Fireworks custom DPPO loss currently requires trainer.algorithm.temperature=1.0")
+    if algorithm.policy_loss_type == "dppo":
+        for name, value in (
+            ("delta_low", algorithm.dppo.delta_low),
+            ("delta_high", algorithm.dppo.delta_high),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    "Fireworks DPPO thresholds must be finite and non-negative; "
+                    f"trainer.algorithm.dppo.{name}={value!r}"
+                )
+    if algorithm.use_kl_loss or algorithm.use_kl_in_reward:
+        raise ValueError("The initial Fireworks GRPO backend requires KL loss and KL reward penalty to be disabled")
+    if trainer.critic.model.path:
+        raise ValueError("The Fireworks GRPO backend is policy-only; trainer.critic.model.path must be null")
+    if trainer.update_epochs_per_batch != 1:
+        raise ValueError("The initial Fireworks GRPO backend requires trainer.update_epochs_per_batch=1")
+
+    if off_policy_correction_enabled(algorithm.off_policy_correction):
+        raise NotImplementedError(
+            "SkyRL off_policy_correction is not yet translated to Fireworks; use rollout_is without an extra mask"
+        )
+
+    if trainer.placement.colocate_all or trainer.placement.colocate_policy_ref:
+        raise ValueError("Hosted Fireworks training cannot be colocated with local SkyRL models")
+    if inference.run_engines_locally:
+        raise ValueError("Fireworks inference is hosted; set generator.inference_engine.run_engines_locally=false")
+    if cfg.generator.max_turns != 1:
+        raise NotImplementedError("The initial Fireworks backend supports single-turn SkyRL rollouts only")
+    if cfg.generator.vision_language_generator:
+        raise NotImplementedError("The initial Fireworks backend supports text-only rollouts")
+
+    if trainer.resume_mode not in (None, "none", "latest", "from_path"):
+        raise ValueError("trainer.resume_mode must be null/'none', 'latest', or 'from_path'")
+    if trainer.resume_mode == "from_path" and not trainer.resume_path:
+        raise ValueError("trainer.resume_path is required when trainer.resume_mode='from_path'")
+    if trainer.hf_save_interval > 0:
+        raise NotImplementedError("HuggingFace export is not wired to Fireworks yet; set trainer.hf_save_interval=-1")
+    if trainer.policy.torch_profiler_config.enable:
+        raise ValueError("Local torch profiling is unavailable with hosted Fireworks training")
+    if trainer.enable_ray_gpu_monitor:
+        raise ValueError("Set trainer.enable_ray_gpu_monitor=false for hosted Fireworks training")
+    if inference.enable_ray_prometheus_stats:
+        raise ValueError("Set generator.inference_engine.enable_ray_prometheus_stats=false for Fireworks")
+
+    optimizer = trainer.policy.optimizer_config
+    if optimizer.num_warmup_steps != 0 or optimizer.scheduler != "constant_with_warmup":
+        raise NotImplementedError(
+            "The initial Fireworks backend supports a constant learning rate only "
+            "(scheduler='constant_with_warmup', num_warmup_steps=0)"
+        )
+
+    for name, sampling in (
+        ("sampling_params", cfg.generator.sampling_params),
+        ("eval_sampling_params", cfg.generator.eval_sampling_params),
+    ):
+        if sampling is None:
+            raise ValueError(f"generator.{name} must be configured for Fireworks")
+        if sampling.repetition_penalty != 1.0:
+            raise NotImplementedError(f"generator.{name}.repetition_penalty is not supported by Fireworks sampling")
+        if sampling.min_p != 0.0:
+            raise NotImplementedError(f"generator.{name}.min_p is not supported by Fireworks sampling")
+
+    max_model_input = trainer.max_prompt_length + cfg.generator.sampling_params.max_generate_length - 1
+    if max_model_input > fireworks.max_seq_len:
+        raise ValueError(
+            "Configured prompt plus generation length exceeds trainer.fireworks.max_seq_len: "
+            f"{max_model_input} > {fireworks.max_seq_len}"
+        )
+
+
+def _validate_tinker_cfg(cfg: SkyRLTrainConfig) -> None:
+    """Validate the initial policy-only hosted Tinker GRPO capability set."""
+
+    trainer = cfg.trainer
+    tinker = trainer.tinker
+    inference = cfg.generator.inference_engine
+    algorithm = trainer.algorithm
+
+    if trainer.strategy != "tinker" or inference.backend != "tinker":
+        raise ValueError(
+            "Hosted Tinker must be selected for both trainer.strategy and " "generator.inference_engine.backend"
+        )
+    if not tinker.base_model:
+        raise ValueError("trainer.tinker.base_model is required")
+    if tinker.max_seq_len is None or tinker.max_seq_len <= 0:
+        raise ValueError("trainer.tinker.max_seq_len must be a positive integer")
+    if not trainer.policy.model.path:
+        raise ValueError("trainer.policy.model.path must name the tokenizer matching the Tinker base model")
+    if trainer.policy.model.lora.rank <= 0:
+        raise ValueError("The initial hosted Tinker backend requires trainer.policy.model.lora.rank > 0")
+    if not any((tinker.train_mlp, tinker.train_attn, tinker.train_unembed)):
+        raise ValueError("At least one Tinker train_mlp, train_attn, or train_unembed option must be true")
+    for name in ("request_timeout_s", "sampling_timeout_s", "close_timeout_s"):
+        if getattr(tinker, name) <= 0:
+            raise ValueError(f"trainer.tinker.{name} must be positive")
+    if tinker.service_bootstrap_max_attempts <= 0:
+        raise ValueError("trainer.tinker.service_bootstrap_max_attempts must be positive")
+    if tinker.service_bootstrap_retry_backoff_s < 0:
+        raise ValueError("trainer.tinker.service_bootstrap_retry_backoff_s must be non-negative")
+    if tinker.checkpoint_ttl_seconds is not None and tinker.checkpoint_ttl_seconds <= 0:
+        raise ValueError("trainer.tinker.checkpoint_ttl_seconds must be positive or null")
+    if tinker.sampler_checkpoint_ttl_seconds is not None and tinker.sampler_checkpoint_ttl_seconds <= 0:
+        raise ValueError("trainer.tinker.sampler_checkpoint_ttl_seconds must be positive or null")
+    for name in (
+        "prefill_price_per_million_tokens",
+        "cached_prefill_price_per_million_tokens",
+        "sample_price_per_million_tokens",
+        "train_price_per_million_tokens",
+    ):
+        value = getattr(tinker, name)
+        if value is not None and value < 0:
+            raise ValueError(f"trainer.tinker.{name} must be non-negative or null")
+    if tinker.max_estimated_cost_usd is not None and tinker.max_estimated_cost_usd <= 0:
+        raise ValueError("trainer.tinker.max_estimated_cost_usd must be positive or null")
+    if tinker.max_estimated_cost_usd is not None:
+        missing_prices = [
+            name
+            for name in (
+                "prefill_price_per_million_tokens",
+                "sample_price_per_million_tokens",
+                "train_price_per_million_tokens",
+            )
+            if getattr(tinker, name) is None
+        ]
+        if missing_prices:
+            raise ValueError(
+                "trainer.tinker.max_estimated_cost_usd requires token prices: " + ", ".join(missing_prices)
+            )
+
+    if algorithm.advantage_estimator != "grpo":
+        raise ValueError("The initial hosted Tinker backend is GRPO-only")
+    if algorithm.policy_loss_type != "rollout_is":
+        raise ValueError("Hosted Tinker GRPO requires trainer.algorithm.policy_loss_type='rollout_is'")
+    if algorithm.use_kl_loss or algorithm.use_kl_in_reward:
+        raise ValueError("Hosted Tinker GRPO requires KL loss and KL reward penalty to be disabled")
+    if trainer.critic.model.path:
+        raise ValueError("Hosted Tinker GRPO is policy-only; trainer.critic.model.path must be null")
+    if trainer.update_epochs_per_batch != 1:
+        raise ValueError("Hosted Tinker GRPO requires trainer.update_epochs_per_batch=1")
+
+    if off_policy_correction_enabled(algorithm.off_policy_correction):
+        raise NotImplementedError(
+            "SkyRL off_policy_correction is not translated to Tinker; use rollout_is without an extra mask"
+        )
+
+    if trainer.placement.colocate_all or trainer.placement.colocate_policy_ref:
+        raise ValueError("Hosted Tinker training cannot be colocated with local SkyRL models")
+    if inference.run_engines_locally:
+        raise ValueError("Tinker inference is hosted; set generator.inference_engine.run_engines_locally=false")
+    if cfg.generator.max_turns != 1:
+        raise NotImplementedError("The initial hosted Tinker backend supports single-turn rollouts only")
+    if cfg.generator.vision_language_generator:
+        raise NotImplementedError("The initial hosted Tinker backend supports text-only rollouts")
+
+    if trainer.resume_mode not in (None, "none", "latest", "from_path"):
+        raise ValueError("trainer.resume_mode must be null/'none', 'latest', or 'from_path'")
+    if trainer.resume_mode == "from_path" and not trainer.resume_path:
+        raise ValueError("trainer.resume_path is required when trainer.resume_mode='from_path'")
+    if trainer.hf_save_interval > 0:
+        raise NotImplementedError("HuggingFace export is not wired to Tinker yet; set trainer.hf_save_interval=-1")
+    if trainer.policy.torch_profiler_config.enable:
+        raise ValueError("Local torch profiling is unavailable with hosted Tinker training")
+    if trainer.enable_ray_gpu_monitor:
+        raise ValueError("Set trainer.enable_ray_gpu_monitor=false for hosted Tinker training")
+    if inference.enable_ray_prometheus_stats:
+        raise ValueError("Set generator.inference_engine.enable_ray_prometheus_stats=false for hosted Tinker")
+
+    optimizer = trainer.policy.optimizer_config
+    if optimizer.num_warmup_steps != 0 or optimizer.scheduler != "constant_with_warmup":
+        raise NotImplementedError(
+            "The initial hosted Tinker backend supports a constant learning rate only "
+            "(scheduler='constant_with_warmup', num_warmup_steps=0)"
+        )
+
+    for name, sampling in (
+        ("sampling_params", cfg.generator.sampling_params),
+        ("eval_sampling_params", cfg.generator.eval_sampling_params),
+    ):
+        if sampling is None:
+            raise ValueError(f"generator.{name} must be configured for Tinker")
+        if sampling.repetition_penalty != 1.0:
+            raise NotImplementedError(f"generator.{name}.repetition_penalty is not supported by Tinker sampling")
+        if sampling.min_p != 0.0:
+            raise NotImplementedError(f"generator.{name}.min_p is not supported by Tinker sampling")
+
+    max_model_input = trainer.max_prompt_length + cfg.generator.sampling_params.max_generate_length - 1
+    if max_model_input > tinker.max_seq_len:
+        raise ValueError(
+            "Configured prompt plus generation length exceeds trainer.tinker.max_seq_len: "
+            f"{max_model_input} > {tinker.max_seq_len}"
+        )
+
+
 def validate_cfg(cfg: SkyRLTrainConfig):
     if cfg.trainer.strategy == "fsdp2":
         import warnings
@@ -284,6 +545,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     if cfg.trainer.max_training_steps is not None:
         if cfg.trainer.max_training_steps <= 0:
             raise ValueError(f"max_training_steps must be > 0, got {cfg.trainer.max_training_steps}")
+
+    if cfg.trainer.strategy == "fireworks" or cfg.generator.inference_engine.backend == "fireworks":
+        _validate_fireworks_cfg(cfg)
+    if cfg.trainer.strategy == "tinker" or cfg.generator.inference_engine.backend == "tinker":
+        _validate_tinker_cfg(cfg)
 
     # Validate generation config separately
     validate_generator_cfg(cfg)
@@ -410,7 +676,7 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     tis_ratio_type = off_policy_correction.tis_ratio_type
     sequence_mask_metric = off_policy_correction.sequence_mask_metric
 
-    uses_off_policy_correction = tis_ratio_type is not None or sequence_mask_metric is not None
+    uses_off_policy_correction = off_policy_correction_enabled(off_policy_correction)
 
     if uses_off_policy_correction:
         # Validate tis_ratio_type
@@ -440,7 +706,10 @@ def validate_cfg(cfg: SkyRLTrainConfig):
                 "`trainer.algorithm.off_policy_correction` doesn't support clip_cov or kl_cov policy loss types"
             )
 
-    if cfg.trainer.policy.model.lora.rank > 0:
+    if cfg.trainer.policy.model.lora.rank > 0 and cfg.trainer.strategy not in (
+        "fireworks",
+        "tinker",
+    ):
         # LoRA enabled: generator backend must be vllm, training backend must be fsdp or megatron
         assert cfg.generator.inference_engine.backend == "vllm", "LoRA enabled requires vLLM backend"
 
@@ -541,6 +810,16 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
         ValueError / NotImplementedError / AssertionError: on invalid combinations.
     """
     ie_cfg = cfg.generator.inference_engine
+
+    # Hosted providers own inference topology. Local vLLM placement,
+    # parallelism, and external-router validation do not apply.
+    if ie_cfg.backend in ("fireworks", "tinker"):
+        if cfg.trainer.strategy != ie_cfg.backend:
+            raise ValueError(
+                f"generator.inference_engine.backend={ie_cfg.backend!r} currently requires "
+                f"trainer.strategy={ie_cfg.backend!r}"
+            )
+        return
 
     if ie_cfg.enable_pd:
         assert ie_cfg.num_prefill > 0, "num_prefill must be > 0 when enable_pd=True"
@@ -776,6 +1055,13 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     if os.environ.get("WANDB_API_KEY"):
         logger.info("Exporting wandb api key to ray runtime env")
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+
+    if cfg.trainer.strategy == "fireworks" and os.environ.get("FIREWORKS_API_KEY"):
+        logger.info("Exporting Fireworks API key to the Ray entrypoint")
+        env_vars["FIREWORKS_API_KEY"] = os.environ["FIREWORKS_API_KEY"]
+    if cfg.trainer.strategy == "tinker" and os.environ.get("TINKER_API_KEY"):
+        logger.info("Exporting Tinker API key to the Ray entrypoint")
+        env_vars["TINKER_API_KEY"] = os.environ["TINKER_API_KEY"]
 
     if os.environ.get("MLFLOW_TRACKING_URI"):
         logger.info("Exporting mlflow tracking uri to ray runtime env")
@@ -1055,7 +1341,7 @@ def str_to_torch_dtype(dtype: str) -> torch.dtype:
 
 
 def format_gib(mem_bytes: int) -> str:
-    return f"{mem_bytes / (1024 ** 3):.2f} GiB"
+    return f"{mem_bytes / (1024**3):.2f} GiB"
 
 
 def print_mem(tag: str, mem: dict):

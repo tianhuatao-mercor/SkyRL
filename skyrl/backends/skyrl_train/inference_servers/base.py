@@ -1,5 +1,15 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Hashable,
+    List,
+    NotRequired,
+    Optional,
+    Tuple,
+    TypedDict,
+)
 
 from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
 
@@ -50,10 +60,11 @@ class InferenceEngineOutput(TypedDict):
     response_logprobs: Optional[List[List[float]]]
     prompt_logprobs: Optional[List[List[float]]]  # per-prompt-token logprobs under the current model
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
+    # Exact hosted-policy version used for each response, when available.
+    sampler_versions: NotRequired[Optional[List[int]]]
 
 
 class InferenceEngineInterface(ABC):
-
     @property
     @abstractmethod
     def model_name(self) -> str:

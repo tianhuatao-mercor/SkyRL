@@ -259,7 +259,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # Session Management
     # ---------------------------
 
-    def _get_semaphores(self) -> Tuple[Optional[asyncio.Semaphore], Optional[asyncio.Semaphore]]:
+    def _get_semaphores(
+        self,
+    ) -> Tuple[Optional[asyncio.Semaphore], Optional[asyncio.Semaphore]]:
         """Get or create the shared generate/detokenize semaphores for this client.
 
         Semaphores are event-loop-bound (Python 3.10+). If the running loop has
@@ -461,6 +463,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             response_ids=[r["response_ids"] for r in raw_results],
             response_logprobs=[r["response_logprobs"] for r in raw_results] if get_logprobs else None,
             rollout_expert_indices=rollout_expert_indices,
+            sampler_versions=None,
         )
 
     async def _generate_single(
@@ -1004,7 +1007,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if isinstance(mode, str):
             mode = PauseMode(mode.lower())
 
-        params: Dict[str, Any] = {"mode": mode.value, "clear_cache": str(clear_cache).lower()}
+        params: Dict[str, Any] = {
+            "mode": mode.value,
+            "clear_cache": str(clear_cache).lower(),
+        }
 
         return await self._call_all_servers("/pause", params=params)
 
@@ -1069,7 +1075,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         return await self._call_all_servers(
             "/collective_rpc",
-            {"method": "skyrl_sleep_for_weight_sync", "kwargs": {"offload_kv": offload_kv}},
+            {
+                "method": "skyrl_sleep_for_weight_sync",
+                "kwargs": {"offload_kv": offload_kv},
+            },
         )
 
     async def wake_for_weight_sync(self, tags: List[str]) -> Dict[str, Any]:
