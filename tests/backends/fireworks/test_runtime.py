@@ -115,7 +115,9 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
         "skyrl.backends.fireworks.runtime.configure_tinker_pyqwest_system_certs",
         lambda: captured.__setitem__("system_certs_configured", True),
     )
-    monkeypatch.setattr(FiretitanServiceClient, "from_firetitan_config", staticmethod(_factory))
+    monkeypatch.setattr(
+        FiretitanServiceClient, "from_firetitan_config", staticmethod(_factory)
+    )
     config = FireworksConfig(
         base_model="accounts/fireworks/models/qwen3-4b",
         max_seq_len=32768,
@@ -156,7 +158,9 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
 def test_runtime_exposes_native_inference_endpoint() -> None:
     service = _Service()
     service._managed_handle = SimpleNamespace(
-        deployment=SimpleNamespace(inference_model="accounts/test/deployments/skyrl-rollout"),
+        deployment=SimpleNamespace(
+            inference_model="accounts/test/deployments/skyrl-rollout"
+        ),
         deployment_manager=SimpleNamespace(inference_url="https://api.fireworks.ai/"),
     )
     runtime = _runtime(service=service)
@@ -170,7 +174,9 @@ def test_runtime_exposes_native_inference_endpoint() -> None:
 def test_usage_metrics_estimate_configured_gpu_hours(monkeypatch) -> None:
     config = FireworksConfig(
         base_model="accounts/fireworks/models/qwen3p6-35b-a3b",
-        training_shape_id=("accounts/fireworks/trainingShapes/qwen3p6-35b-a3b-256k-lora"),
+        training_shape_id=(
+            "accounts/fireworks/trainingShapes/qwen3p6-35b-a3b-256k-lora"
+        ),
         trainer_replica_count=1,
         replica_count=1,
         billing_gpu_type="B200",
@@ -183,7 +189,9 @@ def test_usage_metrics_estimate_configured_gpu_hours(monkeypatch) -> None:
         started_monotonic=100.0,
         started_at_utc="2026-07-30T00:00:00+00:00",
     )
-    monkeypatch.setattr("skyrl.backends.fireworks.runtime.time.monotonic", lambda: 460.0)
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.time.monotonic", lambda: 460.0
+    )
 
     metrics = runtime.usage_metrics()
 
@@ -197,7 +205,10 @@ def test_usage_metrics_estimate_configured_gpu_hours(monkeypatch) -> None:
     summary = runtime.usage_summary()
     assert summary["fireworks/run/gpu_type"] == "B200"
     assert summary["fireworks/run/started_at_utc"] == "2026-07-30T00:00:00+00:00"
-    assert "provider invoice is authoritative" in summary["fireworks/run/cost_estimate_basis"]
+    assert (
+        "provider invoice is authoritative"
+        in summary["fireworks/run/cost_estimate_basis"]
+    )
 
     report = runtime.usage_report()
     assert report["trainer_gpus_per_replica"] == 4
@@ -207,7 +218,9 @@ def test_usage_metrics_estimate_configured_gpu_hours(monkeypatch) -> None:
 
 def test_usage_metrics_track_provider_sampling_tokens(monkeypatch) -> None:
     runtime = _runtime(started_monotonic=100.0)
-    monkeypatch.setattr("skyrl.backends.fireworks.runtime.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.time.monotonic", lambda: 100.0
+    )
 
     runtime.record_external_samples(
         sampling_requests=2,
@@ -232,7 +245,9 @@ def test_usage_metrics_track_provider_sampling_tokens(monkeypatch) -> None:
     assert metrics["fireworks/usage/prompt_cache_hit_tokens_total"] == 70
     assert metrics["fireworks/usage/prompt_cache_unknown_tokens_total"] == 25
     assert metrics["fireworks/usage/sampled_tokens_total"] == 38
-    assert metrics["fireworks/usage/sampling_request_seconds_total"] == pytest.approx(2.0)
+    assert metrics["fireworks/usage/sampling_request_seconds_total"] == pytest.approx(
+        2.0
+    )
 
 
 def test_usage_restore_keeps_sampling_and_training_totals_across_resume(
@@ -242,7 +257,9 @@ def test_usage_restore_keeps_sampling_and_training_totals_across_resume(
         started_monotonic=100.0,
         started_at_utc="2026-07-30T02:00:00+00:00",
     )
-    monkeypatch.setattr("skyrl.backends.fireworks.runtime.time.monotonic", lambda: 105.0)
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.time.monotonic", lambda: 105.0
+    )
     runtime.restore_usage_reports(
         [
             {
@@ -288,46 +305,81 @@ def test_usage_restore_keeps_sampling_and_training_totals_across_resume(
     assert metrics["fireworks/usage/prompt_cache_hit_tokens_total"] == 70
     assert metrics["fireworks/usage/prompt_cache_unknown_tokens_total"] == 25
     assert metrics["fireworks/usage/sampled_tokens_total"] == 38
-    assert metrics["fireworks/usage/sampling_request_seconds_total"] == pytest.approx(2.0)
+    assert metrics["fireworks/usage/sampling_request_seconds_total"] == pytest.approx(
+        2.0
+    )
     assert metrics["fireworks/usage/forward_backward_calls_total"] == 3
     assert metrics["fireworks/usage/training_tokens_total"] == 114
-    assert metrics["fireworks/usage/forward_backward_seconds_total"] == pytest.approx(3.25)
+    assert metrics["fireworks/usage/forward_backward_seconds_total"] == pytest.approx(
+        3.25
+    )
     assert runtime.usage_report()["started_at_utc"] == "2026-07-30T01:00:00+00:00"
 
     with pytest.raises(RuntimeError, match="already been restored"):
         runtime.restore_usage_reports([{"metrics": {}}])
 
 
-def test_usage_restore_rejects_checkpoint_billing_mismatch_before_mutating() -> None:
+def test_usage_restore_preserves_old_topology_and_prices_new_stage(monkeypatch) -> None:
     runtime = _runtime(
         config=FireworksConfig(
             billing_gpu_type="B200",
-            trainer_replica_count=1,
-            replica_count=1,
+            trainer_replica_count=4,
+            replica_count=16,
             billing_trainer_gpus_per_replica=4,
             billing_rollout_gpus_per_replica=2,
             billing_gpu_price_per_hour_usd=10.0,
-        )
+        ),
+        started_monotonic=100.0,
+        started_at_utc="2026-08-05T02:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.time.monotonic", lambda: 1900.0
+    )
+    runtime.restore_usage_reports(
+        [
+            {
+                "started_at_utc": "2026-08-05T01:00:00+00:00",
+                "gpu_type": "B200",
+                "trainer_replica_count": 1,
+                "trainer_gpus_per_replica": 4,
+                "rollout_replica_count": 6,
+                "rollout_gpus_per_replica": 2,
+                "gpu_price_per_hour_usd": 12.0,
+                "metrics": {
+                    "fireworks/usage/wall_time_seconds": 3600.0,
+                    "fireworks/usage/sampling_requests_total": 7,
+                    "fireworks/usage/trainer_gpu_hours": 4.0,
+                    "fireworks/usage/rollout_gpu_hours": 12.0,
+                    "fireworks/usage/total_gpu_hours": 16.0,
+                    "fireworks/estimated_cost/gpu_total_usd": 192.0,
+                },
+            }
+        ]
     )
 
-    with pytest.raises(RuntimeError, match="gpu_price_per_hour_usd"):
-        runtime.restore_usage_reports(
-            [
-                {
-                    "gpu_type": "B200",
-                    "trainer_replica_count": 1,
-                    "trainer_gpus_per_replica": 4,
-                    "rollout_replica_count": 1,
-                    "rollout_gpus_per_replica": 2,
-                    "gpu_price_per_hour_usd": 12.0,
-                    "metrics": {
-                        "fireworks/usage/sampling_requests_total": 7,
-                    },
-                }
-            ]
-        )
+    metrics = runtime.usage_metrics()
+    assert metrics["fireworks/usage/wall_time_seconds"] == pytest.approx(5400.0)
+    assert metrics["fireworks/usage/restored_wall_time_seconds"] == 3600.0
+    assert metrics["fireworks/usage/current_stage_wall_time_seconds"] == 1800.0
+    assert metrics["fireworks/usage/trainer_gpu_count"] == 16
+    assert metrics["fireworks/usage/rollout_gpu_count"] == 32
+    assert metrics["fireworks/usage/current_stage_trainer_gpu_hours"] == 8.0
+    assert metrics["fireworks/usage/current_stage_rollout_gpu_hours"] == 16.0
+    assert metrics["fireworks/usage/trainer_gpu_hours"] == 12.0
+    assert metrics["fireworks/usage/rollout_gpu_hours"] == 28.0
+    assert metrics["fireworks/usage/total_gpu_hours"] == 40.0
+    # The old 16 GPU-hours remain at USD 12; only the new 24 are priced at 10.
+    assert metrics["fireworks/estimated_cost/current_stage_gpu_usd"] == 240.0
+    assert metrics["fireworks/estimated_cost/gpu_total_usd"] == 432.0
+    assert metrics["fireworks/usage/billing_stage_count"] == 2
+    assert metrics["fireworks/usage/cost_history_complete"] == 1
 
-    assert runtime.usage_metrics()["fireworks/usage/sampling_requests_total"] == 0
+    report = runtime.usage_report()
+    assert len(report["billing_stages"]) == 2
+    assert report["billing_stages"][0]["trainer_replica_count"] == 1
+    assert report["billing_stages"][0]["rollout_replica_count"] == 6
+    assert report["billing_stages"][1]["trainer_replica_count"] == 4
+    assert report["billing_stages"][1]["rollout_replica_count"] == 16
 
 
 @pytest.mark.asyncio
@@ -380,7 +432,9 @@ async def test_active_sample_spans_hotload_on_same_client() -> None:
         config=FireworksConfig(sampling_timeout_s=1),
     )
     first = await runtime.publish_sampler_weights()
-    sample_task = asyncio.create_task(runtime.sample_async(prompt="prompt", sampling_params="params"))
+    sample_task = asyncio.create_task(
+        runtime.sample_async(prompt="prompt", sampling_params="params")
+    )
     await asyncio.wait_for(started.wait(), timeout=1)
 
     second = await runtime.publish_sampler_weights()
@@ -419,7 +473,9 @@ async def test_failed_hotload_preserves_published_identity_and_client() -> None:
 
 
 def test_snapshot_name_leaves_room_for_provider_suffix() -> None:
-    runtime = _runtime(config=FireworksConfig(snapshot_prefix="skyrl-smoke-" + "long-prefix-" * 8))
+    runtime = _runtime(
+        config=FireworksConfig(snapshot_prefix="skyrl-smoke-" + "long-prefix-" * 8)
+    )
 
     name = runtime._snapshot_name(42)
     prefix, version, random_suffix = name.rsplit("-", 2)
@@ -432,7 +488,9 @@ def test_snapshot_name_leaves_room_for_provider_suffix() -> None:
 
 
 def test_snapshot_name_is_a_lowercase_dns_label() -> None:
-    runtime = _runtime(config=FireworksConfig(snapshot_prefix="My Run_with.dots / and spaces"))
+    runtime = _runtime(
+        config=FireworksConfig(snapshot_prefix="My Run_with.dots / and spaces")
+    )
 
     name = runtime._snapshot_name(0)
 
@@ -462,7 +520,9 @@ async def test_close_waits_for_active_sample() -> None:
         config=FireworksConfig(sampling_timeout_s=1),
     )
     await runtime.publish_sampler_weights()
-    sample_task = asyncio.create_task(runtime.sample_async(prompt="prompt", sampling_params="params"))
+    sample_task = asyncio.create_task(
+        runtime.sample_async(prompt="prompt", sampling_params="params")
+    )
     await asyncio.wait_for(started.wait(), timeout=1)
 
     close_task = asyncio.create_task(runtime.close())

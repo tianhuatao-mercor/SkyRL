@@ -63,7 +63,9 @@ class FireworksRuntime:
         "fireworks/usage/sampling_requests_total": "_sampling_requests",
         "fireworks/usage/prompt_tokens_total": "_prompt_tokens",
         "fireworks/usage/prompt_cache_hit_tokens_total": "_prompt_cache_hit_tokens",
-        "fireworks/usage/prompt_cache_unknown_tokens_total": ("_prompt_cache_unknown_tokens"),
+        "fireworks/usage/prompt_cache_unknown_tokens_total": (
+            "_prompt_cache_unknown_tokens"
+        ),
         "fireworks/usage/sampled_tokens_total": "_sampled_tokens",
         "fireworks/usage/sampling_request_seconds_total": "_sampling_request_seconds",
         "fireworks/usage/forward_backward_calls_total": "_forward_backward_calls",
@@ -92,10 +94,18 @@ class FireworksRuntime:
         self._active_samples = 0
         self._next_version = 0
         self._closed = False
-        self._started_monotonic = time.monotonic() if started_monotonic is None else started_monotonic
+        self._started_monotonic = (
+            time.monotonic() if started_monotonic is None else started_monotonic
+        )
         self._started_at_utc = started_at_utc or datetime.now(UTC).isoformat()
+        self._current_stage_started_at_utc = self._started_at_utc
         self._usage_lock = threading.Lock()
         self._restored_wall_time_seconds = 0.0
+        self._restored_trainer_gpu_hours = 0.0
+        self._restored_rollout_gpu_hours = 0.0
+        self._restored_gpu_cost_usd = 0.0
+        self._restored_billing_stages: list[dict[str, Any]] = []
+        self._cost_history_complete = True
         self._usage_restored = False
         self._sampling_requests = 0
         self._prompt_tokens = 0
@@ -126,15 +136,20 @@ class FireworksRuntime:
         if not api_key:
             raise RuntimeError("FIREWORKS_API_KEY is required for Fireworks training")
         if not config.base_model or not config.training_shape_id:
-            raise ValueError("Dedicated Fireworks training requires base_model and training_shape_id")
+            raise ValueError(
+                "Dedicated Fireworks training requires base_model and training_shape_id"
+            )
         if not config.trainer_job_id or not config.deployment_id:
-            raise ValueError("Dedicated Fireworks training requires stable trainer_job_id and deployment_id")
+            raise ValueError(
+                "Dedicated Fireworks training requires stable trainer_job_id and deployment_id"
+            )
 
         try:
             from fireworks.training.sdk import FiretitanServiceClient
         except ImportError as exc:
             raise ImportError(
-                "The Fireworks backend requires fireworks-ai[training]; " "install SkyRL with --extra fireworks"
+                "The Fireworks backend requires fireworks-ai[training]; "
+                "install SkyRL with --extra fireworks"
             ) from exc
 
         # Fireworks' embedded Tinker client enables pyqwest. On macOS, its
@@ -142,7 +157,9 @@ class FireworksRuntime:
         # TLS verification enabled while adding the operating-system CA store.
         configure_tinker_pyqwest_system_certs()
 
-        cleanup_deployment = config.cleanup_deployment_on_close if config.cleanup_on_exit else None
+        cleanup_deployment = (
+            config.cleanup_deployment_on_close if config.cleanup_on_exit else None
+        )
         service = FiretitanServiceClient.from_firetitan_config(
             api_key=api_key,
             base_url=config.base_url,
@@ -230,7 +247,13 @@ class FireworksRuntime:
             return self._sampler_identity.snapshot_path
 
     def restore_usage_reports(self, reports: list[dict[str, Any]]) -> None:
-        """Restore cumulative usage from a checkpoint before resumed work."""
+        """Restore cumulative usage without repricing earlier run segments.
+
+        A resumed job may use a different trainer or rollout replica count.
+        Historical GPU-hours and dollars therefore remain fixed at the
+        topology and rate recorded by the checkpoint, while the current
+        process accrues a new billing segment from its own configuration.
+        """
 
         if not reports:
             return
@@ -244,47 +267,148 @@ class FireworksRuntime:
                     self._training_tokens,
                 )
             ):
-                raise RuntimeError("Fireworks usage must be restored before recording provider work")
-            current_billing = {
-                "gpu_type": self.config.billing_gpu_type,
-                "trainer_replica_count": self.config.trainer_replica_count,
-                "trainer_gpus_per_replica": (self.config.billing_trainer_gpus_per_replica),
-                "rollout_replica_count": self.config.replica_count,
-                "rollout_gpus_per_replica": (self.config.billing_rollout_gpus_per_replica),
-                "gpu_price_per_hour_usd": (self.config.billing_gpu_price_per_hour_usd),
-            }
-            for report in reports:
-                saved_billing = {name: report[name] for name in current_billing if name in report}
-                mismatches = [
-                    name for name, saved_value in saved_billing.items() if current_billing[name] != saved_value
-                ]
-                if mismatches:
-                    raise RuntimeError(
-                        "Fireworks usage restore billing configuration does not "
-                        "match the checkpoint for: "
-                        + ", ".join(mismatches)
-                        + ". Resume with the recorded topology and rate so "
-                        "historical cost is not silently repriced."
-                    )
+                raise RuntimeError(
+                    "Fireworks usage must be restored before recording provider work"
+                )
             started_at_values: list[str] = []
             for report in reports:
                 metrics = report.get("metrics")
                 if not isinstance(metrics, dict):
                     continue
-                self._restored_wall_time_seconds += float(metrics.get("fireworks/usage/wall_time_seconds", 0.0))
-                for metric_name, attribute_name in self._RESTORABLE_USAGE_METRICS.items():
+                restored_wall_time = float(
+                    metrics.get("fireworks/usage/wall_time_seconds", 0.0)
+                )
+                if restored_wall_time < 0:
+                    raise RuntimeError(
+                        "Fireworks checkpoint usage contains negative wall time"
+                    )
+                self._restored_wall_time_seconds += restored_wall_time
+                for (
+                    metric_name,
+                    attribute_name,
+                ) in self._RESTORABLE_USAGE_METRICS.items():
                     value = metrics.get(metric_name, 0)
                     setattr(
                         self,
                         attribute_name,
                         getattr(self, attribute_name) + value,
                     )
+                restored_billing = self._billing_totals_from_report(
+                    report,
+                    restored_wall_time=restored_wall_time,
+                )
+                if restored_billing is None:
+                    self._cost_history_complete = False
+                else:
+                    trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd = (
+                        restored_billing
+                    )
+                    self._restored_trainer_gpu_hours += trainer_gpu_hours
+                    self._restored_rollout_gpu_hours += rollout_gpu_hours
+                    self._restored_gpu_cost_usd += gpu_cost_usd
+                saved_stages = report.get("billing_stages")
+                if isinstance(saved_stages, list):
+                    self._restored_billing_stages.extend(
+                        dict(stage) for stage in saved_stages if isinstance(stage, dict)
+                    )
+                else:
+                    legacy_stage = self._legacy_billing_stage(
+                        report,
+                        restored_wall_time=restored_wall_time,
+                        restored_billing=restored_billing,
+                    )
+                    if legacy_stage is not None:
+                        self._restored_billing_stages.append(legacy_stage)
                 started_at = report.get("started_at_utc")
                 if started_at:
                     started_at_values.append(str(started_at))
             if started_at_values:
                 self._started_at_utc = min(started_at_values)
             self._usage_restored = True
+
+    @staticmethod
+    def _nonnegative_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        number = float(value)
+        if number < 0:
+            raise RuntimeError(
+                "Fireworks checkpoint usage contains a negative billing value"
+            )
+        return number
+
+    def _billing_totals_from_report(
+        self,
+        report: dict[str, Any],
+        *,
+        restored_wall_time: float,
+    ) -> tuple[float, float, float] | None:
+        """Read cumulative GPU-hours/cost, with legacy reconstruction."""
+
+        metrics = report.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        trainer_gpu_hours = self._nonnegative_float(
+            metrics.get("fireworks/usage/trainer_gpu_hours")
+        )
+        rollout_gpu_hours = self._nonnegative_float(
+            metrics.get("fireworks/usage/rollout_gpu_hours")
+        )
+        if trainer_gpu_hours is None or rollout_gpu_hours is None:
+            trainer_replicas = self._nonnegative_float(
+                report.get("trainer_replica_count")
+            )
+            trainer_gpus = self._nonnegative_float(
+                report.get("trainer_gpus_per_replica")
+            )
+            rollout_replicas = self._nonnegative_float(
+                report.get("rollout_replica_count")
+            )
+            rollout_gpus = self._nonnegative_float(
+                report.get("rollout_gpus_per_replica")
+            )
+            if None in (trainer_replicas, trainer_gpus, rollout_replicas, rollout_gpus):
+                return None
+            elapsed_hours = restored_wall_time / 3600.0
+            trainer_gpu_hours = trainer_replicas * trainer_gpus * elapsed_hours
+            rollout_gpu_hours = rollout_replicas * rollout_gpus * elapsed_hours
+
+        gpu_cost_usd = self._nonnegative_float(
+            metrics.get("fireworks/estimated_cost/gpu_total_usd")
+        )
+        if gpu_cost_usd is None:
+            gpu_price = self._nonnegative_float(report.get("gpu_price_per_hour_usd"))
+            if gpu_price is None:
+                return None
+            gpu_cost_usd = (trainer_gpu_hours + rollout_gpu_hours) * gpu_price
+        return trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd
+
+    @staticmethod
+    def _legacy_billing_stage(
+        report: dict[str, Any],
+        *,
+        restored_wall_time: float,
+        restored_billing: tuple[float, float, float] | None,
+    ) -> dict[str, Any] | None:
+        """Preserve one pre-stage-format checkpoint as an auditable segment."""
+
+        if restored_billing is None:
+            return None
+        trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd = restored_billing
+        return {
+            "started_at_utc": report.get("started_at_utc"),
+            "wall_time_seconds": restored_wall_time,
+            "gpu_type": report.get("gpu_type"),
+            "trainer_replica_count": report.get("trainer_replica_count"),
+            "trainer_gpus_per_replica": report.get("trainer_gpus_per_replica"),
+            "rollout_replica_count": report.get("rollout_replica_count"),
+            "rollout_gpus_per_replica": report.get("rollout_gpus_per_replica"),
+            "gpu_price_per_hour_usd": report.get("gpu_price_per_hour_usd"),
+            "trainer_gpu_hours": trainer_gpu_hours,
+            "rollout_gpu_hours": rollout_gpu_hours,
+            "estimated_cost_usd": gpu_cost_usd,
+            "source": "restored_legacy_checkpoint",
+        }
 
     def record_external_samples(
         self,
@@ -311,7 +435,10 @@ class FireworksRuntime:
         ):
             raise ValueError("Fireworks sampling usage must be non-negative")
         if prompt_cache_hit_tokens + prompt_cache_unknown_tokens > prompt_tokens:
-            raise ValueError("Fireworks cached plus unknown prompt tokens cannot exceed total " "prompt tokens")
+            raise ValueError(
+                "Fireworks cached plus unknown prompt tokens cannot exceed total "
+                "prompt tokens"
+            )
         with self._usage_lock:
             self._sampling_requests += sampling_requests
             self._prompt_tokens += prompt_tokens
@@ -342,40 +469,60 @@ class FireworksRuntime:
 
         Fireworks bills dedicated RFT and rollout capacity by active GPU
         second. The SDK does not expose exact billing-state transitions, so the
-        local estimate applies the configured topology to the driver-observed
-        interval beginning immediately before provisioning.
+        local estimate applies each run segment's configured topology to its
+        driver-observed interval beginning immediately before provisioning.
         """
 
         with self._usage_lock:
-            elapsed_s = max(
-                0.0,
-                self._restored_wall_time_seconds + time.monotonic() - self._started_monotonic,
-            )
+            current_elapsed_s = max(0.0, time.monotonic() - self._started_monotonic)
+            elapsed_s = self._restored_wall_time_seconds + current_elapsed_s
             metrics: dict[str, int | float] = {
                 "fireworks/usage/wall_time_seconds": elapsed_s,
+                "fireworks/usage/restored_wall_time_seconds": self._restored_wall_time_seconds,
+                "fireworks/usage/current_stage_wall_time_seconds": current_elapsed_s,
                 "fireworks/usage/sampling_requests_total": self._sampling_requests,
                 "fireworks/usage/prompt_tokens_total": self._prompt_tokens,
-                "fireworks/usage/prompt_cache_hit_tokens_total": (self._prompt_cache_hit_tokens),
-                "fireworks/usage/prompt_cache_unknown_tokens_total": (self._prompt_cache_unknown_tokens),
+                "fireworks/usage/prompt_cache_hit_tokens_total": (
+                    self._prompt_cache_hit_tokens
+                ),
+                "fireworks/usage/prompt_cache_unknown_tokens_total": (
+                    self._prompt_cache_unknown_tokens
+                ),
                 "fireworks/usage/sampled_tokens_total": self._sampled_tokens,
-                "fireworks/usage/sampling_request_seconds_total": (self._sampling_request_seconds),
-                "fireworks/usage/forward_backward_calls_total": (self._forward_backward_calls),
+                "fireworks/usage/sampling_request_seconds_total": (
+                    self._sampling_request_seconds
+                ),
+                "fireworks/usage/forward_backward_calls_total": (
+                    self._forward_backward_calls
+                ),
                 "fireworks/usage/training_tokens_total": self._training_tokens,
-                "fireworks/usage/forward_backward_seconds_total": (self._forward_backward_seconds),
+                "fireworks/usage/forward_backward_seconds_total": (
+                    self._forward_backward_seconds
+                ),
             }
         trainer_gpus_per_replica = self.config.billing_trainer_gpus_per_replica
         rollout_gpus_per_replica = self.config.billing_rollout_gpus_per_replica
         gpu_price = self.config.billing_gpu_price_per_hour_usd
-        if trainer_gpus_per_replica is None or rollout_gpus_per_replica is None or gpu_price is None:
+        if (
+            trainer_gpus_per_replica is None
+            or rollout_gpus_per_replica is None
+            or gpu_price is None
+        ):
             return metrics
 
         trainer_gpu_count = self.config.trainer_replica_count * trainer_gpus_per_replica
         rollout_gpu_count = self.config.replica_count * rollout_gpus_per_replica
         total_gpu_count = trainer_gpu_count + rollout_gpu_count
-        hours = elapsed_s / 3600.0
-        trainer_gpu_hours = trainer_gpu_count * hours
-        rollout_gpu_hours = rollout_gpu_count * hours
+        current_hours = current_elapsed_s / 3600.0
+        current_trainer_gpu_hours = trainer_gpu_count * current_hours
+        current_rollout_gpu_hours = rollout_gpu_count * current_hours
+        trainer_gpu_hours = self._restored_trainer_gpu_hours + current_trainer_gpu_hours
+        rollout_gpu_hours = self._restored_rollout_gpu_hours + current_rollout_gpu_hours
         total_gpu_hours = trainer_gpu_hours + rollout_gpu_hours
+        current_gpu_cost_usd = (
+            current_trainer_gpu_hours + current_rollout_gpu_hours
+        ) * gpu_price
+        total_gpu_cost_usd = self._restored_gpu_cost_usd + current_gpu_cost_usd
         metrics.update(
             {
                 "fireworks/usage/trainer_gpu_count": trainer_gpu_count,
@@ -384,8 +531,21 @@ class FireworksRuntime:
                 "fireworks/usage/trainer_gpu_hours": trainer_gpu_hours,
                 "fireworks/usage/rollout_gpu_hours": rollout_gpu_hours,
                 "fireworks/usage/total_gpu_hours": total_gpu_hours,
+                "fireworks/usage/current_stage_trainer_gpu_hours": current_trainer_gpu_hours,
+                "fireworks/usage/current_stage_rollout_gpu_hours": current_rollout_gpu_hours,
+                "fireworks/usage/current_stage_total_gpu_hours": (
+                    current_trainer_gpu_hours + current_rollout_gpu_hours
+                ),
+                "fireworks/usage/billing_stage_count": len(
+                    self._restored_billing_stages
+                )
+                + 1,
+                "fireworks/usage/cost_history_complete": int(
+                    self._cost_history_complete
+                ),
                 "fireworks/cost/gpu_price_per_hour_usd": gpu_price,
-                "fireworks/estimated_cost/gpu_total_usd": (total_gpu_hours * gpu_price),
+                "fireworks/estimated_cost/current_stage_gpu_usd": current_gpu_cost_usd,
+                "fireworks/estimated_cost/gpu_total_usd": total_gpu_cost_usd,
             }
         )
         return metrics
@@ -398,13 +558,15 @@ class FireworksRuntime:
             {
                 "fireworks/run/started_at_utc": self._started_at_utc,
                 "fireworks/run/base_model": self.config.base_model or "",
-                "fireworks/run/training_shape_id": (self.config.training_shape_id or ""),
+                "fireworks/run/training_shape_id": (
+                    self.config.training_shape_id or ""
+                ),
                 "fireworks/run/trainer_job_id": self.trainer_job_id or "",
                 "fireworks/run/deployment_id": self.deployment_id or "",
                 "fireworks/run/cost_estimate_basis": (
-                    "configured trainer plus rollout GPU count multiplied by "
-                    "driver-observed provisioning-through-tracker-finish time and "
-                    "configured GPU-hour rate; provider invoice is authoritative"
+                    "sum of per-run billing segments, each using its recorded "
+                    "trainer/rollout topology, driver-observed active time, and "
+                    "GPU-hour rate; provider invoice is authoritative"
                 ),
             }
         )
@@ -415,6 +577,34 @@ class FireworksRuntime:
     def usage_report(self) -> dict[str, Any]:
         """Return a JSON-serializable audit record for checkpoint manifests."""
 
+        metrics = self.usage_metrics()
+        current_stage: dict[str, Any] | None = None
+        if "fireworks/usage/current_stage_trainer_gpu_hours" in metrics:
+            current_stage = {
+                "started_at_utc": self._current_stage_started_at_utc,
+                "wall_time_seconds": metrics[
+                    "fireworks/usage/current_stage_wall_time_seconds"
+                ],
+                "gpu_type": self.config.billing_gpu_type,
+                "trainer_replica_count": self.config.trainer_replica_count,
+                "trainer_gpus_per_replica": self.config.billing_trainer_gpus_per_replica,
+                "rollout_replica_count": self.config.replica_count,
+                "rollout_gpus_per_replica": self.config.billing_rollout_gpus_per_replica,
+                "gpu_price_per_hour_usd": self.config.billing_gpu_price_per_hour_usd,
+                "trainer_gpu_hours": metrics[
+                    "fireworks/usage/current_stage_trainer_gpu_hours"
+                ],
+                "rollout_gpu_hours": metrics[
+                    "fireworks/usage/current_stage_rollout_gpu_hours"
+                ],
+                "estimated_cost_usd": metrics[
+                    "fireworks/estimated_cost/current_stage_gpu_usd"
+                ],
+                "source": "current_process",
+            }
+        billing_stages = [dict(stage) for stage in self._restored_billing_stages]
+        if current_stage is not None:
+            billing_stages.append(current_stage)
         return {
             "cumulative_across_resumes": True,
             "started_at_utc": self._started_at_utc,
@@ -429,16 +619,20 @@ class FireworksRuntime:
             "rollout_gpus_per_replica": (self.config.billing_rollout_gpus_per_replica),
             "gpu_price_per_hour_usd": (self.config.billing_gpu_price_per_hour_usd),
             "estimate_basis": (
-                "configured trainer plus rollout GPU count multiplied by "
-                "driver-observed provisioning-through-checkpoint time and "
-                "configured GPU-hour rate; provider invoice is authoritative"
+                "sum of per-run billing segments, each using its recorded "
+                "trainer/rollout topology, driver-observed active time, and "
+                "GPU-hour rate; provider invoice is authoritative"
             ),
-            "metrics": self.usage_metrics(),
+            "billing_stages": billing_stages,
+            "metrics": metrics,
         }
 
     def _snapshot_name(self, version: int) -> str:
         # Dedicated checkpoint names are lowercase DNS labels.
-        prefix = re.sub(r"[^a-z0-9-]+", "-", self.config.snapshot_prefix.lower()).strip("-") or "skyrl"
+        prefix = (
+            re.sub(r"[^a-z0-9-]+", "-", self.config.snapshot_prefix.lower()).strip("-")
+            or "skyrl"
+        )
         suffix = f"-v{version:08d}-{uuid.uuid4().hex[:8]}"
         # Fireworks appends another ``-<8 hex>`` suffix. Keep our input at 54
         # characters so the provider-side name remains at most 63 characters.
@@ -461,11 +655,15 @@ class FireworksRuntime:
                 result = future.result(timeout=self.config.request_timeout_s)
                 path = getattr(result, "path", None)
                 if not path:
-                    raise RuntimeError(f"Fireworks save_weights_for_sampler({name!r}) returned no path")
+                    raise RuntimeError(
+                        f"Fireworks save_weights_for_sampler({name!r}) returned no path"
+                    )
                 return str(path)
 
             snapshot_path = await asyncio.to_thread(_save)
-            await asyncio.to_thread(self.service.hotload_sampler_snapshot, snapshot_path)
+            await asyncio.to_thread(
+                self.service.hotload_sampler_snapshot, snapshot_path
+            )
 
             # The client is created once, after the first snapshot is ready.
             with self._state_lock:
@@ -492,7 +690,9 @@ class FireworksRuntime:
             if self._closed:
                 raise RuntimeError("Fireworks runtime is closed")
             if self._sampler is None or self._sampler_identity is None:
-                raise RuntimeError("Fireworks sampler weights have not been published yet")
+                raise RuntimeError(
+                    "Fireworks sampler weights have not been published yet"
+                )
             sampler = self._sampler
             identity = self._sampler_identity
             self._active_samples += 1
@@ -518,7 +718,9 @@ class FireworksRuntime:
         with self._use_sampler() as (sampler, identity):
             native_sample = getattr(sampler, "sample_async", None)
             if native_sample is None:
-                raise RuntimeError("The dedicated Fireworks sampler must expose sample_async()")
+                raise RuntimeError(
+                    "The dedicated Fireworks sampler must expose sample_async()"
+                )
             result = await asyncio.wait_for(
                 native_sample(
                     prompt=prompt,
