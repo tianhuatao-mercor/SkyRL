@@ -14,9 +14,7 @@ High-level notes:
 import asyncio
 import inspect
 import os
-import sys
 import time
-import traceback
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
@@ -245,12 +243,7 @@ class _AsyncStalenessManager:
             self._cond.notify_all()
 
     async def on_rollout_rejected(self) -> None:
-        """
-        Called when a generation is not accepted, or generation worker runs into error while generating a trajectory.
-
-        Currently, we do not call this method but instead raise errors. We might need to use this when we want to
-        filter out trajectories.
-        """
+        """Release a slot when a generation worker fails or is cancelled before acceptance."""
         async with self._cond:
             self._stat.running -= 1
             self._cond.notify_all()
@@ -533,6 +526,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         start_epoch = resumed_start_epoch if resumed_start_epoch is not None else 0
         self.global_step += 1  # start training at global_step 1
         stop_training = False
+        generation_supervisor: Optional[asyncio.Task[None]] = None
         self._profiler_start()
         try:
             for epoch in range(start_epoch, self.cfg.trainer.epochs):
@@ -542,24 +536,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 # Buffer of completed generation, size bounded by capacity - consumed = B * (max_staleness_steps + 1)
                 generation_output_group_buffer = asyncio.Queue[GeneratedOutputGroup](maxsize=self._gen_buffer_maxsize)
 
-                # Maintain self.num_parallel_generation_workers concurrent group-generation workers
-                generator_tasks = [
-                    asyncio.create_task(self._run_generate_for_a_group_loop(generation_output_group_buffer))
-                    for _ in range(self.num_parallel_generation_workers)
-                ]
-
-                # Lets the consumer detect epoch exhaustion (all generators done + buffer empty) instead of
-                # blocking forever on buffer.get() -- under sample_full_batch, drops can exhaust an epoch
-                # before num_steps_per_epoch steps complete.
-                all_generators_done = asyncio.Event()
-                generators_done_watcher = None
-                if self.sample_full_batch:
-
-                    async def _watch_generators_done(tasks=generator_tasks, event=all_generators_done):
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        event.set()
-
-                    generators_done_watcher = asyncio.create_task(_watch_generators_done())
+                # Structured concurrency keeps worker failures observable: one worker error cancels its
+                # siblings and completes this supervisor with an ExceptionGroup. Buffer waits below race
+                # the supervisor so a failed producer cannot leave the trainer blocked forever.
+                generation_supervisor = asyncio.create_task(
+                    self._run_generation_task_group(generation_output_group_buffer)
+                )
 
                 # Steps trained in THIS epoch (not global_step % num_steps_per_epoch: sample_full_batch can
                 # end an epoch early, drifting global_step out of epoch alignment). On resume the dataloader
@@ -580,8 +562,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             cur_dropped_groups,
                             epoch_exhausted,
                         ) = await self._collect_generation_mini_batch(
-                            generation_output_group_buffer, all_generators_done
+                            generation_output_group_buffer, generation_supervisor
                         )
+
+                        # A worker can fail just as the final group is dequeued. Check again before
+                        # entering synchronous post-processing or provider training work.
+                        await self._raise_generation_task_group_error(generation_supervisor)
 
                         if epoch_exhausted:
                             # Exhausted mid mini-batch: discard the partial batch (marked consumed so it
@@ -626,6 +612,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 cur_generation_group_mini_batch,
                                 cur_dropped_groups,
                             )
+                        await self._raise_generation_task_group_error(generation_supervisor)
 
                         # 3. Run training and update consumed UIDs.
                         with self._phase_gauge.timed_phase("run_training", self.all_timings):
@@ -695,12 +682,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         logger.info(
                             f"Reached max_training_steps={self.cfg.trainer.max_training_steps}, stopping early."
                         )
-                        for t in generator_tasks:
-                            t.cancel()
-                        await asyncio.gather(*generator_tasks, return_exceptions=True)
-                        if generators_done_watcher is not None:
-                            generators_done_watcher.cancel()
-                            await asyncio.gather(generators_done_watcher, return_exceptions=True)
+                        await self._stop_generation_task_group(generation_supervisor)
+                        generation_supervisor = None
                         stop_training = True
                         break
 
@@ -724,21 +707,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     with Timer("update_ref_with_policy", self.all_timings):
                         await asyncio.to_thread(self.update_ref_with_policy)
 
-                # Cancel generator tasks for this epoch
-                for t in generator_tasks:
-                    t.cancel()
-                try:
-                    await asyncio.gather(*generator_tasks, return_exceptions=True)
-                except Exception:
-                    pass
-                if generators_done_watcher is not None:
-                    generators_done_watcher.cancel()
-                    await asyncio.gather(generators_done_watcher, return_exceptions=True)
+                # Stop any workers still waiting on capacity at the epoch boundary. If a worker
+                # failed concurrently, propagate its TaskGroup error instead of swallowing it.
+                await self._stop_generation_task_group(generation_supervisor)
+                generation_supervisor = None
 
                 # Per-epoch reset/validation for data loading and staleness management
-                assert all(
-                    t.done() for t in generator_tasks
-                ), "Generator tasks must be done before resetting the dataloader manager and validating the staleness manager."
                 assert (
                     generation_output_group_buffer.qsize() == 0
                 ), f"We expect all generation output to be consumed by the training worker at end of an epoch, got {generation_output_group_buffer.qsize()}."
@@ -747,6 +721,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # End of an epoch.
         finally:
+            # Also clean up workers when conversion, training, evaluation, or checkpointing raises.
+            # Suppress the supervisor result here so it cannot mask the exception already propagating;
+            # normal paths use _stop_generation_task_group, which does propagate worker failures.
+            if generation_supervisor is not None:
+                if not generation_supervisor.done():
+                    generation_supervisor.cancel()
+                await asyncio.gather(generation_supervisor, return_exceptions=True)
             self._profiler_stop()
             if self._ray_gpu_monitor is not None:
                 self._ray_gpu_monitor.stop()
@@ -784,36 +765,81 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.tracker.finish()
         logger.info("Training done!")
 
-    async def _drain_next_group(
-        self, buffer: asyncio.Queue, all_generators_done: asyncio.Event
-    ) -> Optional[GeneratedOutputGroup]:
-        """Return the next generated group, or None if generation is exhausted (all workers finished
-        and the buffer is empty).
+    async def _run_generation_task_group(self, buffer: asyncio.Queue) -> None:
+        """Run all generation workers as one supervised unit.
 
-        Only used under ``sample_full_batch``, where dropping groups can exhaust the epoch mid
-        mini-batch and a plain blocking ``buffer.get()`` would hang forever.
+        ``TaskGroup`` cancels the remaining workers when any worker raises and propagates the
+        failure from this coroutine as an ``ExceptionGroup``. The training consumer observes this
+        supervisor alongside the output buffer, so a producer failure cannot become a silent hang.
+        """
+        async with asyncio.TaskGroup() as task_group:
+            for _ in range(self.num_parallel_generation_workers):
+                task_group.create_task(self._run_generate_for_a_group_loop(buffer))
+
+    @staticmethod
+    async def _raise_generation_task_group_error(generation_supervisor: asyncio.Task[None]) -> None:
+        """Propagate a completed generation supervisor's error, if any."""
+        if generation_supervisor.done() and not generation_supervisor.cancelled():
+            await generation_supervisor
+
+    @staticmethod
+    async def _stop_generation_task_group(generation_supervisor: asyncio.Task[None]) -> None:
+        """Stop an epoch's generation workers without hiding a completed worker failure."""
+        if generation_supervisor.done():
+            if not generation_supervisor.cancelled():
+                await generation_supervisor
+            return
+
+        generation_supervisor.cancel()
+        await asyncio.gather(generation_supervisor, return_exceptions=True)
+        # A worker may have failed just before cancellation reached the TaskGroup.
+        if not generation_supervisor.cancelled():
+            await generation_supervisor
+
+    async def _drain_next_group(
+        self, buffer: asyncio.Queue, generation_supervisor: asyncio.Task[None]
+    ) -> Optional[GeneratedOutputGroup]:
+        """Return the next generated group, or ``None`` after successful generation exhaustion.
+
+        The buffer wait is raced against the generation TaskGroup supervisor. A worker failure is
+        therefore raised immediately while the consumer is waiting, rather than being swallowed by
+        a detached task and leaving the consumer blocked forever.
         """
         while True:
+            # Prefer a producer error over already-buffered work. On successful exhaustion, drain
+            # everything workers enqueued before returning None.
+            if generation_supervisor.done():
+                await FullyAsyncRayPPOTrainer._raise_generation_task_group_error(generation_supervisor)
+                if buffer.empty():
+                    return None
+                return buffer.get_nowait()
             if not buffer.empty():
                 return buffer.get_nowait()
-            if all_generators_done.is_set():
-                return None
-            get_task = asyncio.ensure_future(buffer.get())
-            done_task = asyncio.ensure_future(all_generators_done.wait())
-            done, pending = await asyncio.wait({get_task, done_task}, return_when=asyncio.FIRST_COMPLETED)
-            if get_task in done:
-                for t in pending:
-                    t.cancel()
-                return get_task.result()
-            # all_generators_done fired first. Cancel the pending get and loop to re-check the buffer.
-            # If the get had already pulled an item (racing the cancel), return it rather than drop it
-            # (a successful get() pops from the queue). No put can actually race here since the event is
-            # only set after all producers stop, but this stays correct regardless.
-            get_task.cancel()
+
+            get_task = asyncio.create_task(buffer.get())
             try:
-                return await get_task
-            except asyncio.CancelledError:
-                pass
+                done, _ = await asyncio.wait({get_task, generation_supervisor}, return_when=asyncio.FIRST_COMPLETED)
+            except BaseException:
+                get_task.cancel()
+                await asyncio.gather(get_task, return_exceptions=True)
+                raise
+
+            if generation_supervisor in done:
+                # If generation failed, clean up only the queue waiter before propagating the
+                # supervisor's ExceptionGroup. Never cancel the shared supervisor from here.
+                if not generation_supervisor.cancelled() and generation_supervisor.exception() is not None:
+                    get_task.cancel()
+                    await asyncio.gather(get_task, return_exceptions=True)
+                    await generation_supervisor
+
+                if get_task.done() and not get_task.cancelled():
+                    return get_task.result()
+                get_task.cancel()
+                await asyncio.gather(get_task, return_exceptions=True)
+                # Successful exhaustion may race an enqueue. Re-check the buffer before None.
+                continue
+
+            return get_task.result()
 
     def _should_keep_group(self, group: GeneratedOutputGroup) -> bool:
         """Whether a group has reward variance (train on it) vs. is zero-variance (drop it).
@@ -838,7 +864,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     async def _collect_generation_mini_batch(
         self,
         generation_output_group_buffer: asyncio.Queue,
-        all_generators_done: asyncio.Event,
+        generation_supervisor: asyncio.Task[None],
     ) -> Tuple[List[GeneratedOutputGroup], List[GeneratedOutputGroup], bool]:
         """Pull a full mini-batch of generated groups from the buffer.
 
@@ -863,16 +889,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             )
             while len(kept_groups) < self.mini_batch_size:
                 # We do finish-time FIFO here (not schedule-time FIFO).
+                group = await self._drain_next_group(generation_output_group_buffer, generation_supervisor)
+                if group is None:
+                    if not self.sample_full_batch:
+                        raise RuntimeError("Generation exhausted before producing a complete training mini-batch.")
+                    epoch_exhausted = True
+                    break
+
                 if not self.sample_full_batch:
-                    kept_groups.append(await generation_output_group_buffer.get())
+                    kept_groups.append(group)
                     buffer_pbar.update(1)
                     buffer_pbar.set_postfix({"buffer qsize": generation_output_group_buffer.qsize()})
                     continue
 
-                group = await self._drain_next_group(generation_output_group_buffer, all_generators_done)
-                if group is None:
-                    epoch_exhausted = True
-                    break
                 try:
                     if self._should_keep_group(group):
                         kept_groups.append(group)
@@ -892,8 +921,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
     @staticmethod
     def _log_group_processing_error(group: GeneratedOutputGroup, kept_so_far: int, dropped_so_far: int) -> None:
-        """Log the offending group's reward / loss-mask shape before a drain-loop error propagates,
-        flushing stderr (generator ``os._exit`` on teardown can otherwise drop buffered output)."""
+        """Log the offending group's reward / loss-mask shape before an error propagates."""
         go = group.generator_output
         rewards = go.get("rewards") if isinstance(go, dict) else None
         loss_masks = go.get("loss_masks") if isinstance(go, dict) else None
@@ -906,7 +934,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             f"loss_masks type={type(loss_masks).__name__} "
             f"len={len(loss_masks) if hasattr(loss_masks, '__len__') else 'n/a'}"
         )
-        sys.stderr.flush()
 
     async def _run_training(self, training_input: TrainingInputBatch):
         # TODO(Charlie): share this code with the one-step-off async trainer.
@@ -946,6 +973,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         Generator worker: repeatedly pulls the next prompt (possibly blocked by staleness control),
         generates one single generation group, respecting a pause/resume event, and enqueues the result.
         """
+        slot_acquired = False
         try:
             while True:
                 # 0. Pull next batch from dataloader. If returns None, then dataloader is exhausted.
@@ -969,7 +997,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
 
                 # 2. Acquire capacity slot.
-                slot_acquired = False
                 await self._staleness_manager.acquire_submission_slot()
                 slot_acquired = True
 
@@ -1002,21 +1029,16 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     raise AssertionError("Generation buffer should never be full given staleness control.")
                 await self._staleness_manager.on_rollout_accepted()
                 slot_acquired = False
-        except asyncio.CancelledError:
-            # Expected on epoch end / shutdown: release any held slot so staleness accounting stays
-            # consistent, then exit cleanly. (Previously os._exit(1) here, which crashed the process and
-            # masked the real traceback when the cancel was triggered by a training-loop error.)
-            if "slot_acquired" in locals() and slot_acquired:
+        except Exception:
+            logger.exception("Generator worker errored out")
+            raise
+        finally:
+            # Both worker failures and normal TaskGroup cancellation must return a reserved slot.
+            if slot_acquired:
                 try:
                     await self._staleness_manager.on_rollout_rejected()
                 except Exception:
-                    pass
-            return
-        except Exception as e:
-            logger.error(f"Generator worker errored out with exception: {e}")
-            logger.error(f"Traceback: \n{traceback.format_exc()}")
-            sys.stderr.flush()  # flush before os._exit, which otherwise drops buffered output
-            os._exit(1)
+                    logger.exception("Failed to release the generation worker's staleness slot")
 
     @staticmethod
     def _reprefix_metrics(metrics: dict, suffix: str) -> dict:

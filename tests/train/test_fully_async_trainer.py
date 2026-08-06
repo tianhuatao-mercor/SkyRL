@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+import skyrl.train.fully_async_trainer as fully_async_trainer_module
 from skyrl.train.fully_async_trainer import (
     FullyAsyncRayPPOTrainer,
     GeneratedOutputGroup,
@@ -158,40 +159,39 @@ async def test_async_dataloader_load_state_without_filtered_is_backward_compatib
 @pytest.mark.asyncio
 async def test_drain_next_group_returns_buffered_items_then_exhaustion():
     buffer: asyncio.Queue = asyncio.Queue()
-    done = asyncio.Event()
+    supervisor = asyncio.create_task(asyncio.sleep(0))
+    await supervisor
     buffer.put_nowait("a")
     buffer.put_nowait("b")
 
-    # _drain_next_group uses no instance state, so a bare object stands in for `self`.
     drain = FullyAsyncRayPPOTrainer._drain_next_group
     dummy = object()
 
-    assert await drain(dummy, buffer, done) == "a"
-    assert await drain(dummy, buffer, done) == "b"
+    assert await drain(dummy, buffer, supervisor) == "a"
+    assert await drain(dummy, buffer, supervisor) == "b"
 
-    # Buffer empty and generators done -> exhausted.
-    done.set()
-    assert await drain(dummy, buffer, done) is None
+    # Buffer empty and the generation TaskGroup completed successfully -> exhausted.
+    assert await drain(dummy, buffer, supervisor) is None
 
 
 @pytest.mark.asyncio
 async def test_drain_next_group_drains_remaining_before_exhaustion():
     """If generators finish while items remain, those items are returned before None."""
     buffer: asyncio.Queue = asyncio.Queue()
-    done = asyncio.Event()
+    supervisor = asyncio.create_task(asyncio.sleep(0))
+    await supervisor
     buffer.put_nowait("a")
-    done.set()  # generators done, but a real item is still buffered
 
     drain = FullyAsyncRayPPOTrainer._drain_next_group
     dummy = object()
-    assert await drain(dummy, buffer, done) == "a"
-    assert await drain(dummy, buffer, done) is None
+    assert await drain(dummy, buffer, supervisor) == "a"
+    assert await drain(dummy, buffer, supervisor) is None
 
 
 @pytest.mark.asyncio
 async def test_drain_next_group_blocks_until_item_arrives():
     buffer: asyncio.Queue = asyncio.Queue()
-    done = asyncio.Event()
+    supervisor = asyncio.create_task(asyncio.Event().wait())
     drain = FullyAsyncRayPPOTrainer._drain_next_group
     dummy = object()
 
@@ -200,8 +200,101 @@ async def test_drain_next_group_blocks_until_item_arrives():
         buffer.put_nowait("x")
 
     producer = asyncio.create_task(delayed_put())
-    assert await drain(dummy, buffer, done) == "x"
-    await producer
+    try:
+        assert await drain(dummy, buffer, supervisor) == "x"
+        await producer
+    finally:
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+
+class _ExpectedGenerationError(RuntimeError):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_generation_task_group_failure_wakes_blocked_buffer_consumer():
+    """A worker failure propagates through TaskGroup instead of hanging or killing the process."""
+    buffer: asyncio.Queue = asyncio.Queue()
+
+    async def fail_generation(_buffer):
+        raise _ExpectedGenerationError("generation failed")
+
+    trainer = SimpleNamespace(
+        num_parallel_generation_workers=1,
+        _run_generate_for_a_group_loop=fail_generation,
+    )
+    supervisor = asyncio.create_task(FullyAsyncRayPPOTrainer._run_generation_task_group(trainer, buffer))
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await asyncio.wait_for(
+            FullyAsyncRayPPOTrainer._drain_next_group(trainer, buffer, supervisor),
+            timeout=1,
+        )
+
+    assert exc_info.value.subgroup(_ExpectedGenerationError) is not None
+    assert supervisor.done()
+    assert not supervisor.cancelled()
+    # Reaching this assertion is the regression check that a worker error no longer exits the process.
+    assert asyncio.current_task() is not None
+
+
+@pytest.mark.asyncio
+async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
+    """A failed provider call returns its reserved generation capacity before propagating."""
+
+    class OnePromptDataloader:
+        def __init__(self):
+            self.returned = False
+
+        async def get_next_non_consumed_data(self):
+            if self.returned:
+                return None
+            self.returned = True
+            return [{"uid": "uid-1"}]
+
+    class FailingGenerator:
+        async def generate(self, _generator_input):
+            raise _ExpectedGenerationError("provider failed")
+
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "prepare_generator_input",
+        lambda *_args, **_kwargs: ({"prompts": ["prompt"]}, ["uid-1"]),
+    )
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "get_sampling_params_for_backend",
+        lambda *_args, **_kwargs: {},
+    )
+
+    staleness_manager = _AsyncStalenessManager(
+        max_concurrent_generation_groups=1,
+        mini_batch_size=1,
+        max_staleness_steps=0,
+    )
+    trainer = SimpleNamespace(
+        async_train_dataloader=OnePromptDataloader(),
+        cfg=SimpleNamespace(
+            generator=SimpleNamespace(
+                n_samples_per_prompt=1,
+                inference_engine=SimpleNamespace(backend="test"),
+                sampling_params=object(),
+            ),
+            environment=SimpleNamespace(env_class="test"),
+        ),
+        _staleness_manager=staleness_manager,
+        generator=FailingGenerator(),
+        global_step=1,
+    )
+
+    with pytest.raises(_ExpectedGenerationError, match="provider failed"):
+        await FullyAsyncRayPPOTrainer._run_generate_for_a_group_loop(trainer, asyncio.Queue(maxsize=1))
+
+    assert staleness_manager._stat.submitted == 1
+    assert staleness_manager._stat.running == 0
+    assert staleness_manager._stat.accepted == 0
+    assert staleness_manager._compute_capacity_unlocked() == 1
 
 
 # --------------------------------------------------------------------------------------
