@@ -255,8 +255,35 @@ class FireworksRuntime:
         process accrues a new billing segment from its own configuration.
         """
 
-        if not reports:
-            return
+        if (
+            len(reports) != 1
+            or reports[0].get("cumulative_across_resumes") is not True
+        ):
+            raise RuntimeError(
+                "Fireworks resume requires one cumulative current-format usage report"
+            )
+
+        report = reports[0]
+        metrics = report.get("metrics")
+        if not isinstance(metrics, dict):
+            raise RuntimeError("Fireworks checkpoint usage metrics must be an object")
+        restored_wall_time = float(
+            metrics.get("fireworks/usage/wall_time_seconds", 0.0)
+        )
+        if restored_wall_time < 0:
+            raise RuntimeError("Fireworks checkpoint usage contains negative wall time")
+        restored_billing = self._billing_totals_from_report(report)
+        saved_stages = report.get("billing_stages")
+        if not isinstance(saved_stages, list):
+            raise RuntimeError(
+                "Fireworks checkpoint usage is missing billing_stages; "
+                "only the current accounting format is supported"
+            )
+        if not all(isinstance(stage, dict) for stage in saved_stages):
+            raise RuntimeError(
+                "Fireworks checkpoint billing_stages must contain objects"
+            )
+
         with self._usage_lock:
             if self._usage_restored:
                 raise RuntimeError("Fireworks usage has already been restored")
@@ -270,60 +297,25 @@ class FireworksRuntime:
                 raise RuntimeError(
                     "Fireworks usage must be restored before recording provider work"
                 )
-            started_at_values: list[str] = []
-            for report in reports:
-                metrics = report.get("metrics")
-                if not isinstance(metrics, dict):
-                    continue
-                restored_wall_time = float(
-                    metrics.get("fireworks/usage/wall_time_seconds", 0.0)
-                )
-                if restored_wall_time < 0:
-                    raise RuntimeError(
-                        "Fireworks checkpoint usage contains negative wall time"
-                    )
-                self._restored_wall_time_seconds += restored_wall_time
-                for (
-                    metric_name,
+            self._restored_wall_time_seconds += restored_wall_time
+            for metric_name, attribute_name in self._RESTORABLE_USAGE_METRICS.items():
+                value = metrics.get(metric_name, 0)
+                setattr(
+                    self,
                     attribute_name,
-                ) in self._RESTORABLE_USAGE_METRICS.items():
-                    value = metrics.get(metric_name, 0)
-                    setattr(
-                        self,
-                        attribute_name,
-                        getattr(self, attribute_name) + value,
-                    )
-                restored_billing = self._billing_totals_from_report(
-                    report,
-                    restored_wall_time=restored_wall_time,
+                    getattr(self, attribute_name) + value,
                 )
-                if restored_billing is None:
-                    self._cost_history_complete = False
-                else:
-                    trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd = (
-                        restored_billing
-                    )
-                    self._restored_trainer_gpu_hours += trainer_gpu_hours
-                    self._restored_rollout_gpu_hours += rollout_gpu_hours
-                    self._restored_gpu_cost_usd += gpu_cost_usd
-                saved_stages = report.get("billing_stages")
-                if isinstance(saved_stages, list):
-                    self._restored_billing_stages.extend(
-                        dict(stage) for stage in saved_stages if isinstance(stage, dict)
-                    )
-                else:
-                    legacy_stage = self._legacy_billing_stage(
-                        report,
-                        restored_wall_time=restored_wall_time,
-                        restored_billing=restored_billing,
-                    )
-                    if legacy_stage is not None:
-                        self._restored_billing_stages.append(legacy_stage)
-                started_at = report.get("started_at_utc")
-                if started_at:
-                    started_at_values.append(str(started_at))
-            if started_at_values:
-                self._started_at_utc = min(started_at_values)
+            if restored_billing is None:
+                self._cost_history_complete = False
+            else:
+                trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd = restored_billing
+                self._restored_trainer_gpu_hours += trainer_gpu_hours
+                self._restored_rollout_gpu_hours += rollout_gpu_hours
+                self._restored_gpu_cost_usd += gpu_cost_usd
+            self._restored_billing_stages.extend(dict(stage) for stage in saved_stages)
+            started_at = report.get("started_at_utc")
+            if started_at:
+                self._started_at_utc = min(self._started_at_utc, str(started_at))
             self._usage_restored = True
 
     @staticmethod
@@ -340,10 +332,8 @@ class FireworksRuntime:
     def _billing_totals_from_report(
         self,
         report: dict[str, Any],
-        *,
-        restored_wall_time: float,
     ) -> tuple[float, float, float] | None:
-        """Read cumulative GPU-hours/cost, with legacy reconstruction."""
+        """Read cumulative GPU-hours and cost from the current report format."""
 
         metrics = report.get("metrics")
         if not isinstance(metrics, dict):
@@ -354,61 +344,20 @@ class FireworksRuntime:
         rollout_gpu_hours = self._nonnegative_float(
             metrics.get("fireworks/usage/rollout_gpu_hours")
         )
-        if trainer_gpu_hours is None or rollout_gpu_hours is None:
-            trainer_replicas = self._nonnegative_float(
-                report.get("trainer_replica_count")
-            )
-            trainer_gpus = self._nonnegative_float(
-                report.get("trainer_gpus_per_replica")
-            )
-            rollout_replicas = self._nonnegative_float(
-                report.get("rollout_replica_count")
-            )
-            rollout_gpus = self._nonnegative_float(
-                report.get("rollout_gpus_per_replica")
-            )
-            if None in (trainer_replicas, trainer_gpus, rollout_replicas, rollout_gpus):
-                return None
-            elapsed_hours = restored_wall_time / 3600.0
-            trainer_gpu_hours = trainer_replicas * trainer_gpus * elapsed_hours
-            rollout_gpu_hours = rollout_replicas * rollout_gpus * elapsed_hours
-
         gpu_cost_usd = self._nonnegative_float(
             metrics.get("fireworks/estimated_cost/gpu_total_usd")
         )
-        if gpu_cost_usd is None:
-            gpu_price = self._nonnegative_float(report.get("gpu_price_per_hour_usd"))
-            if gpu_price is None:
-                return None
-            gpu_cost_usd = (trainer_gpu_hours + rollout_gpu_hours) * gpu_price
-        return trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd
-
-    @staticmethod
-    def _legacy_billing_stage(
-        report: dict[str, Any],
-        *,
-        restored_wall_time: float,
-        restored_billing: tuple[float, float, float] | None,
-    ) -> dict[str, Any] | None:
-        """Preserve one pre-stage-format checkpoint as an auditable segment."""
-
-        if restored_billing is None:
+        values = (trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd)
+        if all(value is None for value in values):
             return None
-        trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd = restored_billing
-        return {
-            "started_at_utc": report.get("started_at_utc"),
-            "wall_time_seconds": restored_wall_time,
-            "gpu_type": report.get("gpu_type"),
-            "trainer_replica_count": report.get("trainer_replica_count"),
-            "trainer_gpus_per_replica": report.get("trainer_gpus_per_replica"),
-            "rollout_replica_count": report.get("rollout_replica_count"),
-            "rollout_gpus_per_replica": report.get("rollout_gpus_per_replica"),
-            "gpu_price_per_hour_usd": report.get("gpu_price_per_hour_usd"),
-            "trainer_gpu_hours": trainer_gpu_hours,
-            "rollout_gpu_hours": rollout_gpu_hours,
-            "estimated_cost_usd": gpu_cost_usd,
-            "source": "restored_legacy_checkpoint",
-        }
+        if any(value is None for value in values):
+            raise RuntimeError(
+                "Fireworks checkpoint usage has incomplete GPU-hour accounting"
+            )
+        assert trainer_gpu_hours is not None
+        assert rollout_gpu_hours is not None
+        assert gpu_cost_usd is not None
+        return trainer_gpu_hours, rollout_gpu_hours, gpu_cost_usd
 
     def record_external_samples(
         self,

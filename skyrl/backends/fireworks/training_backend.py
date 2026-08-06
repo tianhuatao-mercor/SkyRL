@@ -226,43 +226,20 @@ class FireworksPolicyDispatch:
         *,
         manifest_path: str,
     ) -> None:
-        """Reject an incompatible checkpoint before asking Fireworks to load it.
-
-        Version-1 manifests predate the explicit identity. To keep existing
-        checkpoints usable, validate any identity fields that are available
-        (including model/shape fields from the usage report), warn about the
-        fields that cannot be verified, and continue. Version-2 manifests are
-        fail-closed: every identity field must be present and match exactly.
-        """
+        """Reject an incompatible current-format checkpoint before provider work."""
 
         format_version = manifest.get("format_version")
         saved_identity = manifest.get("training_identity")
-        if saved_identity is not None and not isinstance(saved_identity, dict):
-            raise ValueError("Fireworks checkpoint training_identity must be an object: " f"{manifest_path}")
-
-        if format_version == 1:
-            # Real version-1 checkpoints normally contain this usage report,
-            # which lets us still reject base-model and shape mismatches. LoRA
-            # and tokenizer identity were not recorded and remain unverifiable.
-            legacy_identity: dict[str, Any] = dict(saved_identity or {})
-            usage_report = manifest.get("usage_at_checkpoint")
-            if isinstance(usage_report, dict):
-                for field in ("base_model", "training_shape_id"):
-                    value = usage_report.get(field)
-                    if value not in (None, ""):
-                        legacy_identity.setdefault(field, value)
-            saved_identity = legacy_identity
-        elif format_version == self._CHECKPOINT_FORMAT_VERSION:
-            if not isinstance(saved_identity, dict):
-                raise ValueError("Fireworks checkpoint format v2 requires training_identity: " f"{manifest_path}")
-            missing = [field for field in self._CHECKPOINT_IDENTITY_FIELDS if field not in saved_identity]
-            if missing:
-                raise ValueError(
-                    "Fireworks checkpoint training_identity is incomplete; missing "
-                    f"{', '.join(missing)}: {manifest_path}"
-                )
-        else:
+        if format_version != self._CHECKPOINT_FORMAT_VERSION:
             raise ValueError("Unsupported Fireworks checkpoint manifest version: " f"{format_version!r}")
+        if not isinstance(saved_identity, dict):
+            raise ValueError("Fireworks checkpoint format v2 requires training_identity: " f"{manifest_path}")
+        missing = [field for field in self._CHECKPOINT_IDENTITY_FIELDS if field not in saved_identity]
+        if missing:
+            raise ValueError(
+                "Fireworks checkpoint training_identity is incomplete; missing "
+                f"{', '.join(missing)}: {manifest_path}"
+            )
 
         current_identity = self._checkpoint_identity()
         mismatches = {
@@ -281,17 +258,6 @@ class FireworksPolicyDispatch:
             raise ValueError(
                 "Fireworks checkpoint training method does not match the current run " f"({details}): {manifest_path}"
             )
-
-        if format_version == 1:
-            unverified = [field for field in self._CHECKPOINT_IDENTITY_FIELDS if field not in saved_identity]
-            if unverified:
-                logger.warning(
-                    "Loading legacy Fireworks checkpoint without verifiable {}. "
-                    "Version-1 compatibility permits this load; confirm the original "
-                    "training method manually. Manifest: {}",
-                    ", ".join(unverified),
-                    manifest_path,
-                )
 
     def save_checkpoint(self, model: str, ckpt_dir: str, tokenizer=None) -> None:
         """Save persistent Fireworks DCP state and a small local resume manifest.
@@ -334,9 +300,7 @@ class FireworksPolicyDispatch:
             "includes_optimizer_state": True,
             "global_step": step_number,
         }
-        usage_report = getattr(self.runtime, "usage_report", None)
-        if usage_report is not None:
-            manifest["usage_at_checkpoint"] = usage_report()
+        manifest["usage_at_checkpoint"] = self.runtime.usage_report()
         io.makedirs(ckpt_dir, exist_ok=True)
         manifest_path = os.path.join(ckpt_dir, self._CHECKPOINT_MANIFEST)
         with io.open_file(manifest_path, "w") as f:
@@ -372,31 +336,28 @@ class FireworksPolicyDispatch:
             manifest,
             manifest_path=manifest_path,
         )
-
-        checkpoint_name = str(manifest.get("checkpoint_name") or "")
-        provider_path = str(manifest.get("provider_path") or "")
-        source_job_id = manifest.get("source_trainer_job_id")
-        cross_job_checkpoint_name = str(manifest.get("cross_job_checkpoint_name") or "")
-        if not cross_job_checkpoint_name and source_job_id:
-            # Compatibility with manifests written before the canonical
-            # cross-job name was recorded. Fireworks' dedicated control plane
-            # lists durable DCP checkpoints as step-N.
-            global_step = manifest.get("global_step")
-            if isinstance(global_step, int) and global_step >= 0:
-                cross_job_checkpoint_name = f"step-{global_step}"
-            else:
-                cross_job_checkpoint_name = checkpoint_name
-        if source_job_id and cross_job_checkpoint_name:
-            load_path = self.runtime.training_client.resolve_checkpoint_path(
-                cross_job_checkpoint_name,
-                source_job_id=str(source_job_id),
+        usage_report = manifest.get("usage_at_checkpoint")
+        if (
+            not isinstance(usage_report, dict)
+            or usage_report.get("cumulative_across_resumes") is not True
+        ):
+            raise ValueError(
+                f"Fireworks checkpoint requires a cumulative current-format usage report: {manifest_path}"
             )
-        elif provider_path:
-            # Serverless sessions may not expose a dedicated trainer job ID;
-            # their returned Tinker path is already directly loadable.
-            load_path = provider_path
-        else:
-            raise ValueError(f"Fireworks checkpoint manifest has no loadable reference: {manifest_path}")
+
+        source_job_id = str(manifest.get("source_trainer_job_id") or "")
+        cross_job_checkpoint_name = str(manifest.get("cross_job_checkpoint_name") or "")
+        if not source_job_id or not cross_job_checkpoint_name:
+            raise ValueError(
+                "Fireworks checkpoint manifest requires source_trainer_job_id "
+                f"and cross_job_checkpoint_name: {manifest_path}"
+            )
+        load_path = self.runtime.training_client.resolve_checkpoint_path(
+            cross_job_checkpoint_name,
+            source_job_id=source_job_id,
+        )
+        self.runtime.restore_usage_reports([usage_report])
+        logger.info("Restored cumulative Fireworks usage from checkpoint report")
 
         load = (
             self.runtime.training_client.load_state_with_optimizer
@@ -404,11 +365,6 @@ class FireworksPolicyDispatch:
             else self.runtime.training_client.load_state
         )
         load(load_path).result(timeout=self.cfg.trainer.fireworks.request_timeout_s)
-        restore_usage = getattr(self.runtime, "restore_usage_reports", None)
-        usage_report = manifest.get("usage_at_checkpoint")
-        if restore_usage is not None and isinstance(usage_report, dict):
-            restore_usage([usage_report])
-            logger.info("Restored cumulative Fireworks usage from checkpoint report")
         logger.info(
             "Loaded Fireworks DCP checkpoint: reference={}, optimizer_restored={}",
             load_path,

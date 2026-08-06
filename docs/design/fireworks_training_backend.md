@@ -6,13 +6,10 @@ Initial scope: text-only, policy-only GRPO; LoRA or full-parameter training
 
 Supported infrastructure: SDK-managed dedicated trainer plus linked deployment
 
-An early serverless probe received HTTP 403 before creating a session. That
-unvalidated implementation was subsequently removed in favor of a
-dedicated-only backend. On July 21, 2026, the bounded Qwen3-4B dedicated run
-provisioned a trainer and linked rollout deployment, completed one GRPO
-forward/backward plus optimizer step, hotloaded both the initial and updated
-sampler snapshots, and deleted both resources. See
-[Live dedicated validation](#live-dedicated-validation).
+The bounded Qwen3-4B dedicated validation provisioned a trainer and linked
+rollout deployment, completed one GRPO forward/backward plus optimizer step,
+hotloaded both the initial and updated sampler snapshots, and deleted both
+resources. See [Live dedicated validation](#live-dedicated-validation).
 
 ## Decision summary
 

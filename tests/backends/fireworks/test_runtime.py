@@ -260,25 +260,24 @@ def test_usage_restore_keeps_sampling_and_training_totals_across_resume(
     monkeypatch.setattr(
         "skyrl.backends.fireworks.runtime.time.monotonic", lambda: 105.0
     )
-    runtime.restore_usage_reports(
-        [
-            {
-                "started_at_utc": "2026-07-30T01:00:00+00:00",
-                "metrics": {
-                    "fireworks/usage/wall_time_seconds": 10.0,
-                    "fireworks/usage/sampling_requests_total": 2,
-                    "fireworks/usage/prompt_tokens_total": 100,
-                    "fireworks/usage/prompt_cache_hit_tokens_total": 60,
-                    "fireworks/usage/prompt_cache_unknown_tokens_total": 20,
-                    "fireworks/usage/sampled_tokens_total": 30,
-                    "fireworks/usage/sampling_request_seconds_total": 1.25,
-                    "fireworks/usage/forward_backward_calls_total": 1,
-                    "fireworks/usage/training_tokens_total": 90,
-                    "fireworks/usage/forward_backward_seconds_total": 2.5,
-                },
-            }
-        ]
-    )
+    usage_report = {
+        "cumulative_across_resumes": True,
+        "started_at_utc": "2026-07-30T01:00:00+00:00",
+        "billing_stages": [],
+        "metrics": {
+            "fireworks/usage/wall_time_seconds": 10.0,
+            "fireworks/usage/sampling_requests_total": 2,
+            "fireworks/usage/prompt_tokens_total": 100,
+            "fireworks/usage/prompt_cache_hit_tokens_total": 60,
+            "fireworks/usage/prompt_cache_unknown_tokens_total": 20,
+            "fireworks/usage/sampled_tokens_total": 30,
+            "fireworks/usage/sampling_request_seconds_total": 1.25,
+            "fireworks/usage/forward_backward_calls_total": 1,
+            "fireworks/usage/training_tokens_total": 90,
+            "fireworks/usage/forward_backward_seconds_total": 2.5,
+        },
+    }
+    runtime.restore_usage_reports([usage_report])
     runtime.record_external_samples(
         sampling_requests=1,
         prompt_tokens=40,
@@ -316,10 +315,10 @@ def test_usage_restore_keeps_sampling_and_training_totals_across_resume(
     assert runtime.usage_report()["started_at_utc"] == "2026-07-30T01:00:00+00:00"
 
     with pytest.raises(RuntimeError, match="already been restored"):
-        runtime.restore_usage_reports([{"metrics": {}}])
+        runtime.restore_usage_reports([usage_report])
 
 
-def test_usage_restore_preserves_old_topology_and_prices_new_stage(monkeypatch) -> None:
+def test_usage_restore_preserves_prior_billing_stage_and_prices_new_stage(monkeypatch) -> None:
     runtime = _runtime(
         config=FireworksConfig(
             billing_gpu_type="B200",
@@ -338,6 +337,7 @@ def test_usage_restore_preserves_old_topology_and_prices_new_stage(monkeypatch) 
     runtime.restore_usage_reports(
         [
             {
+                "cumulative_across_resumes": True,
                 "started_at_utc": "2026-08-05T01:00:00+00:00",
                 "gpu_type": "B200",
                 "trainer_replica_count": 1,
@@ -345,6 +345,22 @@ def test_usage_restore_preserves_old_topology_and_prices_new_stage(monkeypatch) 
                 "rollout_replica_count": 6,
                 "rollout_gpus_per_replica": 2,
                 "gpu_price_per_hour_usd": 12.0,
+                "billing_stages": [
+                    {
+                        "started_at_utc": "2026-08-05T01:00:00+00:00",
+                        "wall_time_seconds": 3600.0,
+                        "gpu_type": "B200",
+                        "trainer_replica_count": 1,
+                        "trainer_gpus_per_replica": 4,
+                        "rollout_replica_count": 6,
+                        "rollout_gpus_per_replica": 2,
+                        "gpu_price_per_hour_usd": 12.0,
+                        "trainer_gpu_hours": 4.0,
+                        "rollout_gpu_hours": 12.0,
+                        "estimated_cost_usd": 192.0,
+                        "source": "current_process",
+                    }
+                ],
                 "metrics": {
                     "fireworks/usage/wall_time_seconds": 3600.0,
                     "fireworks/usage/sampling_requests_total": 7,
@@ -380,6 +396,24 @@ def test_usage_restore_preserves_old_topology_and_prices_new_stage(monkeypatch) 
     assert report["billing_stages"][0]["rollout_replica_count"] == 6
     assert report["billing_stages"][1]["trainer_replica_count"] == 4
     assert report["billing_stages"][1]["rollout_replica_count"] == 16
+
+
+def test_usage_restore_rejects_old_accounting_before_mutating() -> None:
+    runtime = _runtime()
+
+    with pytest.raises(RuntimeError, match="billing_stages"):
+        runtime.restore_usage_reports(
+            [
+                {
+                    "cumulative_across_resumes": True,
+                    "metrics": {
+                        "fireworks/usage/sampling_requests_total": 7,
+                    },
+                }
+            ]
+        )
+
+    assert runtime.usage_metrics()["fireworks/usage/sampling_requests_total"] == 0
 
 
 @pytest.mark.asyncio

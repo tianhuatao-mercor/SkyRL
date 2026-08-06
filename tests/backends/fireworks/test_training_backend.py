@@ -211,7 +211,9 @@ def test_policy_dispatch_finalizes_synchronous_checkpoint_saves() -> None:
 def test_policy_dispatch_saves_and_cross_job_loads_dcp_checkpoint(tmp_path) -> None:
     training_client = _TrainingClient()
     usage_report = {
+        "cumulative_across_resumes": True,
         "started_at_utc": "2026-07-30T01:00:00+00:00",
+        "billing_stages": [],
         "metrics": {
             "fireworks/usage/training_tokens_total": 120,
             "fireworks/usage/forward_backward_seconds_total": 2.5,
@@ -339,7 +341,17 @@ def test_policy_dispatch_ignores_lora_alpha_for_full_finetune_checkpoint(
     cfg = _cfg()
     cfg.trainer.policy.model.lora.rank = 0
     cfg.trainer.policy.model.lora.alpha = 16
-    runtime = SimpleNamespace(training_client=training_client, trainer_job_id=None)
+    usage_report = {
+        "cumulative_across_resumes": True,
+        "billing_stages": [],
+        "metrics": {},
+    }
+    runtime = SimpleNamespace(
+        training_client=training_client,
+        trainer_job_id="source-trainer",
+        usage_report=lambda: usage_report,
+        restore_usage_reports=MagicMock(),
+    )
     dispatch = FireworksPolicyDispatch(
         cfg,
         runtime,
@@ -350,17 +362,18 @@ def test_policy_dispatch_ignores_lora_alpha_for_full_finetune_checkpoint(
     manifest = json.loads(manifest_path.read_text())
     assert manifest["training_identity"]["lora_alpha"] is None
 
-    # Accept an early/noncanonical manifest too: alpha is semantically inert
-    # when both the checkpoint and current run are full-parameter training.
+    # Alpha is semantically inert when both the checkpoint and current run are
+    # full-parameter training.
     manifest["training_identity"]["lora_alpha"] = 999
     manifest_path.write_text(json.dumps(manifest))
 
     dispatch.load_checkpoint("policy", str(ckpt_dir))
 
-    assert training_client.loaded_states == [(manifest["provider_path"], True)]
+    assert training_client.loaded_states == [("cross-job://source-trainer/step-2", True)]
+    runtime.restore_usage_reports.assert_called_once_with([usage_report])
 
 
-def test_policy_dispatch_rejects_legacy_usage_identity_mismatch_before_load(
+def test_policy_dispatch_rejects_old_manifest_before_provider_load(
     tmp_path,
 ) -> None:
     training_client = _TrainingClient()
@@ -374,21 +387,18 @@ def test_policy_dispatch_rejects_legacy_usage_identity_mismatch_before_load(
                 "format_version": 1,
                 "checkpoint_kind": "fireworks_dcp",
                 "provider_path": provider_path,
-                "usage_at_checkpoint": {
-                    "base_model": "accounts/fireworks/models/different",
-                    "training_shape_id": ("accounts/fireworks/trainingShapes/test-shape"),
-                },
+                "usage_at_checkpoint": {"cumulative_across_resumes": True},
             }
         )
     )
 
-    with pytest.raises(ValueError, match="base_model"):
+    with pytest.raises(ValueError, match="Unsupported Fireworks checkpoint manifest"):
         dispatch.load_checkpoint("policy", str(ckpt_dir))
 
     assert training_client.loaded_states == []
 
 
-def test_policy_dispatch_cross_job_loads_legacy_manifest_by_global_step(
+def test_policy_dispatch_rejects_current_manifest_without_canonical_checkpoint_reference(
     tmp_path,
 ) -> None:
     training_client = _TrainingClient()
@@ -402,50 +412,54 @@ def test_policy_dispatch_cross_job_loads_legacy_manifest_by_global_step(
     (ckpt_dir / "fireworks_checkpoint.json").write_text(
         json.dumps(
             {
-                "format_version": 1,
+                "format_version": 2,
                 "checkpoint_kind": "fireworks_dcp",
-                "checkpoint_name": "skyrl-step-2-old-label",
-                "provider_path": "skyrl-step-2-old-label",
+                "training_identity": dispatch._checkpoint_identity(),
+                "checkpoint_name": "skyrl-step-2-label",
+                "provider_path": "skyrl-step-2-label",
                 "source_trainer_job_id": "source-trainer",
                 "includes_optimizer_state": True,
                 "global_step": 2,
+                "usage_at_checkpoint": {
+                    "cumulative_across_resumes": True,
+                    "billing_stages": [],
+                    "metrics": {},
+                },
             }
         )
     )
 
-    dispatch.load_checkpoint("policy", str(ckpt_dir))
+    with pytest.raises(ValueError, match="cross_job_checkpoint_name"):
+        dispatch.load_checkpoint("policy", str(ckpt_dir))
 
-    assert training_client.loaded_states == [("cross-job://source-trainer/step-2", True)]
+    assert training_client.loaded_states == []
 
 
-def test_policy_dispatch_load_falls_back_to_manifest_provider_path(tmp_path) -> None:
+def test_policy_dispatch_rejects_checkpoint_without_current_usage_before_load(tmp_path) -> None:
     training_client = _TrainingClient()
     runtime = SimpleNamespace(training_client=training_client, trainer_job_id=None)
     dispatch = FireworksPolicyDispatch(_cfg(), runtime)
     ckpt_dir = tmp_path / "global_step_2" / "policy"
     ckpt_dir.mkdir(parents=True)
-    provider_path = "tinker://prior-run/weights/step-2"
     (ckpt_dir / "fireworks_checkpoint.json").write_text(
         json.dumps(
             {
-                "format_version": 1,
+                "format_version": 2,
                 "checkpoint_kind": "fireworks_dcp",
+                "training_identity": dispatch._checkpoint_identity(),
                 "checkpoint_name": "step-2",
-                "provider_path": provider_path,
-                "source_trainer_job_id": None,
+                "provider_path": "tinker://prior-run/weights/step-2",
+                "source_trainer_job_id": "source-trainer",
+                "cross_job_checkpoint_name": "step-2",
                 "includes_optimizer_state": True,
             }
         )
     )
 
-    dispatch.load_checkpoint(
-        "policy",
-        str(ckpt_dir),
-        load_optimizer_states=False,
-        load_lr_scheduler_states=False,
-    )
+    with pytest.raises(ValueError, match="cumulative current-format usage report"):
+        dispatch.load_checkpoint("policy", str(ckpt_dir))
 
-    assert training_client.loaded_states == [(provider_path, False)]
+    assert training_client.loaded_states == []
 
 
 def test_hosted_empty_node_cleanup_does_not_initialize_ray(monkeypatch) -> None:

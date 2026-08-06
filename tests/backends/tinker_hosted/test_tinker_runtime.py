@@ -601,7 +601,7 @@ def test_cost_watchdog_aborts_after_successful_training_usage() -> None:
     assert runtime.usage_metrics()["tinker/usage/training_tokens_total"] == 400_000
 
 
-def test_usage_reports_restore_cumulative_metrics_across_processes() -> None:
+def test_usage_report_restores_cumulative_metrics() -> None:
     runtime = _runtime(
         config=TinkerTrainingConfig(
             base_model="Qwen/Qwen3.5-4B",
@@ -611,29 +611,30 @@ def test_usage_reports_restore_cumulative_metrics_across_processes() -> None:
     runtime.restore_usage_reports(
         [
             {
+                "cumulative_across_resumes": True,
                 "started_at_utc": "2026-07-29T01:00:00+00:00",
-                "training_run_id": "training-run-1",
-                "metrics": {
-                    "tinker/usage/wall_time_seconds": 10.0,
-                    "tinker/usage/sampling_requests_total": 2,
-                    "tinker/usage/sampled_tokens_total": 1_000,
-                    "tinker/usage/training_tokens_total": 500,
-                    "tinker/usage/checkpoint_seconds_total": 1.5,
-                },
-                "checkpoints": [{"global_step": 1, "provider_path": "tinker://one"}],
-            },
-            {
-                "started_at_utc": "2026-07-29T02:00:00+00:00",
                 "training_run_id": "training-run-2",
-                "metrics": {
-                    "tinker/usage/wall_time_seconds": 20.0,
-                    "tinker/usage/sampling_requests_total": 3,
-                    "tinker/usage/sampled_tokens_total": 2_000,
-                    "tinker/usage/training_tokens_total": 700,
-                    "tinker/usage/checkpoint_seconds_total": 2.5,
+                "training_run_ids": ["training-run-1", "training-run-2"],
+                "price_per_million_tokens": {
+                    "prefill_uncached": None,
+                    "prefill_cached": None,
+                    "sample": 1.0,
+                    "train": None,
                 },
-                "checkpoints": [{"global_step": 2, "provider_path": "tinker://two"}],
-            },
+                "metrics": {
+                    "tinker/usage/wall_time_seconds": 30.0,
+                    "tinker/usage/sampling_requests_total": 5,
+                    "tinker/usage/prompt_cache_hit_tokens_total": 0,
+                    "tinker/usage/prompt_cache_unknown_tokens_total": 0,
+                    "tinker/usage/sampled_tokens_total": 3_000,
+                    "tinker/usage/training_tokens_total": 1_200,
+                    "tinker/usage/checkpoint_seconds_total": 4.0,
+                },
+                "checkpoints": [
+                    {"global_step": 1, "provider_path": "tinker://one"},
+                    {"global_step": 2, "provider_path": "tinker://two"},
+                ],
+            }
         ]
     )
 
@@ -665,6 +666,7 @@ def test_usage_restore_rejects_checkpoint_price_mismatch_before_mutating() -> No
         runtime.restore_usage_reports(
             [
                 {
+                    "cumulative_across_resumes": True,
                     "price_per_million_tokens": {
                         "prefill_uncached": 1.0,
                         "prefill_cached": 0.2,
@@ -681,25 +683,29 @@ def test_usage_restore_rejects_checkpoint_price_mismatch_before_mutating() -> No
     assert runtime.usage_metrics()["tinker/usage/sampled_tokens_total"] == 0
 
 
-def test_legacy_usage_restore_marks_prompt_cache_status_unknown() -> None:
+def test_usage_restore_rejects_missing_cache_accounting() -> None:
     runtime = _runtime(
         config=TinkerTrainingConfig(
             base_model="Qwen/Qwen3.5-4B",
             prefill_price_per_million_tokens=1.0,
         )
     )
-    runtime.restore_usage_reports(
-        [
-            {
-                "metrics": {
-                    "tinker/usage/prompt_tokens_total": 1_000,
+    with pytest.raises(RuntimeError, match="cache accounting metrics"):
+        runtime.restore_usage_reports(
+            [
+                {
+                    "cumulative_across_resumes": True,
+                    "price_per_million_tokens": {
+                        "prefill_uncached": 1.0,
+                        "prefill_cached": 0.2,
+                        "sample": None,
+                        "train": None,
+                    },
+                    "metrics": {
+                        "tinker/usage/prompt_tokens_total": 1_000,
+                    },
                 }
-            }
-        ]
-    )
+            ]
+        )
 
-    metrics = runtime.usage_metrics()
-    assert metrics["tinker/usage/prompt_cache_hit_tokens_total"] == 0
-    assert metrics["tinker/usage/prompt_uncached_tokens_total"] == 0
-    assert metrics["tinker/usage/prompt_cache_unknown_tokens_total"] == 1_000
-    assert metrics["tinker/estimated_cost/prefill_unknown_upper_bound_usd"] == 0.001
+    assert runtime.usage_metrics()["tinker/usage/prompt_tokens_total"] == 0

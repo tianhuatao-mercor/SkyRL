@@ -215,7 +215,8 @@ class TinkerRuntime:
             0,
             prompt_cache_known_tokens - self._prompt_cache_hit_tokens,
         )
-        # Unknown legacy cache status is conservatively priced as uncached.
+        # Prompt tokens with unknown cache status are conservatively priced as
+        # uncached.
         prefill_cost = (
             self._prompt_cache_hit_tokens * cached_prefill_price
             + (prompt_uncached_tokens + self._prompt_cache_unknown_tokens) * prefill_price
@@ -254,11 +255,16 @@ class TinkerRuntime:
     def _validate_restored_price_config(self, report: dict[str, Any]) -> None:
         saved_prices = report.get("price_per_million_tokens")
         if not isinstance(saved_prices, dict):
-            # Legacy reports predate price snapshots. Keep supporting them, but
-            # new checkpoints must never silently reprice recorded usage.
-            return
+            raise RuntimeError(
+                "Tinker checkpoint usage is missing price_per_million_tokens; "
+                "only the current accounting format is supported"
+            )
         current_prices = self._current_price_config()
-        mismatches = [name for name, current_value in current_prices.items() if saved_prices.get(name) != current_value]
+        mismatches = [
+            name
+            for name, current_value in current_prices.items()
+            if saved_prices.get(name) != current_value
+        ]
         if mismatches:
             raise RuntimeError(
                 "Tinker usage restore pricing does not match the checkpoint for: "
@@ -268,15 +274,15 @@ class TinkerRuntime:
             )
 
     def restore_usage_reports(self, reports: list[dict[str, Any]]) -> None:
-        """Restore cumulative usage before a resumed process starts provider work.
+        """Restore cumulative usage before a resumed process starts provider work."""
 
-        New manifests contain one cumulative report. The first live validation
-        produced two older process-local reports before this restore path
-        existed, so callers may provide several legacy reports to be summed.
-        """
-
-        if not reports:
-            return
+        if (
+            len(reports) != 1
+            or reports[0].get("cumulative_across_resumes") is not True
+        ):
+            raise RuntimeError(
+                "Tinker resume requires one cumulative current-format usage report"
+            )
 
         with self._usage_lock:
             if self._usage_restored:
@@ -301,16 +307,17 @@ class TinkerRuntime:
             for report in reports:
                 metrics = report.get("metrics")
                 if not isinstance(metrics, dict):
-                    continue
-                # Reports written before cache-aware accounting know the total
-                # prompt count but not which tokens received the provider's
-                # cache discount. Preserve that distinction instead of silently
-                # treating an old upper bound as exact.
-                if (
-                    "tinker/usage/prompt_cache_hit_tokens_total" not in metrics
-                    and "tinker/usage/prompt_cache_unknown_tokens_total" not in metrics
-                ):
-                    self._prompt_cache_unknown_tokens += int(metrics.get("tinker/usage/prompt_tokens_total", 0))
+                    raise RuntimeError("Tinker checkpoint usage metrics must be an object")
+                required_cache_metrics = {
+                    "tinker/usage/prompt_cache_hit_tokens_total",
+                    "tinker/usage/prompt_cache_unknown_tokens_total",
+                }
+                missing_cache_metrics = sorted(required_cache_metrics - metrics.keys())
+                if missing_cache_metrics:
+                    raise RuntimeError(
+                        "Tinker checkpoint usage is missing cache accounting metrics: "
+                        + ", ".join(missing_cache_metrics)
+                    )
                 self._restored_wall_time_seconds += float(metrics.get("tinker/usage/wall_time_seconds", 0.0))
                 for (
                     metric_name,

@@ -181,54 +181,6 @@ class TinkerPolicyDispatch:
 
     _CHECKPOINT_MANIFEST = "tinker_checkpoint.json"
 
-    def _usage_reports_for_restore(
-        self,
-        *,
-        ckpt_dir: str,
-        manifest: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Return the cumulative report, or merge pre-fix process-local reports."""
-
-        latest_report = manifest.get("usage_at_checkpoint")
-        if not isinstance(latest_report, dict):
-            return []
-        if latest_report.get("cumulative_across_resumes") is True:
-            return [latest_report]
-
-        step_number = manifest.get("global_step")
-        if not isinstance(step_number, int):
-            return [latest_report]
-
-        checkpoint_root = os.path.dirname(os.path.dirname(ckpt_dir))
-        legacy_reports: list[tuple[int, dict[str, Any]]] = []
-        try:
-            checkpoint_dirs = io.list_dir(checkpoint_root)
-        except (FileNotFoundError, OSError):
-            return [latest_report]
-
-        for candidate_dir in checkpoint_dirs:
-            match = re.fullmatch(r"global_step_(\d+)", os.path.basename(candidate_dir))
-            if match is None:
-                continue
-            candidate_step = int(match.group(1))
-            if candidate_step > step_number:
-                continue
-            candidate_manifest_path = os.path.join(candidate_dir, "policy", self._CHECKPOINT_MANIFEST)
-            if not io.exists(candidate_manifest_path):
-                continue
-            with io.open_file(candidate_manifest_path, "r") as f:
-                candidate_manifest = json.load(f)
-            candidate_report = candidate_manifest.get("usage_at_checkpoint")
-            if not isinstance(candidate_report, dict):
-                continue
-            if candidate_report.get("cumulative_across_resumes") is True:
-                # A cumulative report already includes every earlier process.
-                legacy_reports = [(candidate_step, candidate_report)]
-            else:
-                legacy_reports.append((candidate_step, candidate_report))
-
-        return [report for _, report in sorted(legacy_reports)] or [latest_report]
-
     def save_checkpoint(self, model: str, ckpt_dir: str, tokenizer=None) -> None:
         self._require_policy(model)
         del tokenizer
@@ -262,9 +214,7 @@ class TinkerPolicyDispatch:
             "includes_optimizer_state": True,
             "global_step": step_number,
         }
-        usage_report = getattr(self.runtime, "usage_report", None)
-        if usage_report is not None:
-            manifest["usage_at_checkpoint"] = usage_report()
+        manifest["usage_at_checkpoint"] = self.runtime.usage_report()
         io.makedirs(ckpt_dir, exist_ok=True)
         manifest_path = os.path.join(ckpt_dir, self._CHECKPOINT_MANIFEST)
         with io.open_file(manifest_path, "w") as f:
@@ -299,6 +249,16 @@ class TinkerPolicyDispatch:
         provider_path = str(manifest.get("provider_path") or "")
         if not provider_path:
             raise ValueError(f"Tinker checkpoint manifest has no provider_path: {manifest_path}")
+        usage_report = manifest.get("usage_at_checkpoint")
+        if (
+            not isinstance(usage_report, dict)
+            or usage_report.get("cumulative_across_resumes") is not True
+        ):
+            raise ValueError(
+                f"Tinker checkpoint requires a cumulative current-format usage report: {manifest_path}"
+            )
+        self.runtime.restore_usage_reports([usage_report])
+        logger.info("Restored cumulative Tinker usage from checkpoint report")
 
         load = (
             self.runtime.training_client.load_state_with_optimizer
@@ -306,18 +266,6 @@ class TinkerPolicyDispatch:
             else self.runtime.training_client.load_state
         )
         load(provider_path).result(timeout=self.cfg.trainer.tinker.request_timeout_s)
-        restore_usage = getattr(self.runtime, "restore_usage_reports", None)
-        if restore_usage is not None:
-            usage_reports = self._usage_reports_for_restore(
-                ckpt_dir=ckpt_dir,
-                manifest=manifest,
-            )
-            restore_usage(usage_reports)
-            if usage_reports:
-                logger.info(
-                    "Restored cumulative Tinker usage from {} checkpoint report(s)",
-                    len(usage_reports),
-                )
         logger.info(
             "Loaded hosted Tinker checkpoint: path={}, optimizer_restored={}",
             provider_path,

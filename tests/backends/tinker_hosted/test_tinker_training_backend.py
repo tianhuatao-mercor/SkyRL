@@ -118,7 +118,11 @@ def test_dispatch_saves_and_loads_checkpoint(tmp_path) -> None:
     runtime = SimpleNamespace(
         training_client=training_client,
         record_checkpoint=MagicMock(),
-        usage_report=lambda: {"metrics": {"tinker/usage/checkpoints_total": 1}},
+        usage_report=lambda: {
+            "cumulative_across_resumes": True,
+            "metrics": {"tinker/usage/checkpoints_total": 1},
+        },
+        restore_usage_reports=MagicMock(),
     )
     dispatch = TinkerPolicyDispatch(cfg, runtime)
     ckpt_dir = tmp_path / "global_step_7" / "policy"
@@ -143,9 +147,10 @@ def test_dispatch_saves_and_loads_checkpoint(tmp_path) -> None:
     )
 
     assert training_client.loaded_states == [(manifest["provider_path"], True)]
+    runtime.restore_usage_reports.assert_called_once_with([manifest["usage_at_checkpoint"]])
 
 
-def test_dispatch_restores_all_legacy_process_usage_reports(tmp_path) -> None:
+def test_dispatch_rejects_non_cumulative_usage_before_provider_load(tmp_path) -> None:
     training_client = _TrainingClient()
     runtime = SimpleNamespace(
         training_client=training_client,
@@ -153,25 +158,21 @@ def test_dispatch_restores_all_legacy_process_usage_reports(tmp_path) -> None:
     )
     dispatch = TinkerPolicyDispatch(_cfg(), runtime)
 
-    for step, tokens in ((1, 100), (2, 200)):
-        policy_dir = tmp_path / f"global_step_{step}" / "policy"
-        policy_dir.mkdir(parents=True)
-        (policy_dir / "tinker_checkpoint.json").write_text(
-            json.dumps(
-                {
-                    "format_version": 1,
-                    "provider_path": f"tinker://checkpoint-{step}",
-                    "global_step": step,
-                    "usage_at_checkpoint": {
-                        "metrics": {
-                            "tinker/usage/sampled_tokens_total": tokens,
-                        }
-                    },
-                }
-            )
+    policy_dir = tmp_path / "global_step_2" / "policy"
+    policy_dir.mkdir(parents=True)
+    (policy_dir / "tinker_checkpoint.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "provider_path": "tinker://checkpoint-2",
+                "global_step": 2,
+                "usage_at_checkpoint": {"metrics": {}},
+            }
         )
+    )
 
-    dispatch.load_checkpoint("policy", str(tmp_path / "global_step_2" / "policy"))
+    with pytest.raises(ValueError, match="cumulative current-format usage report"):
+        dispatch.load_checkpoint("policy", str(policy_dir))
 
-    reports = runtime.restore_usage_reports.call_args.args[0]
-    assert [report["metrics"]["tinker/usage/sampled_tokens_total"] for report in reports] == [100, 200]
+    assert training_client.loaded_states == []
+    runtime.restore_usage_reports.assert_not_called()
