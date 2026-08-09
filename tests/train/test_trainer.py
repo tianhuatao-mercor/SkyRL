@@ -166,6 +166,45 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
     assert metrics["avg_advantages"] == approx(
         torch.masked_select(mock_advantages, data["response_mask"].bool()).mean().item(), rel=1e-5
     )
+    assert metrics["std_advantages"] == approx(
+        torch.masked_select(mock_advantages, data["response_mask"].bool()).std(correction=0).item(), rel=1e-5
+    )
+    assert trainer.all_metrics["loss/std_raw_advantages"] == approx(metrics["std_advantages"], rel=1e-5)
+
+
+def test_policy_training_step_logs_batch_token_counts(dummy_config, dummy_generator):
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    data = TrainingInputBatch(
+        {
+            "attention_mask": torch.tensor([[0, 1, 1, 1], [1, 1, 1, 1]]),
+            "response_mask": torch.tensor([[0, 1, 1], [1, 1, 1]]),
+            "loss_mask": torch.tensor([[0, 1, 0], [1, 1, 0]]),
+            "advantages": torch.zeros((2, 3)),
+        }
+    )
+    data.metadata = {"policy_mini_batch_boundaries": [(0, 2)]}
+
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.stage_data.return_value = [data]
+    trainer.dispatch.forward_backward_from_staged.return_value = MagicMock(metrics={"clip_ratio": 0.25})
+    trainer.dispatch.optim_step.return_value = 0.75
+    trainer._normalize_advantages = MagicMock(return_value=data)
+
+    metrics = trainer._execute_training_step("policy", data)
+
+    assert metrics["sequence_tokens"] == 7.0
+    assert metrics["response_tokens"] == 5.0
+    assert metrics["trainable_tokens"] == 3.0
+    assert metrics["clip_ratio"] == pytest.approx(0.25)
+    assert metrics["grad_norm"] == pytest.approx(0.75)
 
 
 def test_calc_advantages_and_returns_step_wise_broadcast(dummy_config):

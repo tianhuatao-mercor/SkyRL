@@ -1130,6 +1130,8 @@ class RayPPOTrainer:
             f"reward/avg_pass_at_{n_samples_per_prompt}": overall_metrics["pass_at_n"],
             "reward/avg_raw_reward": overall_metrics["avg_score"],
             "reward/mean_positive_reward": overall_metrics["mean_positive_reward"],
+            "reward/std_raw_reward": overall_metrics["reward_std"],
+            "reward/fraction_nonzero_reward": overall_metrics["fraction_nonzero_reward"],
         }
         self.all_metrics.update(reward_metrics)
         logger.info(
@@ -1238,6 +1240,7 @@ class RayPPOTrainer:
         )
         avg_advantages: float = valid_advantages.mean().item()
         avg_advantages_abs: float = valid_advantages.abs().mean().item()
+        std_advantages: float = valid_advantages.std(correction=0).item()
 
         if "metrics" not in data.metadata:
             data.metadata["metrics"] = {}
@@ -1247,6 +1250,7 @@ class RayPPOTrainer:
                 "avg_response_length": avg_response_length,
                 "avg_advantages": avg_advantages,
                 "avg_advantages_abs": avg_advantages_abs,
+                "std_advantages": std_advantages,
             }
         )
 
@@ -1256,6 +1260,7 @@ class RayPPOTrainer:
                 "loss/avg_final_rewards": avg_rewards,
                 "loss/avg_raw_advantages": avg_advantages,
                 "loss/avg_raw_advantages_abs": avg_advantages_abs,
+                "loss/std_raw_advantages": std_advantages,
             }
         )
         return data
@@ -1577,6 +1582,15 @@ class RayPPOTrainer:
 
         # Reduce metrics across all mini-batches and epochs
         reduced_metrics = reduce_metrics(all_metrics, sum_loss_metrics=False)
+        if model == "policy":
+            for metric_name, field_name in (
+                ("sequence_tokens", "attention_mask"),
+                ("response_tokens", "response_mask"),
+                ("trainable_tokens", "loss_mask"),
+            ):
+                mask = data.get(field_name)
+                if isinstance(mask, torch.Tensor):
+                    reduced_metrics[metric_name] = float((mask > 0).sum().item())
         finalize_minibatch_rollout_logprob_diff_std(reduced_metrics)
         return reduced_metrics
 

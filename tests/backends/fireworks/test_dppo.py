@@ -87,11 +87,21 @@ def test_binary_tv_custom_loss_matches_expected_loss_mask_and_gradients() -> Non
     assert metrics["clip_ratio"] == pytest.approx(0.4)
     trainable_current = torch.cat([current[0].detach()[1:], current[1].detach()])
     trainable_behavior = torch.full_like(trainable_current, math.log(0.2))
+    trainable_advantages = torch.tensor([2.0, 3.0, -4.0, -5.0, 0.0])
     # The custom loss intentionally computes the difference in float32, then
     # uses float64 only for numerically stable summary accumulation.
     logprob_diff = (trainable_current - trainable_behavior).double()
     abs_logprob_diff = logprob_diff.abs()
     importance_ratio = torch.exp(logprob_diff.clamp(-20.0, 20.0))
+    for prefix, values in (
+        ("train_logprobs", trainable_current.double()),
+        ("rollout_logprobs", trainable_behavior.double()),
+        ("training_advantages", trainable_advantages.double()),
+    ):
+        assert metrics[f"{prefix}_mean"] == pytest.approx(values.mean().item())
+        assert metrics[f"{prefix}_std"] == pytest.approx(values.std(correction=0).item())
+        assert metrics[f"{prefix}_min"] == pytest.approx(values.min().item())
+        assert metrics[f"{prefix}_max"] == pytest.approx(values.max().item())
     assert metrics["rollout_train_logprobs_diff_mean"] == pytest.approx(
         logprob_diff.mean().item()
     )

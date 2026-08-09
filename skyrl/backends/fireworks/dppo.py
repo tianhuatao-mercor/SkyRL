@@ -89,6 +89,9 @@ def make_binary_tv_dppo_loss(
 
         total_loss: torch.Tensor | None = None
         clipped_tokens = 0
+        train_logprob_moments = _StreamingMoments()
+        rollout_logprob_moments = _StreamingMoments()
+        training_advantage_moments = _StreamingMoments()
         logprob_diff_moments = _StreamingMoments()
         abs_logprob_diff_moments = _StreamingMoments()
         importance_ratio_moments = _StreamingMoments()
@@ -143,10 +146,16 @@ def make_binary_tv_dppo_loss(
                 # padding positions are deliberately excluded.
                 trainable_logprob_diff = logprob_diff[trainable].double()
                 if trainable_logprob_diff.numel() > 0:
+                    trainable_train_logprobs = compute_logprobs[trainable].double()
+                    trainable_rollout_logprobs = behavior_logprobs[trainable].double()
+                    trainable_advantages = advantages[trainable].double()
                     trainable_abs_diff = trainable_logprob_diff.abs()
                     trainable_ratio = torch.exp(
                         trainable_logprob_diff.clamp(-20.0, 20.0)
                     )
+                    train_logprob_moments.update(trainable_train_logprobs)
+                    rollout_logprob_moments.update(trainable_rollout_logprobs)
+                    training_advantage_moments.update(trainable_advantages)
                     logprob_diff_moments.update(trainable_logprob_diff)
                     abs_logprob_diff_moments.update(trainable_abs_diff)
                     importance_ratio_moments.update(trainable_ratio)
@@ -168,6 +177,9 @@ def make_binary_tv_dppo_loss(
             "final_loss": float(total_loss.detach().item()),
         }
         if trainable_tokens > 0:
+            metrics.update(train_logprob_moments.as_metrics("train_logprobs"))
+            metrics.update(rollout_logprob_moments.as_metrics("rollout_logprobs"))
+            metrics.update(training_advantage_moments.as_metrics("training_advantages"))
             metrics.update(
                 logprob_diff_moments.as_metrics("rollout_train_logprobs_diff")
             )

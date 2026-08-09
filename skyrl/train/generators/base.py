@@ -69,6 +69,8 @@ class MetricsOutput(TypedDict):
     avg_score: Optional[float]
     pass_at_n: Optional[float]
     mean_positive_reward: Optional[float]
+    reward_std: NotRequired[float]
+    fraction_nonzero_reward: NotRequired[float]
 
 
 class GeneratorInterface(ABC):

@@ -194,6 +194,8 @@ def test_get_metrics_from_generator_output():
     assert metrics["avg_score"] == 1.5
     assert metrics["pass_at_n"] == 1.0
     assert metrics["mean_positive_reward"] == 1.5
+    assert metrics["reward_std"] == pytest.approx(0.5)
+    assert metrics["fraction_nonzero_reward"] == 1.0
 
     # Per token rewards, where rewards are List[List[float]], so for pass_at_n we use the last
     # token's reward to signify the trajectory's reward
@@ -203,6 +205,8 @@ def test_get_metrics_from_generator_output():
     assert metrics["avg_score"] == 1.0
     assert metrics["pass_at_n"] == 0.5
     assert metrics["mean_positive_reward"] == 1.0
+    assert metrics["reward_std"] == 0.0
+    assert metrics["fraction_nonzero_reward"] == 1.0
 
     # Mixed rewards with some negative rewards
     generator_output["rewards"] = [-1.0, 2.0]
@@ -211,6 +215,8 @@ def test_get_metrics_from_generator_output():
     assert metrics["avg_score"] == 0.5
     assert metrics["pass_at_n"] == 0.5
     assert metrics["mean_positive_reward"] == 1.0
+    assert metrics["reward_std"] == pytest.approx(1.5)
+    assert metrics["fraction_nonzero_reward"] == 1.0
 
     # Mixed per-token rewards with negatives - per-token rewards
     generator_output["rewards"] = [[1.0, -1.0], [-0.5, 0.5]]
@@ -219,6 +225,13 @@ def test_get_metrics_from_generator_output():
     assert metrics["avg_score"] == 0.0
     assert metrics["pass_at_n"] == 0.5
     assert metrics["mean_positive_reward"] == 0.75
+    assert metrics["reward_std"] == 0.0
+    assert metrics["fraction_nonzero_reward"] == 0.0
+
+    generator_output["rewards"] = [0.0, 2.0]
+    metrics = get_metrics_from_generator_output(generator_output, ["a", "b"])
+    assert metrics["reward_std"] == pytest.approx(1.0)
+    assert metrics["fraction_nonzero_reward"] == pytest.approx(0.5)
 
 
 # ───────────────────────────────────────────────────────────────────

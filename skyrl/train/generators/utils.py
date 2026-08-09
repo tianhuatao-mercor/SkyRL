@@ -203,7 +203,8 @@ def get_metrics_from_generator_output(generator_output: GeneratorOutput, uids: L
     if isinstance(rewards[0], list):
         # Token-level rewards: rewards is List[List[float]]
         # For each trajectory, we sum over the token rewards for `mean_raw_reward` computation
-        mean_raw_reward = float(np.mean([sum(trajectory_rewards) for trajectory_rewards in rewards]))
+        trajectory_reward_totals = np.asarray([sum(trajectory_rewards) for trajectory_rewards in rewards])
+        mean_raw_reward = float(np.mean(trajectory_reward_totals))
 
         # For each trajectory, we sum over the positive token rewards for mean_positive_reward computation
         mean_positive_reward = float(
@@ -216,7 +217,8 @@ def get_metrics_from_generator_output(generator_output: GeneratorOutput, uids: L
                 raise ValueError("Token-level rewards must be a non-empty list.")
             uid_to_trajectory_rewards[uids[i]].append(cur_trajectory_rewards[-1])
     else:
-        mean_raw_reward = float(np.mean(rewards))
+        trajectory_reward_totals = np.asarray(rewards)
+        mean_raw_reward = float(np.mean(trajectory_reward_totals))
         mean_positive_reward = float(np.mean(np.maximum(rewards, 0.0)))
         for i, reward in enumerate(rewards):
             uid_to_trajectory_rewards[uids[i]].append(reward)
@@ -231,6 +233,8 @@ def get_metrics_from_generator_output(generator_output: GeneratorOutput, uids: L
         avg_score=mean_raw_reward,
         pass_at_n=pass_at_n,
         mean_positive_reward=mean_positive_reward,
+        reward_std=float(np.std(trajectory_reward_totals)),
+        fraction_nonzero_reward=float(np.mean(trajectory_reward_totals != 0.0)),
     )
 
 
