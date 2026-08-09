@@ -58,9 +58,15 @@ def test_binary_tv_custom_loss_matches_expected_loss_mask_and_gradients() -> Non
     loss, metrics = loss_fn([SimpleNamespace(), SimpleNamespace()], current)
     loss.backward()
 
-    reference_current = torch.cat([value.detach() for value in current]).requires_grad_()
-    reference_behavior = torch.tensor([value for spec in specs for value in spec.rollout_logprobs])
-    reference_advantages = torch.tensor([value for spec in specs for value in spec.advantages])
+    reference_current = torch.cat(
+        [value.detach() for value in current]
+    ).requires_grad_()
+    reference_behavior = torch.tensor(
+        [value for spec in specs for value in spec.rollout_logprobs]
+    )
+    reference_advantages = torch.tensor(
+        [value for spec in specs for value in spec.advantages]
+    )
     reference_mask = torch.tensor([value for spec in specs for value in spec.loss_mask])
     algorithm = SkyRLTrainConfig().trainer.algorithm
     algorithm.dppo.dppo_type = "binary_tv"
@@ -79,11 +85,59 @@ def test_binary_tv_custom_loss_matches_expected_loss_mask_and_gradients() -> Non
     assert loss.item() == pytest.approx(-2.0)
     assert metrics["final_loss"] == pytest.approx(-2.0)
     assert metrics["clip_ratio"] == pytest.approx(0.4)
+    trainable_current = torch.cat([current[0].detach()[1:], current[1].detach()])
+    trainable_behavior = torch.full_like(trainable_current, math.log(0.2))
+    # The custom loss intentionally computes the difference in float32, then
+    # uses float64 only for numerically stable summary accumulation.
+    logprob_diff = (trainable_current - trainable_behavior).double()
+    abs_logprob_diff = logprob_diff.abs()
+    importance_ratio = torch.exp(logprob_diff.clamp(-20.0, 20.0))
+    assert metrics["rollout_train_logprobs_diff_mean"] == pytest.approx(
+        logprob_diff.mean().item()
+    )
+    assert metrics["rollout_train_logprobs_diff_std"] == pytest.approx(
+        logprob_diff.std(correction=0).item()
+    )
+    assert metrics["rollout_train_logprobs_diff_min"] == pytest.approx(
+        logprob_diff.min().item()
+    )
+    assert metrics["rollout_train_logprobs_diff_max"] == pytest.approx(
+        logprob_diff.max().item()
+    )
+    assert metrics["rollout_train_logprobs_abs_diff_mean"] == pytest.approx(
+        abs_logprob_diff.mean().item()
+    )
+    assert metrics["rollout_train_logprobs_abs_diff_std"] == pytest.approx(
+        abs_logprob_diff.std(correction=0).item()
+    )
+    assert metrics["rollout_train_logprobs_abs_diff_min"] == pytest.approx(
+        abs_logprob_diff.min().item()
+    )
+    assert metrics["rollout_train_logprobs_abs_diff_max"] == pytest.approx(
+        abs_logprob_diff.max().item()
+    )
+    assert metrics["rollout_train_importance_ratio_mean"] == pytest.approx(
+        importance_ratio.mean().item()
+    )
+    assert metrics["rollout_train_importance_ratio_std"] == pytest.approx(
+        importance_ratio.std(correction=0).item()
+    )
+    assert metrics["rollout_train_importance_ratio_min"] == pytest.approx(
+        importance_ratio.min().item()
+    )
+    assert metrics["rollout_train_importance_ratio_max"] == pytest.approx(
+        importance_ratio.max().item()
+    )
+    assert metrics["rollout_train_approx_kl"] == pytest.approx(
+        (importance_ratio - 1.0 - logprob_diff).mean().item()
+    )
     assert current[0].grad.tolist() == pytest.approx([0.0, 0.0, -4.5])
     assert current[1].grad.tolist() == pytest.approx([0.0, 2.5, 0.0])
     assert loss.item() == pytest.approx(reference_loss.item())
     assert metrics["clip_ratio"] == pytest.approx(reference_metrics["clip_ratio"])
-    assert torch.cat([value.grad for value in current]).tolist() == pytest.approx(reference_current.grad.tolist())
+    assert torch.cat([value.grad for value in current]).tolist() == pytest.approx(
+        reference_current.grad.tolist()
+    )
 
 
 def test_binary_tv_custom_loss_uses_strict_delta_thresholds() -> None:
@@ -92,7 +146,9 @@ def test_binary_tv_custom_loss_uses_strict_delta_thresholds() -> None:
         advantages=[1.0, 1.0, -1.0, -1.0],
         loss_mask=[1.0, 1.0, 1.0, 1.0],
     )
-    current = torch.log(torch.tensor([0.349, 0.351, 0.051, 0.049])).detach().requires_grad_()
+    current = (
+        torch.log(torch.tensor([0.349, 0.351, 0.051, 0.049])).detach().requires_grad_()
+    )
     loss_fn = make_binary_tv_dppo_loss(
         [spec],
         delta_low=0.15,
