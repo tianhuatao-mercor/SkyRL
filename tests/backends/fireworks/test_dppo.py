@@ -1,3 +1,4 @@
+import base64
 import math
 from types import SimpleNamespace
 
@@ -254,3 +255,34 @@ def test_build_dppo_request_strips_callback_only_inputs_from_provider_datums() -
     # Prompt predictions use a masked placeholder target; response targets
     # remain aligned to the behavior logprobs and advantages in the closure.
     assert list(datums[0].loss_fn_inputs["target_tokens"].data) == [0, 20, 21]
+
+
+def test_build_dppo_request_attaches_router_replay_rows() -> None:
+    pytest.importorskip("tinker")
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.tensor([[10, 11, 20, 21]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "loss_mask": torch.tensor([[1.0, 1.0]]),
+            "advantages": torch.tensor([[2.0, -1.0]]),
+            "rollout_logprobs": torch.tensor([[-0.1, -0.2]]),
+            "rollout_expert_indices": torch.tensor(
+                [[[[1], [2]], [[3], [4]], [[5], [6]], [[0], [1]]]],
+                dtype=torch.uint8,
+            ),
+            "router_padding_mask": torch.tensor([[False, False, False, True]]),
+        }
+    )
+
+    datums, _ = build_tinker_binary_tv_dppo_request(
+        batch,
+        max_seq_len=3,
+        delta_low=0.15,
+        delta_high=0.15,
+        enable_router_replay=True,
+    )
+
+    assert datums[0].model_input.routing_matrices == [
+        base64.b64encode(bytes(pair)).decode("ascii") for pair in ([1, 2], [3, 4], [5, 6])
+    ]

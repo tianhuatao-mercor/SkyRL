@@ -40,6 +40,30 @@ def test_validate_fireworks_grpo_config() -> None:
     validate_cfg(_valid_fireworks_cfg())
 
 
+def test_validate_fireworks_router_replay_config() -> None:
+    cfg = _valid_fireworks_cfg()
+    cfg.trainer.fireworks.enable_router_replay = True
+    cfg.generator.inference_engine.enable_return_routed_experts = True
+
+    validate_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    ("trainer_enabled", "sampler_enabled"),
+    [(True, False), (False, True)],
+)
+def test_validate_fireworks_requires_router_capture_and_replay_together(
+    trainer_enabled: bool,
+    sampler_enabled: bool,
+) -> None:
+    cfg = _valid_fireworks_cfg()
+    cfg.trainer.fireworks.enable_router_replay = trainer_enabled
+    cfg.generator.inference_engine.enable_return_routed_experts = sampler_enabled
+
+    with pytest.raises(ValueError, match="requires both"):
+        validate_cfg(cfg)
+
+
 def test_validate_fireworks_binary_tv_dppo_prompt_mean_config() -> None:
     cfg = _valid_fireworks_cfg()
     cfg.trainer.algorithm.policy_loss_type = "dppo"

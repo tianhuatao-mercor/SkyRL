@@ -13,6 +13,7 @@ from loguru import logger
 
 from skyrl.backends.fireworks.dppo import build_tinker_binary_tv_dppo_request
 from skyrl.backends.fireworks.grpo import build_tinker_grpo_datums
+from skyrl.backends.fireworks.router_replay import routing_payload_counts
 from skyrl.backends.fireworks.runtime import FireworksRuntime
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
@@ -66,23 +67,39 @@ class FireworksPolicyDispatch:
             raise NotImplementedError("Fireworks native GRPO dispatch does not accept per-call loss/model overrides")
         attention_mask = staged_batch.get("attention_mask")
         training_tokens = 0 if attention_mask is None else int(attention_mask.sum().item())
+        routing_rows = 0
+        routing_bytes = 0
         started = time.monotonic()
         try:
             policy_loss_type = self.cfg.trainer.algorithm.policy_loss_type
             if policy_loss_type == "rollout_is":
+                builder_kwargs: dict[str, Any] = {
+                    "max_seq_len": self.cfg.trainer.fireworks.max_seq_len,
+                }
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    builder_kwargs["enable_router_replay"] = True
                 datums = self._datum_builder(
                     staged_batch,
-                    max_seq_len=self.cfg.trainer.fireworks.max_seq_len,
+                    **builder_kwargs,
                 )
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    routing_rows, routing_bytes = routing_payload_counts(datums)
                 future = self.runtime.training_client.forward_backward(datums, "importance_sampling")
             elif policy_loss_type == "dppo":
                 dppo = self.cfg.trainer.algorithm.dppo
+                dppo_builder_kwargs: dict[str, Any] = {
+                    "max_seq_len": self.cfg.trainer.fireworks.max_seq_len,
+                    "delta_low": dppo.delta_low,
+                    "delta_high": dppo.delta_high,
+                }
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    dppo_builder_kwargs["enable_router_replay"] = True
                 datums, custom_loss = self._dppo_request_builder(
                     staged_batch,
-                    max_seq_len=self.cfg.trainer.fireworks.max_seq_len,
-                    delta_low=dppo.delta_low,
-                    delta_high=dppo.delta_high,
+                    **dppo_builder_kwargs,
                 )
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    routing_rows, routing_bytes = routing_payload_counts(datums)
                 future = self.runtime.training_client.forward_backward_custom(
                     datums,
                     custom_loss,
@@ -96,20 +113,32 @@ class FireworksPolicyDispatch:
         except BaseException:
             record = getattr(self.runtime, "record_forward_backward", None)
             if record is not None:
-                record(
+                record_kwargs: dict[str, Any] = dict(
                     training_tokens=0,
                     elapsed_s=time.monotonic() - started,
                     succeeded=False,
                 )
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    record_kwargs.update(routing_rows=0, routing_bytes=0)
+                record(**record_kwargs)
             raise
         record = getattr(self.runtime, "record_forward_backward", None)
         if record is not None:
-            record(
+            record_kwargs = dict(
                 training_tokens=training_tokens,
                 elapsed_s=time.monotonic() - started,
                 succeeded=True,
             )
+            if self.cfg.trainer.fireworks.enable_router_replay:
+                record_kwargs.update(
+                    routing_rows=routing_rows,
+                    routing_bytes=routing_bytes,
+                )
+            record(**record_kwargs)
         metrics = {key: float(value) for key, value in (getattr(result, "metrics", None) or {}).items()}
+        if self.cfg.trainer.fireworks.enable_router_replay:
+            metrics["router_replay_rows"] = float(routing_rows)
+            metrics["router_replay_bytes"] = float(routing_bytes)
         if "loss:sum" in metrics:
             metrics.setdefault("final_loss", metrics["loss:sum"])
         return WorkerOutput(

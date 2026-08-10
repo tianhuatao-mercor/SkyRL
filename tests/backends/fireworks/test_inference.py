@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -77,6 +78,44 @@ class _TrainingClient:
         return _Future(SimpleNamespace(path=f"snapshot://{name}"))
 
 
+class _RouterReplaySampler:
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    async def sample_with_prompt_tokens(self, prompt_token_ids, *, n, **kwargs):
+        self.calls.append((list(prompt_token_ids), n, kwargs))
+        rows = [
+            base64.b64encode(bytes(values)).decode("ascii") for values in ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
+        ]
+        return [
+            SimpleNamespace(
+                full_tokens=list(prompt_token_ids) + [7, 8],
+                prompt_len=len(prompt_token_ids),
+                completion_len=2,
+                sampling_logprobs=[-0.2, -0.7, -0.8],
+                logprobs_echoed=True,
+                routing_matrices=rows,
+                finish_reason="stop",
+            )
+        ]
+
+    def close(self):
+        self.closed = True
+
+
+class _RouterReplayService(_Service):
+    def __init__(self):
+        super().__init__()
+        self.router_sampler = _RouterReplaySampler()
+        self.native_sampler_creations = 0
+
+    def create_deployment_sampler(self, **kwargs):
+        assert isinstance(kwargs.get("tokenizer"), _Tokenizer)
+        self.native_sampler_creations += 1
+        return self.router_sampler
+
+
 @pytest.mark.asyncio
 async def test_generate_returns_exact_tokens_and_logprobs() -> None:
     runtime = FireworksRuntime(
@@ -113,6 +152,65 @@ async def test_generate_returns_exact_tokens_and_logprobs() -> None:
     assert output["response_logprobs"] == [[-0.7, -0.8], [-0.7, -0.8]]
     assert output["stop_reasons"] == ["stop", "stop"]
     assert client.weight_version == 0
+    await client.teardown()
+
+
+@pytest.mark.asyncio
+async def test_generate_captures_echo_aligned_router_replay_payload() -> None:
+    service = _RouterReplayService()
+    runtime = FireworksRuntime(
+        service=service,
+        training_client=_TrainingClient(),
+        tokenizer=_Tokenizer(),
+        config=FireworksConfig(
+            max_seq_len=16,
+            enable_router_replay=True,
+        ),
+    )
+    await runtime.publish_sampler_weights()
+    client = FireworksInferenceClient(
+        runtime=runtime,
+        default_sampling_params={
+            "max_tokens": 8,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "logprobs": 1,
+        },
+    )
+
+    output = await client.generate(
+        {
+            "prompt_token_ids": [[1, 2]],
+            "sampling_params": None,
+            "session_ids": ["route-test"],
+            "prompts": None,
+            "mm_features": None,
+            "cache_salt": None,
+        }
+    )
+
+    assert output["response_ids"] == [[7, 8]]
+    assert output["response_logprobs"] == [[-0.7, -0.8]]
+    routes = output["rollout_expert_indices"]
+    assert routes is not None
+    assert routes[0].shape == (3, 4, 1)
+    assert routes[0].reshape(3, 4).tolist() == [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+    ]
+    prompt, n, kwargs = service.router_sampler.calls[0]
+    assert prompt == [1, 2]
+    assert n == 1
+    assert kwargs["logprobs"] is True
+    assert kwargs["echo"] is True
+    assert kwargs["include_routing_matrix"] is True
+    assert kwargs["top_k"] == 0
+    assert service.native_sampler_creations == 1
+    metrics = runtime.usage_metrics()
+    assert metrics["fireworks/router_replay/captured_rows_total"] == 3
+    assert metrics["fireworks/router_replay/captured_bytes_total"] == 12
     await client.teardown()
 
 

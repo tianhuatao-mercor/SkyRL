@@ -71,6 +71,10 @@ class FireworksRuntime:
         "fireworks/usage/forward_backward_calls_total": "_forward_backward_calls",
         "fireworks/usage/training_tokens_total": "_training_tokens",
         "fireworks/usage/forward_backward_seconds_total": "_forward_backward_seconds",
+        "fireworks/router_replay/captured_rows_total": "_router_rows_captured",
+        "fireworks/router_replay/captured_bytes_total": "_router_bytes_captured",
+        "fireworks/router_replay/submitted_rows_total": "_router_rows_submitted",
+        "fireworks/router_replay/submitted_bytes_total": "_router_bytes_submitted",
     }
 
     def __init__(
@@ -116,6 +120,10 @@ class FireworksRuntime:
         self._forward_backward_calls = 0
         self._training_tokens = 0
         self._forward_backward_seconds = 0.0
+        self._router_rows_captured = 0
+        self._router_bytes_captured = 0
+        self._router_rows_submitted = 0
+        self._router_bytes_submitted = 0
 
     @classmethod
     def connect(
@@ -403,16 +411,29 @@ class FireworksRuntime:
         training_tokens: int,
         elapsed_s: float,
         succeeded: bool,
+        routing_rows: int = 0,
+        routing_bytes: int = 0,
     ) -> None:
         """Record one Fireworks trainer forward/backward request."""
 
-        if training_tokens < 0 or elapsed_s < 0:
+        if min(training_tokens, routing_rows, routing_bytes) < 0 or elapsed_s < 0:
             raise ValueError("Fireworks training usage must be non-negative")
         with self._usage_lock:
             self._forward_backward_calls += 1
             self._forward_backward_seconds += elapsed_s
             if succeeded:
                 self._training_tokens += training_tokens
+                self._router_rows_submitted += routing_rows
+                self._router_bytes_submitted += routing_bytes
+
+    def record_router_capture(self, *, routing_rows: int, routing_bytes: int) -> None:
+        """Record validated routing payload returned by the rollout sampler."""
+
+        if min(routing_rows, routing_bytes) < 0:
+            raise ValueError("Fireworks router-replay usage must be non-negative")
+        with self._usage_lock:
+            self._router_rows_captured += routing_rows
+            self._router_bytes_captured += routing_bytes
 
     def usage_metrics(self) -> dict[str, int | float]:
         """Return cumulative numeric GPU-hour estimates for W&B.
@@ -448,6 +469,18 @@ class FireworksRuntime:
                 "fireworks/usage/training_tokens_total": self._training_tokens,
                 "fireworks/usage/forward_backward_seconds_total": (
                     self._forward_backward_seconds
+                ),
+                "fireworks/router_replay/captured_rows_total": (
+                    self._router_rows_captured
+                ),
+                "fireworks/router_replay/captured_bytes_total": (
+                    self._router_bytes_captured
+                ),
+                "fireworks/router_replay/submitted_rows_total": (
+                    self._router_rows_submitted
+                ),
+                "fireworks/router_replay/submitted_bytes_total": (
+                    self._router_bytes_submitted
                 ),
             }
         trainer_gpus_per_replica = self.config.billing_trainer_gpus_per_replica
@@ -623,8 +656,13 @@ class FireworksRuntime:
             with self._state_lock:
                 needs_sampler = self._sampler is None
             if needs_sampler:
+                sampler_factory = (
+                    self.service.create_deployment_sampler
+                    if self.config.enable_router_replay
+                    else self.service.create_sampling_client
+                )
                 sampler = await asyncio.to_thread(
-                    self.service.create_sampling_client,
+                    sampler_factory,
                     tokenizer=self.tokenizer,
                 )
                 with self._state_lock:
@@ -681,6 +719,28 @@ class FireworksRuntime:
                     num_samples=1,
                     sampling_params=sampling_params,
                 ),
+                timeout=self.config.sampling_timeout_s,
+            )
+            return result, identity
+
+    async def sample_with_router_replay_async(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        sampling_kwargs: dict[str, Any],
+    ) -> tuple[Any, SamplerVersion]:
+        """Sample through Fireworks' native route-aware deployment client."""
+
+        if not self.config.enable_router_replay:
+            raise RuntimeError("Fireworks router replay is not enabled")
+        with self._use_sampler() as (sampler, identity):
+            native_sample = getattr(sampler, "sample_with_prompt_tokens", None)
+            if native_sample is None:
+                raise RuntimeError(
+                    "The Fireworks DeploymentSampler must expose " "sample_with_prompt_tokens() for router replay"
+                )
+            result = await asyncio.wait_for(
+                native_sample(prompt_token_ids, n=1, **sampling_kwargs),
                 timeout=self.config.sampling_timeout_s,
             )
             return result, identity

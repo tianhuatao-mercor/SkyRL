@@ -19,6 +19,7 @@ from skyrl.backends.fireworks.grpo import (
     GRPODatumSpec,
     training_batch_to_grpo_datum_specs,
 )
+from skyrl.backends.fireworks.router_replay import make_tinker_model_input
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 
 
@@ -201,6 +202,7 @@ def build_tinker_binary_tv_dppo_request(
     max_seq_len: int | None,
     delta_low: float,
     delta_high: float,
+    enable_router_replay: bool = False,
 ) -> tuple[list[Any], Callable[..., tuple[torch.Tensor, dict[str, float]]]]:
     """Build target-token datums plus the aligned custom DPPO closure."""
 
@@ -212,10 +214,17 @@ def build_tinker_binary_tv_dppo_request(
             "install SkyRL with the Fireworks extra"
         ) from exc
 
-    specs = training_batch_to_grpo_datum_specs(batch, max_seq_len=max_seq_len)
+    specs = training_batch_to_grpo_datum_specs(
+        batch,
+        max_seq_len=max_seq_len,
+        enable_router_replay=enable_router_replay,
+    )
     datums = [
         tinker.Datum(
-            model_input=tinker.ModelInput.from_ints(list(spec.model_input_token_ids)),
+            model_input=make_tinker_model_input(
+                spec.model_input_token_ids,
+                spec.routing_matrices,
+            ),
             loss_fn_inputs={
                 "target_tokens": tinker.TensorData(
                     data=list(spec.target_tokens), dtype="int64"

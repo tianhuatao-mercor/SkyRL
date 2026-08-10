@@ -303,6 +303,12 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
         raise ValueError("Dedicated Fireworks training requires trainer_replica_count > 0")
     if fireworks.replica_count <= 0:
         raise ValueError("Dedicated Fireworks training requires replica_count > 0")
+    if fireworks.enable_router_replay != inference.enable_return_routed_experts:
+        raise ValueError(
+            "Fireworks router replay requires both "
+            "trainer.fireworks.enable_router_replay=true and "
+            "generator.inference_engine.enable_return_routed_experts=true"
+        )
     if not fireworks.cleanup_on_exit:
         raise ValueError("The dedicated Fireworks backend requires cleanup_on_exit=true")
     if fireworks.cleanup_deployment_on_close not in ("delete", "scale_to_zero"):

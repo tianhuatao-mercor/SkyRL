@@ -1,3 +1,4 @@
+import base64
 import math
 
 import pytest
@@ -115,3 +116,38 @@ def test_build_tinker_grpo_datums() -> None:
     assert datums[0].loss_fn_inputs["target_tokens"].dtype == "int64"
     assert datums[0].loss_fn_inputs["logprobs"].dtype == "float32"
     assert datums[0].loss_fn_inputs["advantages"].dtype == "float32"
+
+
+def test_build_tinker_grpo_datums_attaches_router_replay_rows() -> None:
+    pytest.importorskip("tinker")
+    batch = _batch()
+    batch["rollout_expert_indices"] = torch.zeros(
+        (2, 5, 2, 1),
+        dtype=torch.uint8,
+    )
+    batch["rollout_expert_indices"][0, :4, :, 0] = torch.tensor(
+        [[1, 2], [3, 4], [5, 6], [7, 8]],
+        dtype=torch.uint8,
+    )
+    batch["rollout_expert_indices"][1, 1:4, :, 0] = torch.tensor(
+        [[9, 10], [11, 12], [13, 14]],
+        dtype=torch.uint8,
+    )
+    batch["router_padding_mask"] = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [True, False, False, False, True],
+        ]
+    )
+
+    datums = build_tinker_grpo_datums(
+        batch,
+        max_seq_len=4,
+        enable_router_replay=True,
+    )
+
+    expected = [
+        [base64.b64encode(bytes(pair)).decode("ascii") for pair in ([1, 2], [3, 4], [5, 6], [7, 8])],
+        [base64.b64encode(bytes(pair)).decode("ascii") for pair in ([9, 10], [11, 12], [13, 14])],
+    ]
+    assert [datum.model_input.routing_matrices for datum in datums] == expected

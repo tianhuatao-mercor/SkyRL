@@ -1355,6 +1355,14 @@ class FireworksConfig(BaseConfig):
     When unset, Fireworks uses the deployment shape linked by the selected
     training shape. Set this to pin a newer compatible rollout shape explicitly.
     """
+    enable_router_replay: bool = False
+    """Replay rollout MoE routing matrices during Fireworks training.
+
+    Enable together with
+    ``generator.inference_engine.enable_return_routed_experts``. Fireworks
+    sampling then returns one opaque routing payload per model-input token and
+    the hosted trainer consumes those exact payloads during forward/backward.
+    """
     trainer_job_id: Optional[str] = None
     """Stable trainer ID, used for audit and failure cleanup."""
     trainer_replica_count: int = 1

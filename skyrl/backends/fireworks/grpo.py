@@ -9,11 +9,15 @@ conversion pure makes it testable without opening a Fireworks session.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from skyrl.backends.fireworks.router_replay import (
+    make_tinker_model_input,
+    routing_matrices_for_model_inputs,
+)
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 
 if TYPE_CHECKING:
@@ -34,6 +38,7 @@ class GRPODatumSpec:
     rollout_logprobs: tuple[float, ...]
     advantages: tuple[float, ...]
     loss_mask: tuple[float, ...]
+    routing_matrices: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         expected = len(self.model_input_token_ids)
@@ -46,6 +51,11 @@ class GRPODatumSpec:
         mismatched = {name: length for name, length in lengths.items() if length != expected}
         if mismatched:
             raise ValueError(f"GRPO datum fields must all have length {expected}, got {mismatched}")
+        if self.routing_matrices is not None and len(self.routing_matrices) != expected:
+            raise ValueError(
+                "GRPO routing_matrices must have one row per model-input token, "
+                f"got {len(self.routing_matrices)} for length {expected}"
+            )
 
 
 def _require_matrix(batch: TrainingInputBatch, name: str) -> torch.Tensor:
@@ -88,6 +98,7 @@ def training_batch_to_grpo_datum_specs(
     batch: TrainingInputBatch,
     *,
     max_seq_len: int | None = None,
+    enable_router_replay: bool = False,
 ) -> list[GRPODatumSpec]:
     """Convert a SkyRL policy mini-batch into shifted GRPO datum specs.
 
@@ -190,6 +201,16 @@ def training_batch_to_grpo_datum_specs(
             )
         )
 
+    if enable_router_replay:
+        encoded_routes = routing_matrices_for_model_inputs(
+            batch,
+            [len(spec.model_input_token_ids) for spec in specs],
+        )
+        specs = [
+            replace(spec, routing_matrices=routes)
+            for spec, routes in zip(specs, encoded_routes, strict=True)
+        ]
+
     return specs
 
 
@@ -203,7 +224,10 @@ def _to_tinker_datum(spec: GRPODatumSpec) -> Any:
         ) from exc
 
     return tinker.Datum(
-        model_input=tinker.ModelInput.from_ints(list(spec.model_input_token_ids)),
+        model_input=make_tinker_model_input(
+            spec.model_input_token_ids,
+            spec.routing_matrices,
+        ),
         loss_fn_inputs={
             "target_tokens": tinker.TensorData(data=list(spec.target_tokens), dtype="int64"),
             "logprobs": tinker.TensorData(data=list(spec.rollout_logprobs), dtype="float32"),
@@ -216,7 +240,15 @@ def build_tinker_grpo_datums(
     batch: TrainingInputBatch,
     *,
     max_seq_len: int | None = None,
+    enable_router_replay: bool = False,
 ) -> list["tinker.Datum"]:
     """Build concrete Tinker datums for Fireworks ``importance_sampling``."""
 
-    return [_to_tinker_datum(spec) for spec in training_batch_to_grpo_datum_specs(batch, max_seq_len=max_seq_len)]
+    return [
+        _to_tinker_datum(spec)
+        for spec in training_batch_to_grpo_datum_specs(
+            batch,
+            max_seq_len=max_seq_len,
+            enable_router_replay=enable_router_replay,
+        )
+    ]
