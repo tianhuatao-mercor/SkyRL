@@ -1349,6 +1349,12 @@ class FireworksConfig(BaseConfig):
     """Prefix for unique in-session sampler snapshot names. It must not contain secrets."""
     training_shape_id: Optional[str] = None
     """Training shape resource name."""
+    deployment_shape_id: Optional[str] = None
+    """Optional rollout deployment-shape resource name.
+
+    When unset, Fireworks uses the deployment shape linked by the selected
+    training shape. Set this to pin a newer compatible rollout shape explicitly.
+    """
     trainer_job_id: Optional[str] = None
     """Stable trainer ID, used for audit and failure cleanup."""
     trainer_replica_count: int = 1

@@ -122,6 +122,9 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
         base_model="accounts/fireworks/models/qwen3-4b",
         max_seq_len=32768,
         training_shape_id="accounts/fireworks/trainingShapes/qwen3-4b-minimum-lora",
+        deployment_shape_id=(
+            "accounts/fireworks/deploymentShapes/rft-qwen3-4b/versions/latest"
+        ),
         trainer_job_id="skyrl-smoke-test-trainer",
         deployment_id="skyrl-smoke-test-rollout",
         cleanup_deployment_on_close="delete",
@@ -138,6 +141,7 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
     )
 
     assert captured["service"]["training_shape_id"] == config.training_shape_id
+    assert captured["service"]["deployment_shape"] == config.deployment_shape_id
     assert captured["service"]["cleanup_trainer_on_close"] is True
     assert captured["service"]["cleanup_deployment_on_close"] == "delete"
     assert captured["service"]["trainer_replica_count"] == 2

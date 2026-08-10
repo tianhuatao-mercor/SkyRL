@@ -242,6 +242,12 @@ class FireworksPolicyDispatch:
             )
 
         current_identity = self._checkpoint_identity()
+        saved_training_shape = str(saved_identity["training_shape_id"])
+        current_training_shape = str(current_identity["training_shape_id"])
+        same_training_shape_family = (
+            saved_training_shape.split("/versions/", 1)[0]
+            == current_training_shape.split("/versions/", 1)[0]
+        )
         mismatches = {
             field: (saved_identity[field], current_identity[field])
             for field in self._CHECKPOINT_IDENTITY_FIELDS
@@ -249,6 +255,7 @@ class FireworksPolicyDispatch:
             and not (
                 field == "lora_alpha" and saved_identity.get("lora_rank") == 0 and current_identity["lora_rank"] == 0
             )
+            and not (field == "training_shape_id" and same_training_shape_family)
             and saved_identity[field] != current_identity[field]
         }
         if mismatches:
@@ -257,6 +264,13 @@ class FireworksPolicyDispatch:
             )
             raise ValueError(
                 "Fireworks checkpoint training method does not match the current run " f"({details}): {manifest_path}"
+            )
+        if saved_training_shape != current_training_shape:
+            logger.info(
+                "Accepting Fireworks checkpoint across validated versions of the same "
+                "training shape: checkpoint={}, current={}",
+                saved_training_shape,
+                current_training_shape,
             )
 
     def save_checkpoint(self, model: str, ckpt_dir: str, tokenizer=None) -> None:

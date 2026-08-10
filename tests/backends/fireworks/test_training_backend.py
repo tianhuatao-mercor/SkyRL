@@ -311,6 +311,28 @@ def test_policy_dispatch_rejects_checkpoint_method_mismatch_before_provider_load
     assert training_client.loaded_states == []
 
 
+def test_policy_dispatch_accepts_new_version_of_same_training_shape() -> None:
+    cfg = _cfg()
+    cfg.trainer.fireworks.training_shape_id = (
+        "accounts/fireworks/trainingShapes/test-shape/versions/new"
+    )
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        SimpleNamespace(),
+    )
+    identity = dispatch._checkpoint_identity()
+    identity["training_shape_id"] = (
+        "accounts/fireworks/trainingShapes/test-shape/versions/old"
+    )
+    dispatch._preflight_checkpoint_identity(
+        {
+            "format_version": 2,
+            "training_identity": identity,
+        },
+        manifest_path="fireworks_checkpoint.json",
+    )
+
+
 def test_policy_dispatch_rejects_v2_checkpoint_without_identity_before_load(
     tmp_path,
 ) -> None:

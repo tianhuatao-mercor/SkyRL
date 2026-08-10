@@ -168,6 +168,7 @@ class FireworksRuntime:
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             training_shape_id=config.training_shape_id,
+            deployment_shape=config.deployment_shape_id,
             trainer_job_id=config.trainer_job_id,
             deployment_id=config.deployment_id,
             create_deployment=True,
@@ -510,6 +511,9 @@ class FireworksRuntime:
                 "fireworks/run/training_shape_id": (
                     self.config.training_shape_id or ""
                 ),
+                "fireworks/run/deployment_shape_id": (
+                    self.config.deployment_shape_id or ""
+                ),
                 "fireworks/run/trainer_job_id": self.trainer_job_id or "",
                 "fireworks/run/deployment_id": self.deployment_id or "",
                 "fireworks/run/cost_estimate_basis": (
@@ -559,6 +563,7 @@ class FireworksRuntime:
             "started_at_utc": self._started_at_utc,
             "base_model": self.config.base_model,
             "training_shape_id": self.config.training_shape_id,
+            "deployment_shape_id": self.config.deployment_shape_id,
             "trainer_job_id": self.trainer_job_id,
             "deployment_id": self.deployment_id,
             "gpu_type": self.config.billing_gpu_type,
