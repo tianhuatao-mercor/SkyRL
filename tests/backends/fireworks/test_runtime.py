@@ -143,6 +143,7 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
     assert captured["service"]["training_shape_id"] == config.training_shape_id
     assert captured["service"]["deployment_shape"] == config.deployment_shape_id
     assert captured["service"]["cleanup_trainer_on_close"] is True
+    assert captured["service"]["inactivity_timeout"] == "300s"
     assert captured["service"]["cleanup_deployment_on_close"] == "delete"
     assert captured["service"]["trainer_replica_count"] == 2
     assert captured["service"]["replica_count"] == 1
@@ -156,6 +157,56 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
     assert runtime.trainer_job_id == config.trainer_job_id
     assert runtime.deployment_id == config.deployment_id
     asyncio.run(runtime.close())
+    assert service.closed is True
+
+
+def test_failed_close_preserves_trainer_but_still_closes_service() -> None:
+    service = _Service()
+    service._managed_handle = SimpleNamespace(cleanup_trainer_on_close=True)
+    runtime = _runtime(service=service)
+
+    asyncio.run(runtime.close(preserve_trainer=True))
+
+    assert service._managed_handle.cleanup_trainer_on_close is False
+    assert service.closed is True
+
+
+def test_connect_failure_preserves_provisioned_trainer(monkeypatch) -> None:
+    from fireworks.training.sdk import FiretitanServiceClient
+
+    class FailingManagedService(_Service):
+        def __init__(self):
+            super().__init__()
+            self._managed_handle = SimpleNamespace(cleanup_trainer_on_close=True)
+
+        def create_training_client(self, **kwargs):
+            del kwargs
+            raise RuntimeError("client setup failed")
+
+    service = FailingManagedService()
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr(
+        FiretitanServiceClient,
+        "from_firetitan_config",
+        staticmethod(lambda **kwargs: service),
+    )
+
+    with pytest.raises(RuntimeError, match="client setup failed"):
+        FireworksRuntime.connect(
+            config=FireworksConfig(
+                base_model="accounts/fireworks/models/qwen3-4b",
+                training_shape_id="accounts/fireworks/trainingShapes/test",
+                trainer_job_id="skyrl-smoke-test-trainer",
+                deployment_id="skyrl-smoke-test-rollout",
+            ),
+            tokenizer="tokenizer",
+            tokenizer_model="Qwen/Qwen3-4B",
+            lora_rank=8,
+            lora_alpha=32,
+            learning_rate=1e-5,
+        )
+
+    assert service._managed_handle.cleanup_trainer_on_close is False
     assert service.closed is True
 
 

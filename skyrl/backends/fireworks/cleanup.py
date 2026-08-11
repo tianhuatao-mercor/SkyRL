@@ -15,6 +15,7 @@ _TRAINER_TERMINAL = {
     "JOB_STATE_COMPLETED",
     "JOB_STATE_DELETED",
     "JOB_STATE_FAILED",
+    "JOB_STATE_PAUSED",
 }
 _DEPLOYMENT_TERMINAL = {"DELETED", "FAILED"}
 
@@ -37,8 +38,20 @@ def _deployment_state(manager: DeploymentManager, resource_id: str) -> str | Non
     return None if row is None else str(row.state)
 
 
-def cleanup_and_audit(*, trainer_job_id: str, deployment_id: str, attempts: int = 12) -> bool:
-    """Delete only the named smoke resources and wait for terminal states."""
+def cleanup_and_audit(
+    *,
+    trainer_job_id: str,
+    deployment_id: str,
+    attempts: int = 12,
+    preserve_trainer: bool = False,
+) -> bool:
+    """Clean exact-ID resources and wait for non-billing states.
+
+    ``preserve_trainer`` leaves the trainer record and its logs intact. New
+    SkyRL trainers have an inactivity timeout, so closing their client stops
+    orphaned compute without requiring the destructive trainer DELETE call.
+    The rollout deployment is still removed immediately.
+    """
 
     api_key = os.environ.get("FIREWORKS_API_KEY")
     if not api_key:
@@ -56,12 +69,22 @@ def cleanup_and_audit(*, trainer_job_id: str, deployment_id: str, attempts: int 
             deployment.delete(deployment_id)
 
         trainer_state = _trainer_state(trainer, trainer_job_id)
-        if trainer_state is not None and trainer_state not in _TRAINER_TERMINAL:
+        if (
+            trainer_state is not None
+            and trainer_state not in _TRAINER_TERMINAL
+            and not preserve_trainer
+        ):
             print(
                 f"Stopping dedicated trainer {trainer_job_id} (state={trainer_state})",
                 flush=True,
             )
             trainer.delete(trainer_job_id)
+        elif trainer_state is not None and preserve_trainer:
+            print(
+                f"Preserving dedicated trainer {trainer_job_id} "
+                f"(state={trainer_state}); waiting for inactivity cleanup",
+                flush=True,
+            )
 
         for attempt in range(1, attempts + 1):
             trainer_state = _trainer_state(trainer, trainer_job_id)
@@ -86,10 +109,19 @@ def _parse_args() -> Any:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trainer-job-id", required=True, type=_resource_id)
     parser.add_argument("--deployment-id", required=True, type=_resource_id)
+    parser.add_argument(
+        "--preserve-trainer",
+        action="store_true",
+        help="retain the trainer record and logs; only remove the rollout",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    if not cleanup_and_audit(trainer_job_id=args.trainer_job_id, deployment_id=args.deployment_id):
+    if not cleanup_and_audit(
+        trainer_job_id=args.trainer_job_id,
+        deployment_id=args.deployment_id,
+        preserve_trainer=args.preserve_trainer,
+    ):
         raise RuntimeError("Dedicated Fireworks resources did not reach terminal states")

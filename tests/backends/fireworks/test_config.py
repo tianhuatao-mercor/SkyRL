@@ -195,6 +195,15 @@ def test_validate_dedicated_requires_positive_trainer_replica_count() -> None:
         validate_cfg(cfg)
 
 
+@pytest.mark.parametrize("seconds", [0, 10801])
+def test_validate_fireworks_inactivity_timeout(seconds: int) -> None:
+    cfg = _valid_fireworks_cfg()
+    cfg.trainer.fireworks.trainer_inactivity_timeout_s = seconds
+
+    with pytest.raises(ValueError, match="between 1 and 10800"):
+        validate_cfg(cfg)
+
+
 def test_validate_dedicated_requires_auditable_resource_ids() -> None:
     cfg = _valid_fireworks_cfg()
     cfg.trainer.fireworks.training_shape_id = None

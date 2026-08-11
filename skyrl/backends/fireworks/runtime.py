@@ -50,6 +50,16 @@ def _close_quietly(resource: Any) -> None:
         )
 
 
+def _disable_managed_trainer_deletion(service: Any) -> bool:
+    """Keep an SDK-managed trainer record when closing after a failure."""
+
+    handle = getattr(service, "_managed_handle", None)
+    if handle is None:
+        return False
+    handle.cleanup_trainer_on_close = False
+    return True
+
+
 class FireworksRuntime:
     """Own one dedicated trainer, deployment, and stable sampling client.
 
@@ -189,6 +199,7 @@ class FireworksRuntime:
             trainer_replica_count=config.trainer_replica_count,
             replica_count=config.replica_count,
             trainer_timeout_s=config.trainer_timeout_s,
+            inactivity_timeout=f"{config.trainer_inactivity_timeout_s}s",
             deployment_timeout_s=config.deployment_timeout_s,
             hotload_timeout_s=config.hotload_timeout_s,
             cleanup_trainer_on_close=config.cleanup_on_exit,
@@ -202,7 +213,10 @@ class FireworksRuntime:
             )
         except BaseException:
             # Include KeyboardInterrupt so a wall-clock supervisor can still
-            # invoke SDK cleanup during a long provisioning wait.
+            # invoke SDK cleanup during a long provisioning wait. Do not let
+            # that cleanup archive a trainer that was provisioned before a
+            # later setup operation failed.
+            _disable_managed_trainer_deletion(service)
             _close_quietly(service)
             raise
         return cls(
@@ -745,8 +759,15 @@ class FireworksRuntime:
             )
             return result, identity
 
-    async def close(self) -> None:
-        """Drain active calls, then close the sampler and service. Idempotent."""
+    async def close(self, *, preserve_trainer: bool = False) -> None:
+        """Drain active calls and close managed resources. Idempotent.
+
+        On a failed run, ``preserve_trainer`` keeps the trainer job and its
+        dashboard logs available for diagnosis. The SDK still closes the
+        trainer client and the rollout cleanup policy still applies. Fireworks'
+        inactivity timeout then stops the orphaned trainer compute without
+        archiving the evidence.
+        """
 
         # Publication and teardown must not mutate the deployment concurrently.
         async with self._publish_lock:
@@ -778,4 +799,10 @@ class FireworksRuntime:
                 )
             if sampler is not None:
                 await asyncio.to_thread(_close_quietly, sampler)
+            if preserve_trainer:
+                # Fireworks' managed handle otherwise issues DELETE during
+                # close(), which archives the job and removes it from the
+                # dashboard. This flag affects only trainer deletion; rollout
+                # teardown and client/telemetry shutdown still happen.
+                _disable_managed_trainer_deletion(self.service)
             await asyncio.to_thread(_close_quietly, self.service)

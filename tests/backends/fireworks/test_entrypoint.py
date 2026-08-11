@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -89,3 +89,34 @@ def test_direct_entrypoint_selects_fully_async_scheduler() -> None:
 
     cfg.trainer.fully_async.enabled = True
     assert experiment_class(cfg) is FullyAsyncFireworksExp
+
+
+def _run_exp_with_fireworks_runtime(*, train_error: Exception | None):
+    exp = object.__new__(BasePPOExp)
+    runtime = MagicMock()
+    runtime.close = AsyncMock()
+    trainer = MagicMock()
+    trainer.train = AsyncMock(side_effect=train_error)
+    exp._fireworks_runtime = runtime
+    exp._tinker_runtime = None
+    exp._setup_trainer = MagicMock(return_value=trainer)
+    return exp, runtime
+
+
+def test_failed_training_preserves_fireworks_trainer_record() -> None:
+    exp, runtime = _run_exp_with_fireworks_runtime(
+        train_error=RuntimeError("training failed")
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        exp.run()
+
+    runtime.close.assert_awaited_once_with(preserve_trainer=True)
+
+
+def test_successful_training_uses_normal_fireworks_cleanup() -> None:
+    exp, runtime = _run_exp_with_fireworks_runtime(train_error=None)
+
+    exp.run()
+
+    runtime.close.assert_awaited_once_with(preserve_trainer=False)

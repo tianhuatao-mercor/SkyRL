@@ -1342,6 +1342,14 @@ class FireworksConfig(BaseConfig):
     request_timeout_s: int = 3600
     sampling_timeout_s: int = 600
     trainer_timeout_s: int = 900
+    trainer_inactivity_timeout_s: int = 300
+    """Stop an orphaned trainer after this many seconds without activity.
+
+    Fireworks counts trainer operations and active-client heartbeats as
+    activity, so long rollout phases do not trigger this timeout. A short
+    timeout lets SkyRL preserve a failed trainer record for diagnosis without
+    leaving its GPUs running after the controller has exited.
+    """
     deployment_timeout_s: int = 900
     hotload_timeout_s: int = 600
     adam_eps: float = 1e-8

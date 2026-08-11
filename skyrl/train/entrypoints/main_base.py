@@ -337,7 +337,10 @@ class BasePPOExp:
                 self.trainer = trainer
                 return trainer
             except Exception:
-                asyncio.run(runtime.close())
+                # Keep the failed trainer and its provider logs visible. Its
+                # short inactivity timeout stops paid compute after the client
+                # closes; rollout cleanup still runs immediately.
+                asyncio.run(runtime.close(preserve_trainer=True))
                 self._fireworks_runtime = None
                 raise
 
@@ -437,15 +440,21 @@ class BasePPOExp:
             trainer = self._setup_trainer()
 
             async def _train_and_close_remote_runtime():
+                failed = True
                 try:
                     await trainer.train()
+                    failed = False
                 finally:
                     # Fireworks owns asyncio synchronization primitives used by
                     # sampling and publication. Close it on the same loop that
                     # ran training rather than constructing a second loop.
-                    if self._fireworks_runtime is not None or self._tinker_runtime is not None:
-                        await trainer.inference_engine_client.teardown()
+                    if self._fireworks_runtime is not None:
+                        await self._fireworks_runtime.close(
+                            preserve_trainer=failed
+                        )
                         self._fireworks_runtime = None
+                    elif self._tinker_runtime is not None:
+                        await trainer.inference_engine_client.teardown()
                         self._tinker_runtime = None
 
             # Start the training loop
@@ -466,7 +475,11 @@ class BasePPOExp:
             raise
         finally:
             if self._fireworks_runtime is not None:
-                asyncio.run(self._fireworks_runtime.close())
+                # Reaching this fallback means normal success teardown did not
+                # complete, so retain the trainer as failure evidence.
+                asyncio.run(
+                    self._fireworks_runtime.close(preserve_trainer=True)
+                )
             if self._tinker_runtime is not None:
                 asyncio.run(self._tinker_runtime.close())
 

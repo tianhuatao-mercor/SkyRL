@@ -301,6 +301,10 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
         raise ValueError("Dedicated Fireworks training requires trainer.fireworks.deployment_id for safe audit")
     if fireworks.trainer_replica_count <= 0:
         raise ValueError("Dedicated Fireworks training requires trainer_replica_count > 0")
+    if not 0 < fireworks.trainer_inactivity_timeout_s <= 3 * 60 * 60:
+        raise ValueError(
+            "trainer.fireworks.trainer_inactivity_timeout_s must be between 1 and 10800 seconds"
+        )
     if fireworks.replica_count <= 0:
         raise ValueError("Dedicated Fireworks training requires replica_count > 0")
     if fireworks.enable_router_replay != inference.enable_return_routed_experts:

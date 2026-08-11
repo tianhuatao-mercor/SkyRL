@@ -115,6 +115,12 @@ The backend requires stable `trainer_job_id`, `deployment_id`, and
 explicit cleanup-on-exit. A zero LoRA rank selects full-parameter training; a
 positive rank selects LoRA.
 
+Successful runs apply the configured trainer and rollout cleanup. Failed runs
+still remove or scale down the rollout, but retain the trainer job so its
+dashboard state and logs remain available for investigation. The trainer
+client is closed immediately and a short, heartbeat-aware inactivity timeout
+stops orphaned trainer compute without deleting that evidence.
+
 The reason for `update_epochs_per_batch=1` is that the rollout logprobs are the
 behavior-policy anchor. Multiple optimizer passes over the same samples are a
 separate off-policy feature and should not be enabled accidentally.
@@ -385,6 +391,7 @@ class FireworksConfig(BaseConfig):
     snapshot_prefix: str = "skyrl"
     training_shape_id: str | None = None
     trainer_job_id: str | None = None
+    trainer_inactivity_timeout_s: int = 300
     deployment_id: str | None = None
     replica_count: int = 1
     cleanup_on_exit: bool = True

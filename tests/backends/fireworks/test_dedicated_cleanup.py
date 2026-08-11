@@ -64,6 +64,29 @@ def test_cleanup_waits_until_deployment_is_absent(monkeypatch) -> None:
     assert deployment.closed is True
 
 
+def test_cleanup_can_preserve_trainer_evidence(monkeypatch) -> None:
+    trainer = _TrainerManager()
+    trainer.states = ["JOB_STATE_RUNNING", "JOB_STATE_PAUSED"]
+    deployment = _DeploymentManager()
+    deployment.states = ["READY", None]
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr(cleanup, "TrainerJobManager", lambda *, api_key: trainer)
+    monkeypatch.setattr(
+        cleanup, "DeploymentManager", lambda *, api_key: deployment
+    )
+    monkeypatch.setattr(cleanup.time, "sleep", lambda seconds: None)
+
+    success = cleanup.cleanup_and_audit(
+        trainer_job_id="skyrl-smoke-test-trainer",
+        deployment_id="skyrl-smoke-test-rollout",
+        preserve_trainer=True,
+    )
+
+    assert success is True
+    assert trainer.deleted == []
+    assert deployment.deleted == ["skyrl-smoke-test-rollout"]
+
+
 @pytest.mark.parametrize("resource_id", ["unrelated", "accounts/test/skyrl-smoke-id"])
 def test_cleanup_rejects_non_smoke_or_full_resource_names(resource_id: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
