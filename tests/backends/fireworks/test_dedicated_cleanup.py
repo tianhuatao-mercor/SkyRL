@@ -87,7 +87,14 @@ def test_cleanup_can_preserve_trainer_evidence(monkeypatch) -> None:
     assert deployment.deleted == ["skyrl-smoke-test-rollout"]
 
 
-@pytest.mark.parametrize("resource_id", ["unrelated", "accounts/test/skyrl-smoke-id"])
-def test_cleanup_rejects_non_smoke_or_full_resource_names(resource_id: str) -> None:
+@pytest.mark.parametrize(
+    "resource_id", ["skyrl-run-test", "skyrl-smoke-test"]
+)
+def test_cleanup_accepts_current_and_legacy_prefixes(resource_id: str) -> None:
+    assert cleanup._resource_id(resource_id) == resource_id
+
+
+@pytest.mark.parametrize("resource_id", ["unrelated", "accounts/test/skyrl-run-id"])
+def test_cleanup_rejects_unmanaged_or_full_resource_names(resource_id: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         cleanup._resource_id(resource_id)

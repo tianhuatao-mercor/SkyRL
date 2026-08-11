@@ -1,4 +1,4 @@
-"""Exact-ID cleanup for bounded Fireworks dedicated smoke runs."""
+"""Exact-ID cleanup for SkyRL-managed Fireworks resources."""
 
 from __future__ import annotations
 
@@ -9,7 +9,10 @@ from typing import Any
 
 from fireworks.training.sdk import DeploymentManager, TrainerJobManager
 
-_SAFE_PREFIX = "skyrl-smoke-"
+# Keep the legacy prefix so resources created by older launchers remain
+# cleanable. New launchers should use ``skyrl-run-``; the allowlist stays
+# narrow so an accidental arbitrary provider ID cannot be deleted.
+_SAFE_PREFIXES = ("skyrl-run-", "skyrl-smoke-")
 _TRAINER_TERMINAL = {
     "JOB_STATE_CANCELLED",
     "JOB_STATE_COMPLETED",
@@ -21,8 +24,11 @@ _DEPLOYMENT_TERMINAL = {"DELETED", "FAILED"}
 
 
 def _resource_id(value: str) -> str:
-    if not value.startswith(_SAFE_PREFIX):
-        raise argparse.ArgumentTypeError(f"cleanup IDs must start with {_SAFE_PREFIX!r}")
+    if not value.startswith(_SAFE_PREFIXES):
+        allowed = ", ".join(repr(prefix) for prefix in _SAFE_PREFIXES)
+        raise argparse.ArgumentTypeError(
+            f"cleanup IDs must start with one of: {allowed}"
+        )
     if "/" in value:
         raise argparse.ArgumentTypeError("pass the resource ID, not a full resource name")
     return value
