@@ -208,6 +208,57 @@ def test_compute_grpo_outcome_advantage_norm_std_false():
     assert torch.allclose(adv, expected, atol=1e-5), f"Expected {expected}, got {adv}"
 
 
+def test_compute_grpo_outcome_advantage_excludes_masked_trajectories():
+    token_level_rewards = torch.tensor([[0.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+    response_mask = torch.ones_like(token_level_rewards)
+    loss_mask = torch.tensor([[1.0, 1.0], [1.0, 1.0], [0.0, 0.0]])
+
+    adv, ret = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        loss_mask=loss_mask,
+        index=np.array(["group", "group", "group"]),
+        grpo_norm_by_std=False,
+    )
+
+    expected = torch.tensor([[0.5, 0.5], [-0.5, -0.5], [0.0, 0.0]])
+    assert torch.allclose(adv, expected)
+    assert torch.allclose(ret, expected)
+
+
+def test_compute_grpo_outcome_advantage_normalizes_over_live_trajectories_only():
+    token_level_rewards = torch.tensor([[1.0], [0.0], [0.0]])
+    response_mask = torch.ones_like(token_level_rewards)
+
+    adv, ret = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        loss_mask=torch.tensor([[1.0], [1.0], [0.0]]),
+        index=np.array(["group", "group", "group"]),
+        grpo_norm_by_std=True,
+    )
+
+    expected = torch.tensor([[2**-0.5], [-(2**-0.5)], [0.0]])
+    assert torch.allclose(adv, expected, atol=1e-5)
+    assert torch.allclose(ret, expected, atol=1e-5)
+
+
+def test_compute_grpo_outcome_advantage_zeroes_groups_with_fewer_than_two_live_trajectories():
+    token_level_rewards = torch.tensor([[1.0], [0.0], [0.0]])
+    response_mask = torch.ones_like(token_level_rewards)
+
+    adv, ret = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        loss_mask=torch.tensor([[1.0], [0.0], [0.0]]),
+        index=np.array(["singleton", "singleton", "all-masked"]),
+        grpo_norm_by_std=False,
+    )
+
+    assert torch.count_nonzero(adv) == 0
+    assert torch.count_nonzero(ret) == 0
+
+
 def test_compute_maxrl_advantage():
     # Two groups: [6.0, 3.0] mean=4.5, [9.0, 12.0] mean=10.5
     token_level_rewards = torch.tensor(
@@ -711,6 +762,37 @@ class TestApplyLossReductionToAdvantagesMinibatch:
         )
         loss = reduce_loss(scaled, loss_mask)
         assert torch.allclose(loss, torch.tensor(4.25))
+
+    def test_prompt_mean_excludes_fully_masked_prompts(self):
+        advantages = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        loss_mask = torch.tensor([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [1.0, 1.0]])
+
+        scaled = apply_loss_reduction_to_advantages_minibatch(
+            advantages=advantages,
+            loss_mask=loss_mask,
+            loss_reduction="prompt_mean",
+            micro_batch_size=1,
+            max_seq_len=2,
+            prompt_boundaries=[(0, 2), (2, 4)],
+        )
+
+        assert torch.count_nonzero(scaled[:2]) == 0
+        assert torch.allclose(reduce_loss(scaled, loss_mask), torch.tensor(6.5))
+
+    def test_prompt_mean_all_prompts_masked(self):
+        advantages = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        loss_mask = torch.zeros_like(advantages)
+
+        scaled = apply_loss_reduction_to_advantages_minibatch(
+            advantages=advantages,
+            loss_mask=loss_mask,
+            loss_reduction="prompt_mean",
+            micro_batch_size=1,
+            max_seq_len=2,
+            prompt_boundaries=[(0, 2)],
+        )
+
+        assert torch.count_nonzero(scaled) == 0
 
     def test_prompt_mean_requires_boundaries(self):
         """prompt_mean without prompt_boundaries should raise ValueError."""

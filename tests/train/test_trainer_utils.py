@@ -671,14 +671,14 @@ def test_filter_generator_output():
 
 
 def test_zero_variance_filter_mixed_groups():
-    """uid groups with non-zero variance and singletons are kept; zero-variance duplicates are removed."""
+    """Only groups with at least two live trajectories and reward variance are kept."""
     rewards = [1.0, 2.0, 3.0, 3.0, 5.0]
     uids = ["uid1", "uid1", "uid2", "uid2", "uid3"]
 
     kept_indices = zero_variance_filter(rewards, uids)
 
-    # uid1 has variance > 0 -> keep indices 0,1; uid2 has variance 0 with size>1 -> drop 2,3; uid3 singleton -> keep 4
-    assert kept_indices == [0, 1, 4]
+    # uid1 has variance > 0 -> keep indices 0,1; uid2 has zero variance and uid3 is a singleton -> drop.
+    assert kept_indices == [0, 1]
 
 
 def test_zero_variance_filter_all_zero_variance_duplicates():
@@ -691,14 +691,14 @@ def test_zero_variance_filter_all_zero_variance_duplicates():
     assert kept_indices == []
 
 
-def test_zero_variance_filter_singletons_kept():
-    """Singleton groups should always be kept regardless of reward values."""
+def test_zero_variance_filter_singletons_dropped():
+    """Singleton groups cannot produce a group-relative advantage."""
     rewards = [1.0, 1.0, 1.0]
     uids = ["x", "y", "z"]
 
     kept_indices = zero_variance_filter(rewards, uids)
 
-    assert kept_indices == [0, 1, 2]
+    assert kept_indices == []
 
 
 def test_zero_variance_filter_tolerance():
@@ -724,13 +724,21 @@ def test_zero_variance_filter_ignores_masked_trajectories():
     assert zero_variance_filter(rewards, uids, loss_masks=loss_masks) == []
 
 
-def test_zero_variance_filter_single_live_trajectory_kept():
-    """A group with only one live trajectory (others masked) is kept as a singleton."""
+def test_zero_variance_filter_single_live_trajectory_dropped():
+    """A group with only one live trajectory has no group-relative signal."""
     rewards = [1.0, 0.0]
     uids = ["a", "a"]
     loss_masks = [[1, 1], [0, 0]]
 
-    assert zero_variance_filter(rewards, uids, loss_masks=loss_masks) == [0, 1]
+    assert zero_variance_filter(rewards, uids, loss_masks=loss_masks) == []
+
+
+def test_zero_variance_filter_all_masked_group_dropped():
+    rewards = [0.0, 0.0]
+    uids = ["a", "a"]
+    loss_masks = [[0, 0], [0, 0]]
+
+    assert zero_variance_filter(rewards, uids, loss_masks=loss_masks) == []
 
 
 def test_validate_generator_output_valid_case():

@@ -1202,16 +1202,24 @@ def apply_loss_reduction_to_advantages_minibatch(
     elif loss_reduction == "seq_mean_token_sum_norm":
         normalized_advantages = advantages / (batch_size * max_seq_len)
 
-    # Option 4: Prompt level mean - token mean within each prompt, then average over all prompts.
+    # Option 4: Prompt level mean - token mean within each live prompt, then average over live prompts.
     # A "prompt" is a group of sequences sharing the same prompt (e.g. the n_samples_per_prompt
     # GRPO responses). Scale token [i, t] in prompt p by 1 / (num_prompts * tokens_in_prompt_p)
-    # so that summing the per-token policy loss yields mean_p(token_mean within prompt p).
+    # so that summing the per-token policy loss yields mean_p(token_mean within prompt p). Fully
+    # masked prompts are excluded so they cannot dilute the remaining gradients.
     elif loss_reduction == "prompt_mean":
         if prompt_boundaries is None:
             raise ValueError("`prompt_mean` loss reduction requires `prompt_boundaries`")
-        num_prompts = len(prompt_boundaries)
-        for p_start, p_end in prompt_boundaries:
-            prompt_tokens = loss_mask[p_start:p_end].sum().clamp(min=1)
+        live_prompt_boundaries = [
+            (p_start, p_end)
+            for p_start, p_end in prompt_boundaries
+            if loss_mask[p_start:p_end].sum() > 0
+        ]
+        num_prompts = len(live_prompt_boundaries)
+        if num_prompts == 0:
+            return normalized_advantages
+        for p_start, p_end in live_prompt_boundaries:
+            prompt_tokens = loss_mask[p_start:p_end].sum()
             normalized_advantages[p_start:p_end] = advantages[p_start:p_end] / (num_prompts * prompt_tokens)
 
     else:
@@ -1347,6 +1355,7 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     grpo_norm_by_std: bool = True,
+    loss_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1356,6 +1365,9 @@ def compute_grpo_outcome_advantage(
         - token_level_rewards: Float[torch.Tensor, "batch_size response_len"]
         - response_mask: Float[torch.Tensor, "batch_size response_len"]
         - index: np.ndarray (batch_size)
+        - loss_mask: Optional Float[torch.Tensor, "batch_size response_len"].
+          Trajectories without any trainable tokens are excluded from group
+          statistics and receive zero advantage.
         - epsilon: float
         - grpo_norm_by_std: bool
 
@@ -1365,6 +1377,16 @@ def compute_grpo_outcome_advantage(
     """
     # this assumes response-level rewards
     scores = token_level_rewards.sum(dim=-1)
+    if loss_mask is None:
+        trajectory_is_live = torch.ones_like(scores, dtype=torch.bool)
+    else:
+        if loss_mask.shape != response_mask.shape:
+            raise ValueError(
+                "GRPO loss_mask must have the same shape as response_mask, "
+                f"got {tuple(loss_mask.shape)} and {tuple(response_mask.shape)}"
+            )
+        trajectory_is_live = loss_mask.sum(dim=-1) > 0
+    trajectory_is_live_list = trajectory_is_live.tolist()
 
     id2score = defaultdict(list)
     id2mean = {}
@@ -1373,18 +1395,27 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            if trajectory_is_live_list[i]:
+                id2score[index[i]].append(scores[i])
+        for idx in set(index):
+            live_scores = id2score[idx]
+            if len(live_scores) == 0:
+                id2mean[idx] = scores.new_tensor(0.0)
+                id2std[idx] = scores.new_tensor(1.0)
+            elif len(live_scores) == 1:
+                # Strict group-relative semantics: a singleton has no relative
+                # signal. zero_variance_filter normally removes it before this
+                # point, but keep the estimator defensive when filtering is off.
+                id2mean[idx] = live_scores[0]
+                id2std[idx] = scores.new_tensor(1.0)
             else:
-                raise ValueError(f"no score in prompt index: {idx}")
+                stacked_scores = torch.stack(live_scores)
+                id2mean[idx] = torch.mean(stacked_scores)
+                id2std[idx] = torch.std(stacked_scores)
         for i in range(bsz):
-            if grpo_norm_by_std:
+            if not trajectory_is_live_list[i]:
+                scores[i] = 0.0
+            elif grpo_norm_by_std:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
@@ -1443,11 +1474,12 @@ def compute_advantages_and_returns(
     grpo_norm_by_std: bool = True,
     gamma=1.0,
     lambd=1.0,
+    loss_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     estimator_func = AdvantageEstimatorRegistry.get(adv_estimator)
 
-    return estimator_func(
+    estimator_kwargs = dict(
         token_level_rewards=token_level_rewards,
         response_mask=response_mask,
         index=index,
@@ -1458,3 +1490,9 @@ def compute_advantages_and_returns(
         config=config,
         **kwargs,
     )
+    # Live-only group statistics are specific to GRPO. Avoid changing the
+    # call contract of exact-signature custom estimators that predate
+    # ``loss_mask`` forwarding.
+    if adv_estimator == AdvantageEstimator.GRPO:
+        estimator_kwargs["loss_mask"] = loss_mask
+    return estimator_func(**estimator_kwargs)

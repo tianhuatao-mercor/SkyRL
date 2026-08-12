@@ -647,8 +647,9 @@ def zero_variance_filter(
     """
     Given trajectory-level rewards and uids, return the indices of the trajectories to keep.
 
-    A group (trajectories sharing a uid) is dropped only when it has >1 *live* trajectory and their
-    reward spread is within ``tol`` (no GRPO signal); groups with <=1 live trajectory are always kept.
+    A group (trajectories sharing a uid) is kept only when it has at least two *live* trajectories and
+    their reward spread exceeds ``tol``. Groups with fewer than two live trajectories cannot produce
+    a group-relative signal and are dropped.
     A trajectory is "live" if ``sum(loss_mask) > 0`` (or all live when ``loss_masks`` is None) -- so
     trajectories masked upstream don't make a genuine zero-variance group look varied.
 
@@ -670,12 +671,11 @@ def zero_variance_filter(
         if live:
             uid2live_rewards[uid].append(reward)
 
-    def _is_zero_variance(uid: str) -> bool:
+    def _has_group_relative_signal(uid: str) -> bool:
         vals = uid2live_rewards.get(uid, [])
-        return len(vals) > 1 and (max(vals) - min(vals)) <= tol
+        return len(vals) >= 2 and (max(vals) - min(vals)) > tol
 
-    # Keep everything except groups with >1 live trajectory and no reward spread.
-    kept_uids_set = {uid for uid in set(uids) if not _is_zero_variance(uid)}
+    kept_uids_set = {uid for uid in set(uids) if _has_group_relative_signal(uid)}
 
     # Return indices of trajectories with kept UIDs
     return [i for i, uid in enumerate(uids) if uid in kept_uids_set]

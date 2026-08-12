@@ -8,6 +8,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 import skyrl.train.fully_async_trainer as fully_async_trainer_module
@@ -21,11 +22,23 @@ from skyrl.train.fully_async_trainer import (
 )
 
 
-def _make_async_dataloader(num_prompts: int, mini_batch_size: int) -> _AsyncDataloader:
+def _make_async_dataloader(
+    num_prompts: int,
+    mini_batch_size: int,
+    *,
+    shuffle: bool = False,
+) -> _AsyncDataloader:
     """Build an _AsyncDataloader over a trivial dataset of `num_prompts` single-prompt batches."""
     dataset = [[{"uid": str(i)}] for i in range(num_prompts)]
     # batch_size=1 (one prompt per draw) and identity collate so each batch is a list with one dict.
-    loader = StatefulDataLoader(dataset, batch_size=1, collate_fn=lambda batch: batch[0])
+    generator = torch.Generator().manual_seed(42)
+    loader = StatefulDataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=shuffle,
+        generator=generator,
+        collate_fn=lambda batch: batch[0],
+    )
     return _AsyncDataloader(loader, mini_batch_size)
 
 
@@ -149,6 +162,56 @@ async def test_async_dataloader_load_state_without_filtered_is_backward_compatib
     adl.load_state_from_checkpoint({"0", "1"})
     assert adl.num_trained() == 2
     assert adl.get_filtered_uids_list() == []
+
+
+@pytest.mark.asyncio
+async def test_async_dataloader_epoch_reset_advances_shuffle_order():
+    adl = _make_async_dataloader(num_prompts=8, mini_batch_size=2, shuffle=True)
+
+    first_epoch = []
+    while (prompts := await adl.get_next_non_consumed_data()) is not None:
+        first_epoch.append(prompts[0]["uid"])
+
+    await adl.reset_at_epoch_end()
+    second_epoch = []
+    while (prompts := await adl.get_next_non_consumed_data()) is not None:
+        second_epoch.append(prompts[0]["uid"])
+
+    assert sorted(first_epoch) == sorted(second_epoch)
+    assert first_epoch != second_epoch
+
+
+@pytest.mark.asyncio
+async def test_async_dataloader_resume_restores_current_epoch_shuffle_order():
+    adl = _make_async_dataloader(num_prompts=8, mini_batch_size=2, shuffle=True)
+
+    while await adl.get_next_non_consumed_data() is not None:
+        pass
+    await adl.reset_at_epoch_end()
+    epoch_start_state = adl.get_epoch_start_dataloader_state()
+
+    consumed = []
+    for _ in range(3):
+        prompts = await adl.get_next_non_consumed_data()
+        assert prompts is not None
+        consumed.append(prompts[0]["uid"])
+    await adl.mark_consumed_uids(consumed)
+
+    expected_remaining = []
+    while (prompts := await adl.get_next_non_consumed_data()) is not None:
+        expected_remaining.append(prompts[0]["uid"])
+
+    resumed = _make_async_dataloader(num_prompts=8, mini_batch_size=2, shuffle=True)
+    resumed.load_state_from_checkpoint(
+        set(consumed),
+        set(),
+        epoch_start_state,
+    )
+    actual_remaining = []
+    while (prompts := await resumed.get_next_non_consumed_data()) is not None:
+        actual_remaining.append(prompts[0]["uid"])
+
+    assert actual_remaining == expected_remaining
 
 
 # --------------------------------------------------------------------------------------
@@ -324,8 +387,9 @@ def test_should_keep_group():
     assert keep(_trainer_with_tol(0.0), _group([1.0, 1.0], [[1], [1]])) is False
     # Group with reward spread -> keep.
     assert keep(_trainer_with_tol(0.0), _group([1.0, 0.0], [[1], [1]])) is True
-    # Singleton -> keep.
-    assert keep(_trainer_with_tol(0.0), _group([1.0], [[1]])) is True
+    # Singleton and fully masked groups have no group-relative signal -> drop.
+    assert keep(_trainer_with_tol(0.0), _group([1.0], [[1]])) is False
+    assert keep(_trainer_with_tol(0.0), _group([0.0, 0.0], [[0], [0]])) is False
     # Masked trajectories are ignored: two equal live rewards + one masked -> still zero-variance.
     assert keep(_trainer_with_tol(0.0), _group([1.0, 1.0, 0.0], [[1], [1], [0]])) is False
     # Near-equal float rewards within tol -> drop.

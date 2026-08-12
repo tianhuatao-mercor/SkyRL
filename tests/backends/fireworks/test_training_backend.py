@@ -74,6 +74,30 @@ class _TrainingClient:
         return _Future(SimpleNamespace())
 
 
+class _GradNormMetricsTrainingClient(_TrainingClient):
+    def __init__(self):
+        super().__init__()
+        self.emit_grad_norm_metrics = None
+
+    def optim_step(self, params, *, emit_grad_norm_metrics=None):
+        self.optim_params.append(params)
+        self.emit_grad_norm_metrics = emit_grad_norm_metrics
+        return _Future(
+            SimpleNamespace(
+                metrics={
+                    "skyrl.ai/grad_norm": 1.5,
+                    "skyrl.ai/grad_norm_rms": 0.25,
+                }
+            )
+        )
+
+
+class _PatchedAdamParamsTrainingClient(_TrainingClient):
+    def optim_step(self, params):
+        self.optim_params.append(params)
+        return _Future(SimpleNamespace(metrics={}))
+
+
 def _cfg() -> SkyRLTrainConfig:
     cfg = SkyRLTrainConfig()
     cfg.trainer.fireworks.base_model = "accounts/fireworks/models/test-base"
@@ -198,6 +222,59 @@ def test_policy_dispatch_optimizer_uses_skyrl_optimizer_config() -> None:
     assert params.weight_decay == pytest.approx(0.1)
     assert params.grad_clip_norm == pytest.approx(2.0)
     assert grad_norm == pytest.approx(0.75)
+
+
+def test_policy_dispatch_opts_in_and_exposes_provider_optimizer_metrics() -> None:
+    cfg = _cfg()
+    cfg.trainer.fireworks.emit_grad_norm_metrics = "detailed"
+    training_client = _GradNormMetricsTrainingClient()
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        SimpleNamespace(training_client=training_client),
+    )
+
+    grad_norm = dispatch.optim_step("policy")
+
+    assert training_client.emit_grad_norm_metrics == "detailed"
+    assert grad_norm == pytest.approx(1.5)
+    assert dispatch.take_last_optimizer_metrics() == {
+        "skyrl.ai/grad_norm": 1.5,
+        "skyrl.ai/grad_norm_rms": 0.25,
+    }
+    assert dispatch.take_last_optimizer_metrics() == {}
+
+
+def test_policy_dispatch_does_not_report_rms_as_global_grad_norm() -> None:
+    cfg = _cfg()
+    training_client = _GradNormMetricsTrainingClient()
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        SimpleNamespace(training_client=training_client),
+    )
+    training_client.optim_step = lambda params, **kwargs: _Future(
+        SimpleNamespace(metrics={"skyrl.ai/grad_norm_rms": 0.25})
+    )
+
+    assert dispatch.optim_step("policy") is None
+    assert dispatch.take_last_optimizer_metrics() == {
+        "skyrl.ai/grad_norm_rms": 0.25,
+    }
+
+
+def test_policy_dispatch_uses_patched_adam_field_for_old_optimizer_signature() -> None:
+    cfg = _cfg()
+    cfg.trainer.fireworks.emit_grad_norm_metrics = "basic"
+    training_client = _PatchedAdamParamsTrainingClient()
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        SimpleNamespace(training_client=training_client),
+    )
+
+    dispatch.optim_step("policy")
+
+    params = training_client.optim_params[0]
+    if "emit_grad_norm_metrics" in type(params).model_fields:
+        assert params.emit_grad_norm_metrics == "basic"
 
 
 def test_policy_dispatch_finalizes_synchronous_checkpoint_saves() -> None:

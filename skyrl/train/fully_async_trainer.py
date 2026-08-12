@@ -12,6 +12,7 @@ High-level notes:
 """
 
 import asyncio
+import copy
 import inspect
 import os
 import time
@@ -125,12 +126,12 @@ def _advance_global_step_after_training(global_step: int, max_training_steps: Op
 
 def _needs_final_checkpoint(
     ckpt_interval: int,
-    global_step: int,
+    completed_step: int,
     last_checkpoint_step: Optional[int],
 ) -> bool:
-    """Avoid paying for a duplicate final checkpoint at the same step."""
+    """Save a completed step once; a next-step cursor is never checkpointable."""
 
-    return ckpt_interval > 0 and last_checkpoint_step != global_step
+    return ckpt_interval > 0 and completed_step > 0 and last_checkpoint_step != completed_step
 
 
 class _AsyncStalenessManager:
@@ -266,7 +267,10 @@ class _AsyncDataloader:
 
     def __init__(self, train_dataloader: StatefulDataLoader, mini_batch_size: int):
         self._train_dataloader = train_dataloader
-        self._train_dataloader_initial_state = train_dataloader.state_dict()
+        self._train_dataloader_initial_state = copy.deepcopy(train_dataloader.state_dict())
+        self._epoch_start_dataloader_state = copy.deepcopy(
+            self._train_dataloader_initial_state
+        )
         self._effective_dataloader_length = len(self._train_dataloader) // mini_batch_size * mini_batch_size
         self._iter = enumerate(self._train_dataloader)
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -281,6 +285,7 @@ class _AsyncDataloader:
         self,
         consumed_data_uids_set: Set[str],
         filtered_data_uids_set: Optional[Set[str]] = None,
+        epoch_start_dataloader_state: Optional[dict] = None,
     ) -> None:
         """
         Load the state from a checkpoint.
@@ -288,13 +293,36 @@ class _AsyncDataloader:
         self._consumed_data_uids = consumed_data_uids_set
         self._filtered_data_uids = filtered_data_uids_set if filtered_data_uids_set is not None else set()
 
-        # Reset in case the dataloader loaded the state from the checkpoint, which we do not want.
-        self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)
+        # The common checkpoint captures the live loader position, which may be
+        # ahead of completed training due to async prefetch. Restore the saved
+        # epoch-start sampler state and skip completed/filtered UIDs instead.
+        epoch_start_state = (
+            self._train_dataloader_initial_state
+            if epoch_start_dataloader_state is None
+            else epoch_start_dataloader_state
+        )
+        self._train_dataloader.load_state_dict(copy.deepcopy(epoch_start_state))
+        self._epoch_start_dataloader_state = copy.deepcopy(epoch_start_state)
+        self._iter = enumerate(self._train_dataloader)
+
+    def get_epoch_start_dataloader_state(self) -> dict:
+        """Return the stable sampler state used to start the current epoch."""
+
+        return copy.deepcopy(self._epoch_start_dataloader_state)
 
     async def reset_at_epoch_end(self) -> None:
         async with self._lock:
-            self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)  # reset to initial state
+            # Construct the next iterator from the dataloader's current sampler
+            # RNG state. Reloading the construction-time snapshot here repeated
+            # the exact same task order every epoch, so async finish-time tails
+            # could systematically discard the same slow/hard prompts.
             self._iter = enumerate(self._train_dataloader)
+            # StatefulDataLoader chooses the next shuffled order when its new
+            # iterator is constructed. Capture the state after construction,
+            # but before the first item is drawn, so resume replays that order.
+            self._epoch_start_dataloader_state = copy.deepcopy(
+                self._train_dataloader.state_dict()
+            )
             self._consumed_data_uids.clear()
             self._filtered_data_uids.clear()
             self._exhausted = False
@@ -462,6 +490,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.global_step = 0
         self.epoch = 0
         resumed_start_epoch = None
+        last_completed_step = 0
         last_checkpoint_step = None
 
         # Load checkpoint state if resumption is enabled. Also load the data UIDs that are already trained on.
@@ -473,14 +502,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     loaded_consumed_data_uids_set,
                     loaded_filtered_data_uids_set,
                     loaded_epoch,
+                    loaded_epoch_start_dataloader_state,
                 ) = self.load_checkpoints()
                 logger.info(f"Resumed training from global_step {self.global_step}")
+                last_completed_step = self.global_step
                 if self.global_step > 0:
                     last_checkpoint_step = self.global_step
                 if self.global_step > 0:
                     # Set async dataloader manager and staleness manager to the loaded state.
                     self.async_train_dataloader.load_state_from_checkpoint(
-                        loaded_consumed_data_uids_set, loaded_filtered_data_uids_set
+                        loaded_consumed_data_uids_set,
+                        loaded_filtered_data_uids_set,
+                        loaded_epoch_start_dataloader_state,
                     )
                     self._staleness_manager.load_state_from_checkpoint(
                         self.global_step + 1
@@ -584,13 +617,23 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 )
                             # Save the end-of-epoch checkpoint the normal is_epoch_end path would have, since
                             # we break before reaching it.
-                            if self.cfg.trainer.ckpt_interval > 0:
+                            if _needs_final_checkpoint(
+                                self.cfg.trainer.ckpt_interval,
+                                last_completed_step,
+                                last_checkpoint_step,
+                            ):
                                 with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                                    await asyncio.to_thread(self.save_checkpoints)
-                                last_checkpoint_step = self.global_step
-                            if self.cfg.trainer.hf_save_interval > 0:
+                                    await asyncio.to_thread(
+                                        self.save_checkpoints,
+                                        checkpoint_step=last_completed_step,
+                                    )
+                                last_checkpoint_step = last_completed_step
+                            if self.cfg.trainer.hf_save_interval > 0 and last_completed_step > 0:
                                 with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
-                                    await asyncio.to_thread(self.save_models)
+                                    await asyncio.to_thread(
+                                        self.save_models,
+                                        checkpoint_step=last_completed_step,
+                                    )
                             break
 
                         if self.sample_full_batch:
@@ -620,6 +663,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             await self.async_train_dataloader.mark_consumed_uids(
                                 [g.uid for g in cur_generation_group_mini_batch]
                             )
+                            last_completed_step = self.global_step
 
                         # 4. After training: pause generation, sync weights, resume.
                         with self._phase_gauge.timed_phase("sync_weights", self.all_timings):
@@ -660,12 +704,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     if self.cfg.trainer.ckpt_interval > 0:
                         if is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
                             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                                await asyncio.to_thread(self.save_checkpoints)
-                            last_checkpoint_step = self.global_step
+                                await asyncio.to_thread(
+                                    self.save_checkpoints,
+                                    checkpoint_step=last_completed_step,
+                                )
+                            last_checkpoint_step = last_completed_step
                     if self.cfg.trainer.hf_save_interval > 0:
                         if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
                             with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
-                                await asyncio.to_thread(self.save_models)
+                                await asyncio.to_thread(
+                                    self.save_models,
+                                    checkpoint_step=last_completed_step,
+                                )
 
                     timing_payload = {"timing/" + k: v for k, v in self.all_timings.items()}
                     if self._ray_gpu_monitor is not None:
@@ -743,15 +793,21 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # persisted by the interval/epoch path.
         if _needs_final_checkpoint(
             self.cfg.trainer.ckpt_interval,
-            self.global_step,
+            last_completed_step,
             last_checkpoint_step,
         ):
             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                await asyncio.to_thread(self.save_checkpoints)
+                await asyncio.to_thread(
+                    self.save_checkpoints,
+                    checkpoint_step=last_completed_step,
+                )
                 logger.info("Saved final checkpoint.")
-        if self.cfg.trainer.hf_save_interval > 0:
+        if self.cfg.trainer.hf_save_interval > 0 and last_completed_step > 0:
             with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
-                await asyncio.to_thread(self.save_models)
+                await asyncio.to_thread(
+                    self.save_models,
+                    checkpoint_step=last_completed_step,
+                )
                 logger.info("Saved final model.")
 
         # Drain any in-flight async checkpoint write before teardown. Unconditional:
@@ -845,7 +901,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """Whether a group has reward variance (train on it) vs. is zero-variance (drop it).
 
         Token-level rewards (``List[List[float]]``) are collapsed to a per-trajectory sum, like the rest
-        of the trainer. Groups with <=1 live trajectory (singletons / mostly masked) are always kept.
+        of the trainer. Groups with fewer than two live trajectories have no group-relative signal and
+        are dropped.
         """
         rewards = group.generator_output["rewards"]
         if rewards and isinstance(rewards[0], list):
@@ -1280,7 +1337,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         return self.convert_to_training_input(generator_output, uids)
 
-    def save_checkpoints(self) -> str:
+    def save_checkpoints(self, *, checkpoint_step: Optional[int] = None) -> str:
         """
         Extend base checkpointing by recording consumed UIDs for fully-async training.
 
@@ -1291,8 +1348,16 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             self.async_train_dataloader.get_consumed_uids_list()
         )  # read first to prevent race condition
         filtered_uids_list = self.async_train_dataloader.get_filtered_uids_list()
-        # The base method will save the model, dataloader path, trainer_state, and latest_ckpt_global_step.txt.
-        global_step_folder = super().save_checkpoints()
+        epoch_start_dataloader_state = (
+            self.async_train_dataloader.get_epoch_start_dataloader_state()
+        )
+        resolved_step = self.global_step if checkpoint_step is None else checkpoint_step
+        # Save the common payload first, but do not publish ``latest`` until
+        # the fully-async state below is also durable.
+        global_step_folder = super().save_checkpoints(
+            checkpoint_step=resolved_step,
+            publish=False,
+        )
         # Also save the consumed UIDs (do-not-redraw this epoch), the filtered subset (so dropped
         # prompts are skipped, not regenerated, on resume), and the epoch (not derivable from
         # global_step under sample_full_batch, where an epoch can end early).
@@ -1301,25 +1366,35 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "consumed_uids": consumed_uids_list,
             "filtered_uids": filtered_uids_list,
             "epoch": self.epoch,
+            "epoch_start_dataloader_state": epoch_start_dataloader_state,
         }
         with io.open_file(fully_async_state_path, "wb") as f:
             torch.save(fully_async_state, f)
         logger.info(f"Saved fully-async state to {fully_async_state_path}")
+        self._publish_checkpoint(resolved_step, global_step_folder)
         return global_step_folder
 
     def load_checkpoints(
         self,
-    ) -> Tuple[int, str, Optional[Set[str]], Optional[Set[str]], Optional[int]]:
+    ) -> Tuple[
+        int,
+        str,
+        Optional[Set[str]],
+        Optional[Set[str]],
+        Optional[int],
+        Optional[dict],
+    ]:
         """
         Load the base checkpoint without loading the dataloader state, and load the fully-async state.
 
         Returns the global step to resume from, the checkpoint path, the consumed data UIDs, the
         filtered (dropped, not trained on) data UIDs, and the epoch to resume in (None if the
-        checkpoint predates epoch tracking, in which case the caller derives it from global_step).
+        checkpoint predates epoch tracking, in which case the caller derives it from global_step),
+        plus the current epoch's initial dataloader state when available.
         """
         global_step, checkpoint_path = super().load_checkpoints()
         if global_step == 0:
-            return 0, checkpoint_path, None, None, None
+            return 0, checkpoint_path, None, None, None, None
         fully_async_state_path = os.path.join(checkpoint_path, "fully_async_state.pt")
         assert io.exists(fully_async_state_path), f"Fully-async state file not found at {fully_async_state_path}"
         with io.open_file(fully_async_state_path, "rb") as f:
@@ -1329,6 +1404,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # Backward compatible with checkpoints saved before filtered UIDs / epoch were tracked.
             filtered_data_uids_set = set(fully_async_state.get("filtered_uids", []))
             epoch = fully_async_state.get("epoch", None)
+            epoch_start_dataloader_state = fully_async_state.get(
+                "epoch_start_dataloader_state"
+            )
         logger.info(
             f"Loaded fully-async state with {len(consumed_data_uids_set)} consumed UIDs "
             f"({len(filtered_data_uids_set)} filtered), epoch={epoch}"
@@ -1339,4 +1417,5 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             consumed_data_uids_set,
             filtered_data_uids_set,
             epoch,
+            epoch_start_dataloader_state,
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -165,16 +166,62 @@ class FireworksPolicyDispatch:
             weight_decay=optimizer.weight_decay,
             grad_clip_norm=optimizer.max_grad_norm,
         )
-        result = self.runtime.training_client.optim_step(params).result(
+        optim_step = self.runtime.training_client.optim_step
+        optim_kwargs: dict[str, Any] = {}
+        try:
+            optim_signature = inspect.signature(optim_step)
+        except (TypeError, ValueError):
+            optim_signature = None
+        if (
+            optim_signature is not None
+            and "emit_grad_norm_metrics" in optim_signature.parameters
+        ):
+            optim_kwargs["emit_grad_norm_metrics"] = (
+                self.cfg.trainer.fireworks.emit_grad_norm_metrics
+            )
+        elif "emit_grad_norm_metrics" in getattr(type(params), "model_fields", {}):
+            # Some Fireworks SDK versions patch the option directly onto
+            # Tinker's AdamParams while retaining the original one-argument
+            # optim_step method.
+            params = params.model_copy(
+                update={
+                    "emit_grad_norm_metrics": (
+                        self.cfg.trainer.fireworks.emit_grad_norm_metrics
+                    )
+                }
+            )
+
+        # Fireworks added ``emit_grad_norm_metrics`` after the original
+        # Tinker-compatible optimizer surface. Signature detection keeps old
+        # clients working while opting newer clients into the diagnostics.
+        self._last_optim_metrics = {}
+        result = optim_step(params, **optim_kwargs).result(
             timeout=self.cfg.trainer.fireworks.request_timeout_s
         )
         self._last_optim_metrics = {
             key: float(value) for key, value in (getattr(result, "metrics", None) or {}).items()
         }
-        for key, value in self._last_optim_metrics.items():
-            if "grad_norm" in key:
-                return value
+        # Do not treat RMS or per-bucket norms as the global norm merely
+        # because their names contain ``grad_norm``. Prefer the provider's
+        # canonical key, then narrowly support exact legacy spellings.
+        for key in ("skyrl.ai/grad_norm", "grad_norm", "global_grad_norm"):
+            if key in self._last_optim_metrics:
+                return self._last_optim_metrics[key]
+        exact_suffix_matches = [
+            value
+            for key, value in self._last_optim_metrics.items()
+            if key.rsplit("/", 1)[-1] == "grad_norm"
+        ]
+        if len(exact_suffix_matches) == 1:
+            return exact_suffix_matches[0]
         return None
+
+    def take_last_optimizer_metrics(self) -> dict[str, float]:
+        """Return provider optimizer metrics once for trainer-side logging."""
+
+        metrics = self._last_optim_metrics
+        self._last_optim_metrics = {}
+        return metrics
 
     async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> None:
         if model_id is not None:

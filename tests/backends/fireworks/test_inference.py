@@ -151,6 +151,7 @@ async def test_generate_returns_exact_tokens_and_logprobs() -> None:
     assert output["response_ids"] == [[7, 8], [7, 8]]
     assert output["response_logprobs"] == [[-0.7, -0.8], [-0.7, -0.8]]
     assert output["stop_reasons"] == ["stop", "stop"]
+    assert output["sampler_versions"] is None
     assert client.weight_version == 0
     await client.teardown()
 
@@ -192,6 +193,7 @@ async def test_generate_captures_echo_aligned_router_replay_payload() -> None:
 
     assert output["response_ids"] == [[7, 8]]
     assert output["response_logprobs"] == [[-0.7, -0.8]]
+    assert output["sampler_versions"] is None
     routes = output["rollout_expert_indices"]
     assert routes is not None
     assert routes[0].shape == (3, 4, 1)

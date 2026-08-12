@@ -258,6 +258,9 @@ class FireworksInferenceClient(InferenceEngineInterface):
             response_logprobs=response_logprobs_out,
             prompt_logprobs=None,
             rollout_expert_indices=rollout_expert_indices_out,
+            # A Fireworks request may span a sampler hot-load. The version at
+            # request admission therefore is not an exact trajectory version,
+            # so do not advertise one to the async staleness logic.
             sampler_versions=None,
         )
 

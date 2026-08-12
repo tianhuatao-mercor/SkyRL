@@ -891,7 +891,8 @@ class AlgorithmConfig(BaseConfig):
     """Normalize advantages by the standard deviation in GRPO.
     Set to False for Dr. GRPO (https://arxiv.org/abs/2503.20783)."""
     zero_variance_filter: bool = False
-    """Loss-mask prompts with zero-variance rewards. Only applicable when rewards are response-level."""
+    """Loss-mask prompts with fewer than two live trajectories or zero-variance rewards.
+    Only applicable when rewards are response-level."""
     zero_variance_filter_tol: float = 1e-6
     """Two rewards within this absolute tolerance count as equal when detecting zero-variance groups.
     Only used when ``zero_variance_filter=True``. Defaults to 1e-6 so float (LLM-judge) rewards that are
@@ -1353,6 +1354,13 @@ class FireworksConfig(BaseConfig):
     deployment_timeout_s: int = 900
     hotload_timeout_s: int = 600
     adam_eps: float = 1e-8
+    emit_grad_norm_metrics: Literal["off", "basic", "detailed"] = "basic"
+    """Trainer-side optimizer gradient-norm telemetry.
+
+    Recent Fireworks Training API clients accept this opt-in on ``optim_step``.
+    Older clients do not, so the adapter omits it when their method signature
+    lacks the parameter.
+    """
     snapshot_prefix: str = "skyrl"
     """Prefix for unique in-session sampler snapshot names. It must not contain secrets."""
     training_shape_id: Optional[str] = None

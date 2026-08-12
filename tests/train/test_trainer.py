@@ -173,6 +173,7 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
 
 
 def test_policy_training_step_logs_batch_token_counts(dummy_config, dummy_generator):
+    dummy_config.generator.inference_engine.enable_ray_prometheus_stats = False
     trainer = RayPPOTrainer(
         cfg=dummy_config,
         tracker=None,
@@ -196,6 +197,10 @@ def test_policy_training_step_logs_batch_token_counts(dummy_config, dummy_genera
     trainer.dispatch.stage_data.return_value = [data]
     trainer.dispatch.forward_backward_from_staged.return_value = MagicMock(metrics={"clip_ratio": 0.25})
     trainer.dispatch.optim_step.return_value = 0.75
+    trainer.dispatch.take_last_optimizer_metrics.return_value = {
+        "skyrl.ai/grad_norm": 0.75,
+        "skyrl.ai/grad_norm_rms": 0.125,
+    }
     trainer._normalize_advantages = MagicMock(return_value=data)
 
     metrics = trainer._execute_training_step("policy", data)
@@ -205,6 +210,8 @@ def test_policy_training_step_logs_batch_token_counts(dummy_config, dummy_genera
     assert metrics["trainable_tokens"] == 3.0
     assert metrics["clip_ratio"] == pytest.approx(0.25)
     assert metrics["grad_norm"] == pytest.approx(0.75)
+    assert metrics["skyrl.ai/grad_norm"] == pytest.approx(0.75)
+    assert metrics["skyrl.ai/grad_norm_rms"] == pytest.approx(0.125)
 
 
 def test_calc_advantages_and_returns_step_wise_broadcast(dummy_config):

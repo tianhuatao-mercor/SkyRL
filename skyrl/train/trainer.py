@@ -1181,6 +1181,7 @@ class RayPPOTrainer:
             last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards[is_last_step],
                 response_mask=torch.ones_like(last_step_response_mask, dtype=torch.float),
+                loss_mask=data["loss_mask"][is_last_step],
                 index=index[is_last_step.cpu().numpy()],
                 adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
                 values=values[is_last_step] if values is not None else None,
@@ -1210,6 +1211,7 @@ class RayPPOTrainer:
             advantages, returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards,
                 response_mask=data["response_mask"],
+                loss_mask=data["loss_mask"],
                 index=data.metadata["uids"],
                 adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
                 config=self.cfg.trainer.algorithm,
@@ -1579,6 +1581,18 @@ class RayPPOTrainer:
                 grad_norm = self.dispatch.optim_step(model)
                 if grad_norm is not None:
                     all_metrics["grad_norm"].append(grad_norm)
+                take_optimizer_metrics = getattr(
+                    self.dispatch, "take_last_optimizer_metrics", None
+                )
+                if callable(take_optimizer_metrics):
+                    optimizer_metrics = take_optimizer_metrics()
+                    if isinstance(optimizer_metrics, dict):
+                        for key, value in optimizer_metrics.items():
+                            # The generic scalar remains ``policy/grad_norm``;
+                            # preserve all other provider metric names exactly.
+                            if key == "grad_norm" and grad_norm is not None:
+                                continue
+                            all_metrics[key].append(float(value))
 
         # Reduce metrics across all mini-batches and epochs
         reduced_metrics = reduce_metrics(all_metrics, sum_loss_metrics=False)
@@ -1696,15 +1710,34 @@ class RayPPOTrainer:
         actor_info: ActorInfo = model.actor_infos[rank]
         return actor_info.rank
 
-    def save_checkpoints(self) -> str:
+    def save_checkpoints(
+        self,
+        *,
+        checkpoint_step: Optional[int] = None,
+        publish: bool = True,
+    ) -> str:
         """
         Save the model, optimizer, and training states to disk. Returns the
         checkpoint folder path.
 
         Dispatch handles offload/backload automatically for all colocation configurations.
+
+        Args:
+            checkpoint_step: Completed optimizer step represented by the
+                checkpoint. Defaults to ``self.global_step`` for the synchronous
+                loop, where the cursor denotes the step that just completed.
+                Fully-async callers pass this explicitly because their cursor can
+                already point at the next step when an epoch is exhausted.
+            publish: Publish this checkpoint as ``latest`` and clean up older
+                checkpoints. Fully-async saving defers this until its additional
+                state file is durable.
         """
+        checkpoint_step = self.global_step if checkpoint_step is None else checkpoint_step
+        if checkpoint_step < 0:
+            raise ValueError(f"checkpoint_step must be non-negative, got {checkpoint_step}")
+
         # Create global step folder structure
-        global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
+        global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{checkpoint_step}")
         policy_save_dir = os.path.join(global_step_folder, "policy")
         critic_save_dir = os.path.join(global_step_folder, "critic")
 
@@ -1729,7 +1762,7 @@ class RayPPOTrainer:
 
         # Save additional trainer state
         trainer_state = {
-            "global_step": self.global_step,
+            "global_step": checkpoint_step,
             "config": asdict(self.cfg),
         }
         trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
@@ -1737,18 +1770,24 @@ class RayPPOTrainer:
             torch.save(trainer_state, f)
         logger.info(f"Saved trainer state to {trainer_state_path}")
 
-        # Atomic tracking - write this last after all saves succeed
+        if publish:
+            self._publish_checkpoint(checkpoint_step, global_step_folder)
+
+        return global_step_folder
+
+    def _publish_checkpoint(self, checkpoint_step: int, global_step_folder: str) -> None:
+        """Make a fully written checkpoint discoverable as ``latest``."""
+
+        # Atomic tracking - write this last after all required state succeeds.
         latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
         with io.open_file(latest_checkpoint_file, "w") as f:
-            f.write(str(self.global_step))
+            f.write(str(checkpoint_step))
 
-        logger.info(f"Successfully saved checkpoint for global_step_{self.global_step} to: {global_step_folder}")
+        logger.info(f"Successfully saved checkpoint for global_step_{checkpoint_step} to: {global_step_folder}")
 
         # Clean up old checkpoints after successful save
         with Timer("cleanup_old_checkpoints", self.all_timings):
             self._cleanup_old_checkpoints()
-
-        return global_step_folder
 
     def _cleanup_old_checkpoints(self):
         if not self._node_ids:
@@ -1876,19 +1915,27 @@ class RayPPOTrainer:
         logger.info(f"Successfully loaded complete checkpoint state from global_step_{global_step}")
         return global_step, str(checkpoint_path)
 
-    def save_models(self):
+    def save_models(self, *, checkpoint_step: Optional[int] = None):
         """
         Save the model parameters in HF format at `cfg.trainer.export_path`.
 
         Dispatch handles offload/backload automatically for all colocation configurations.
         """
-        policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
+        checkpoint_step = self.global_step if checkpoint_step is None else checkpoint_step
+        if checkpoint_step < 0:
+            raise ValueError(f"checkpoint_step must be non-negative, got {checkpoint_step}")
+
+        policy_export_dir = os.path.join(
+            self.cfg.trainer.export_path,
+            f"global_step_{checkpoint_step}",
+            "policy",
+        )
         self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
 
         if self.has_critic:
             critic_export_dir = os.path.join(
                 self.cfg.trainer.export_path,
-                f"global_step_{self.global_step}",
+                f"global_step_{checkpoint_step}",
                 "critic",
             )
             self.dispatch.save_hf_model("critic", critic_export_dir, self.tokenizer)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -56,6 +56,79 @@ class _StreamingMoments:
         }
 
 
+@dataclass(slots=True)
+class _StreamingLogRatioHistogram:
+    """Bounded-memory importance-ratio quantiles and cap-hit counts.
+
+    Quantiles are reconstructed from a fixed-width histogram in log-ratio
+    space. Cap-hit counts are exact. Keeping the sketch on CPU prevents these
+    diagnostics from retaining token-sized accelerator tensors after a row is
+    processed.
+    """
+
+    bin_count: int = 4096
+    lower: float = -20.0
+    upper: float = 20.0
+    count: int = 0
+    cap_5_hits: int = 0
+    cap_20_hits: int = 0
+    counts: torch.Tensor = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.bin_count <= 0 or self.lower >= self.upper:
+            raise ValueError("Invalid streaming log-ratio histogram bounds")
+        self.counts = torch.zeros(self.bin_count, dtype=torch.int64)
+
+    def update(self, log_ratios: torch.Tensor) -> None:
+        if log_ratios.numel() == 0:
+            return
+        values = log_ratios.detach().float().clamp(self.lower, self.upper).cpu()
+        self.count += values.numel()
+        self.cap_5_hits += int((values > math.log(5.0)).sum().item())
+        self.cap_20_hits += int((values > math.log(20.0)).sum().item())
+        indices = torch.floor(
+            (values - self.lower) * (self.bin_count / (self.upper - self.lower))
+        ).long()
+        indices.clamp_(0, self.bin_count - 1)
+        self.counts += torch.bincount(indices, minlength=self.bin_count)
+
+    def _value_at_rank(self, rank: int) -> float:
+        cumulative = self.counts.cumsum(dim=0)
+        index = int(
+            torch.searchsorted(
+                cumulative,
+                torch.tensor(rank + 1, dtype=cumulative.dtype),
+            ).item()
+        )
+        log_ratio = self.lower + (index + 0.5) * (
+            (self.upper - self.lower) / self.bin_count
+        )
+        return math.exp(log_ratio)
+
+    def _quantile(self, quantile: float) -> float:
+        rank = quantile * (self.count - 1)
+        low_rank = math.floor(rank)
+        high_rank = math.ceil(rank)
+        low = self._value_at_rank(low_rank)
+        if low_rank == high_rank:
+            return low
+        high = self._value_at_rank(high_rank)
+        return low + (rank - low_rank) * (high - low)
+
+    def as_metrics(self, prefix: str) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        metrics = {
+            f"{prefix}_p50": self._quantile(0.50),
+            f"{prefix}_p90": self._quantile(0.90),
+            f"{prefix}_p95": self._quantile(0.95),
+            f"{prefix}_p99": self._quantile(0.99),
+            f"{prefix}_cap_5_hit_ratio": self.cap_5_hits / self.count,
+            f"{prefix}_cap_20_hit_ratio": self.cap_20_hits / self.count,
+        }
+        return metrics
+
+
 def make_binary_tv_dppo_loss(
     specs: Sequence[GRPODatumSpec],
     *,
@@ -96,6 +169,7 @@ def make_binary_tv_dppo_loss(
         logprob_diff_moments = _StreamingMoments()
         abs_logprob_diff_moments = _StreamingMoments()
         importance_ratio_moments = _StreamingMoments()
+        retained_ratio_histogram = _StreamingLogRatioHistogram()
         approx_kl_sum = 0.0
         for row_index, (spec, current_logprobs) in enumerate(
             zip(specs, logprobs_list, strict=True)
@@ -160,6 +234,9 @@ def make_binary_tv_dppo_loss(
                     logprob_diff_moments.update(trainable_logprob_diff)
                     abs_logprob_diff_moments.update(trainable_abs_diff)
                     importance_ratio_moments.update(trainable_ratio)
+                    retained_ratio_histogram.update(
+                        logprob_diff[trainable & (keep != 0)]
+                    )
                     # Schulman-style non-negative approximation to
                     # KL(behavior || current), averaged over action tokens.
                     approx_kl_sum += (
@@ -189,6 +266,14 @@ def make_binary_tv_dppo_loss(
             )
             metrics.update(
                 importance_ratio_moments.as_metrics("rollout_train_importance_ratio")
+            )
+            metrics.update(
+                retained_ratio_histogram.as_metrics(
+                    "rollout_train_importance_ratio_retained"
+                )
+            )
+            metrics["dppo_retained_token_ratio"] = (
+                retained_ratio_histogram.count / trainable_tokens
             )
             metrics["rollout_train_approx_kl"] = approx_kl_sum / trainable_tokens
         return total_loss, metrics

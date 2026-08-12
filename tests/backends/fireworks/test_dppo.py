@@ -174,6 +174,36 @@ def test_binary_tv_custom_loss_uses_strict_delta_thresholds() -> None:
     assert current.grad.tolist() == pytest.approx([-1.745, 0.0, 0.255, 0.0], abs=1e-5)
 
 
+def test_binary_tv_custom_loss_reports_retained_ratio_percentiles_and_caps() -> None:
+    ratios = [1.0, 4.0, 6.0, 19.0, 21.0, 100.0]
+    behavior_probability = 0.001
+    spec = _spec(
+        behavior_probs=[behavior_probability] * len(ratios),
+        advantages=[1.0] * len(ratios),
+        loss_mask=[1.0] * len(ratios),
+    )
+    current = torch.log(
+        torch.tensor([behavior_probability * ratio for ratio in ratios])
+    ).requires_grad_()
+    loss_fn = make_binary_tv_dppo_loss(
+        [spec],
+        delta_low=0.15,
+        delta_high=0.15,
+    )
+
+    _, metrics = loss_fn([SimpleNamespace()], [current])
+
+    prefix = "rollout_train_importance_ratio_retained"
+    assert metrics["dppo_retained_token_ratio"] == pytest.approx(1.0)
+    assert metrics[f"{prefix}_cap_5_hit_ratio"] == pytest.approx(4 / 6)
+    assert metrics[f"{prefix}_cap_20_hit_ratio"] == pytest.approx(2 / 6)
+    # Percentiles use a high-resolution, bounded-memory histogram in log space.
+    assert metrics[f"{prefix}_p50"] == pytest.approx(12.5, rel=0.02)
+    assert metrics[f"{prefix}_p90"] == pytest.approx(60.5, rel=0.02)
+    assert metrics[f"{prefix}_p95"] == pytest.approx(80.25, rel=0.02)
+    assert metrics[f"{prefix}_p99"] == pytest.approx(96.05, rel=0.02)
+
+
 @pytest.mark.parametrize(
     ("delta_low", "delta_high"),
     [
