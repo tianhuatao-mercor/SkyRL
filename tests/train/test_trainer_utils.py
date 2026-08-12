@@ -654,6 +654,11 @@ def test_filter_generator_output():
         "rollout_metrics": {"metric": "value"},
         "rollout_logprobs": [[0.16, 0.4], [0.1, 0.2], [0.3, 0.4]],
         "rollout_expert_indices": routes,
+        "trajectory_generation_times": [1.0, 2.0, 3.0],
+        "trajectory_time_splits": {
+            "llm": [0.5, 1.0, 1.5],
+            "env": [0.2, 0.4, 0.6],
+        },
     }
     kept_indices = [0, 2]  # Keep first and third samples
 
@@ -668,6 +673,11 @@ def test_filter_generator_output():
     assert filtered["rollout_logprobs"] == [[0.16, 0.4], [0.3, 0.4]]
     assert filtered["rollout_expert_indices"][0] is routes[0]
     assert filtered["rollout_expert_indices"][1] is routes[2]
+    assert filtered["trajectory_generation_times"] == [1.0, 3.0]
+    assert filtered["trajectory_time_splits"] == {
+        "llm": [0.5, 1.5],
+        "env": [0.2, 0.6],
+    }
 
 
 def test_zero_variance_filter_mixed_groups():
