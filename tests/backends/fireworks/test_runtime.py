@@ -1,6 +1,7 @@
 import asyncio
 import re
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -558,6 +559,79 @@ async def test_failed_hotload_preserves_published_identity_and_client() -> None:
     assert runtime.snapshot_path == first.snapshot_path
     assert len(service.samplers) == 1
     assert service.samplers[0].closed is False
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_retries_snapshot_directory_visibility_race(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    class EventuallyVisibleService(_Service):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def hotload_sampler_snapshot(self, path):
+            self.attempts += 1
+            if self.attempts < 3:
+                request = httpx.Request("POST", "https://api.fireworks.ai/hot_load")
+                response = httpx.Response(
+                    400,
+                    request=request,
+                    text=(
+                        "Validation failed. Snapshot 'test' directory does not exist"
+                    ),
+                )
+                raise httpx.HTTPStatusError(
+                    "snapshot not ready",
+                    request=request,
+                    response=response,
+                )
+            super().hotload_sampler_snapshot(path)
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    service = EventuallyVisibleService()
+    runtime = _runtime(service=service)
+
+    with pytest.warns(RuntimeWarning, match="not visible"):
+        identity = await runtime.publish_sampler_weights()
+
+    assert identity.version == 0
+    assert service.attempts == 3
+    assert service.hotloads == [identity.snapshot_path]
+    assert [call.args[0] for call in sleep.await_args_list] == [5.0, 10.0]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_does_not_retry_other_hotload_http_400(monkeypatch) -> None:
+    import httpx
+
+    class InvalidShapeService(_Service):
+        def hotload_sampler_snapshot(self, path):
+            request = httpx.Request("POST", "https://api.fireworks.ai/hot_load")
+            response = httpx.Response(
+                400,
+                request=request,
+                text="Validation failed. Base model does not match deployment",
+            )
+            raise httpx.HTTPStatusError(
+                "invalid request",
+                request=request,
+                response=response,
+            )
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    runtime = _runtime(service=InvalidShapeService())
+
+    with pytest.raises(httpx.HTTPStatusError, match="invalid request"):
+        await runtime.publish_sampler_weights()
+
+    sleep.assert_not_awaited()
     await runtime.close()
 
 

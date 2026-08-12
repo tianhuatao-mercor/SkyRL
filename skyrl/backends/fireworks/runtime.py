@@ -60,6 +60,25 @@ def _disable_managed_trainer_deletion(service: Any) -> bool:
     return True
 
 
+def _is_snapshot_directory_not_ready(exc: BaseException) -> bool:
+    """Recognize Fireworks' transient snapshot-publication race.
+
+    The trainer can return a valid inference checkpoint resource just before
+    its backing directory becomes visible to the hot-load service. Retry only
+    this exact provider response; other HTTP 400s usually indicate a real
+    model/shape/request mismatch and must fail immediately.
+    """
+
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    try:
+        body = str(response.text).lower()
+    except Exception:
+        return False
+    return "snapshot" in body and "directory does not exist" in body
+
+
 class FireworksRuntime:
     """Own one dedicated trainer, deployment, and stable sampling client.
 
@@ -86,6 +105,8 @@ class FireworksRuntime:
         "fireworks/router_replay/submitted_rows_total": "_router_rows_submitted",
         "fireworks/router_replay/submitted_bytes_total": "_router_bytes_submitted",
     }
+    _SNAPSHOT_READY_ATTEMPTS = 6
+    _SNAPSHOT_READY_BACKOFF_S = 5.0
 
     def __init__(
         self,
@@ -662,9 +683,29 @@ class FireworksRuntime:
                 return str(path)
 
             snapshot_path = await asyncio.to_thread(_save)
-            await asyncio.to_thread(
-                self.service.hotload_sampler_snapshot, snapshot_path
-            )
+            for attempt in range(1, self._SNAPSHOT_READY_ATTEMPTS + 1):
+                try:
+                    await asyncio.to_thread(
+                        self.service.hotload_sampler_snapshot, snapshot_path
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        not _is_snapshot_directory_not_ready(exc)
+                        or attempt == self._SNAPSHOT_READY_ATTEMPTS
+                    ):
+                        raise
+                    delay_s = min(
+                        self._SNAPSHOT_READY_BACKOFF_S * (2 ** (attempt - 1)),
+                        30.0,
+                    )
+                    warnings.warn(
+                        "Fireworks inference snapshot is not visible to the "
+                        f"hot-load service yet; retrying in {delay_s:.0f}s "
+                        f"(attempt {attempt + 1}/{self._SNAPSHOT_READY_ATTEMPTS}).",
+                        RuntimeWarning,
+                    )
+                    await asyncio.sleep(delay_s)
 
             # The client is created once, after the first snapshot is ready.
             with self._state_lock:
