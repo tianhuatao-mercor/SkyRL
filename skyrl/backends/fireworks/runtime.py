@@ -219,6 +219,7 @@ class FireworksRuntime:
             gradient_accumulation_steps=None,
             trainer_replica_count=config.trainer_replica_count,
             replica_count=config.replica_count,
+            use_reservation=config.use_reservation,
             trainer_timeout_s=config.trainer_timeout_s,
             inactivity_timeout=f"{config.trainer_inactivity_timeout_s}s",
             deployment_timeout_s=config.deployment_timeout_s,

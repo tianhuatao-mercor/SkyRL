@@ -1392,6 +1392,12 @@ class FireworksConfig(BaseConfig):
     """Stable rollout deployment ID."""
     replica_count: int = 1
     """Number of rollout replicas managed by Fireworks."""
+    use_reservation: bool = True
+    """Try Fireworks reservation capacity first.
+
+    Fireworks SDK 1.2.8 and newer default this to ``True``. Set it to
+    ``False`` only when shared capacity is explicitly desired.
+    """
     cleanup_on_exit: bool = True
     cleanup_deployment_on_close: str = "delete"
     """``"delete"`` or ``"scale_to_zero"`` for the SDK-created deployment."""

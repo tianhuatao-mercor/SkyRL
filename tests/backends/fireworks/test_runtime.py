@@ -148,6 +148,7 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
     assert captured["service"]["cleanup_deployment_on_close"] == "delete"
     assert captured["service"]["trainer_replica_count"] == 2
     assert captured["service"]["replica_count"] == 1
+    assert captured["service"]["use_reservation"] is True
     assert captured["service"]["gradient_accumulation_steps"] is None
     assert captured["service"]["lora_alpha"] == 32
     assert captured["training_client"] == {

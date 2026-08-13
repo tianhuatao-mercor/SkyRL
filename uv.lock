@@ -2345,7 +2345,7 @@ wheels = [
 
 [[package]]
 name = "fireworks-ai"
-version = "1.2.9"
+version = "1.2.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp", marker = "python_full_version < '3.14' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
@@ -2357,9 +2357,9 @@ dependencies = [
     { name = "sniffio", marker = "python_full_version < '3.14' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
     { name = "typing-extensions", marker = "python_full_version < '3.14' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/43/f0374497e2c36ed8459c305009834c1474dec659ec3ac7aa9cb62746615d/fireworks_ai-1.2.9.tar.gz", hash = "sha256:a900adb64ad1364f6adf6d5dcf8a0bf0b9aa39b86fecce40add92b35cc27e01b", size = 487616, upload-time = "2026-08-12T20:58:56.953Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/bc/a8447fddaddc7c3b84224abfa55aed8169a28e9f666c5be3d2eee2369b5e/fireworks_ai-1.2.8.tar.gz", hash = "sha256:123217884df5e1ca556388d3f4df2063961f5c6a540e72a5dd4ce8215b8b63f7", size = 487726, upload-time = "2026-08-12T05:24:01.672Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/c0/5153df0ef516a04afae9551dc93170b19be42adc8d3d888e9cf675464d42/fireworks_ai-1.2.9-py3-none-any.whl", hash = "sha256:fb035feee8a7464caa06a7e7bf59751d15be37b207a12d62b91baecba848e4ba", size = 486029, upload-time = "2026-08-12T20:58:55.376Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/c9/44d64669f97946f82f293e8c713e80cfd8f2b5a6bf13463eeb7f60838677/fireworks_ai-1.2.8-py3-none-any.whl", hash = "sha256:e1ef9801efe1b9c9557be19faecc5f6e30bf7eae607bb681e5a8d8d51eb82d74", size = 486150, upload-time = "2026-08-12T05:24:00.146Z" },
 ]
 
 [package.optional-dependencies]
@@ -9798,7 +9798,7 @@ requires-dist = [
     { name = "debugpy", marker = "extra == 'skyrl-train'", specifier = "==1.8.0" },
     { name = "fastapi", marker = "extra == 'skyrl-train'" },
     { name = "fastapi", extras = ["standard"], marker = "extra == 'tinker'" },
-    { name = "fireworks-ai", extras = ["training"], marker = "python_full_version < '3.14' and extra == 'fireworks'", specifier = ">=1.2.0a87,<2" },
+    { name = "fireworks-ai", extras = ["training"], marker = "python_full_version < '3.14' and extra == 'fireworks'", specifier = "==1.2.8" },
     { name = "flash-attn", marker = "sys_platform == 'linux' and extra == 'fsdp'", specifier = "==2.8.3+cu.12.8.torch.2.11", index = "https://wheels.astral.sh/simple/cu128/" },
     { name = "flash-attn", marker = "sys_platform == 'linux' and extra == 'megatron'", specifier = "==2.8.3+cu.12.8.torch.2.11", index = "https://wheels.astral.sh/simple/cu128/" },
     { name = "flash-attn", marker = "sys_platform == 'linux' and extra == 'skyrl-train'", specifier = "==2.8.3+cu.12.8.torch.2.11", index = "https://wheels.astral.sh/simple/cu128/" },
