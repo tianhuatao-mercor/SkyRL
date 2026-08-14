@@ -884,6 +884,28 @@ class RayPPOTrainer:
 
         logprobs: Optional[List[List[float]]] = generator_output.get("rollout_logprobs", None)
         rollout_expert_indices = generator_output.get("rollout_expert_indices", None)
+        rollout_routing_matrices = generator_output.get(
+            "rollout_routing_matrices", None
+        )
+        if rollout_routing_matrices is not None:
+            if rollout_expert_indices is not None:
+                raise ValueError(
+                    "GeneratorOutput must not provide both decoded expert indices "
+                    "and encoded routing matrices"
+                )
+            if len(rollout_routing_matrices) != len(response_ids):
+                raise ValueError(
+                    "rollout_routing_matrices must contain one row per trajectory"
+                )
+            for row_index, (routes, response) in enumerate(
+                zip(rollout_routing_matrices, response_ids, strict=True)
+            ):
+                if len(routes) != len(response):
+                    raise ValueError(
+                        "rollout_routing_matrices must be response-token aligned: "
+                        f"row {row_index} has {len(routes)} routes for "
+                        f"{len(response)} response tokens"
+                    )
 
         pixel_values = generator_output.get("pixel_values", None)
         image_grid_thw = generator_output.get("image_grid_thw", None)
@@ -949,6 +971,13 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
+        if rollout_routing_matrices is not None:
+            # Keep provider-encoded route strings on CPU as opaque row
+            # metadata. Fireworks slices them at policy mini-batch boundaries;
+            # self-managed backends continue using rollout_expert_indices.
+            training_input.metadata["rollout_routing_matrices"] = [
+                list(routes) for routes in rollout_routing_matrices
+            ]
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 

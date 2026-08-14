@@ -151,6 +151,34 @@ def test_policy_dispatch_stages_and_submits_importance_sampling(monkeypatch) -> 
     )
 
 
+def test_policy_dispatch_slices_encoded_routes_at_minibatch_boundaries() -> None:
+    dispatch = FireworksPolicyDispatch(
+        _cfg(),
+        SimpleNamespace(training_client=_TrainingClient()),
+    )
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.arange(12).reshape(4, 3),
+            "attention_mask": torch.ones((4, 3), dtype=torch.bool),
+        }
+    )
+    batch.metadata = {
+        "uids": ["a", "b", "c", "d"],
+        "rollout_routing_matrices": [["a"], ["b"], ["c"], ["d"]],
+    }
+
+    staged = dispatch.stage_data("policy", batch, [(0, 2), (2, 4)])
+
+    assert staged[0].metadata["rollout_routing_matrices"] == [["a"], ["b"]]
+    assert staged[1].metadata["rollout_routing_matrices"] == [["c"], ["d"]]
+    assert batch.metadata["rollout_routing_matrices"] == [
+        ["a"],
+        ["b"],
+        ["c"],
+        ["d"],
+    ]
+
+
 def test_policy_dispatch_submits_binary_tv_dppo_custom_loss(monkeypatch) -> None:
     cfg = _cfg()
     cfg.trainer.algorithm.policy_loss_type = "dppo"

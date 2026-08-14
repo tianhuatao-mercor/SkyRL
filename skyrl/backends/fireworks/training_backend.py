@@ -53,7 +53,20 @@ class FireworksPolicyDispatch:
 
     def stage_data(self, model: str, data: TrainingInputBatch, mini_batch_boundaries):
         self._require_policy(model)
-        return [data[start:end] for start, end in mini_batch_boundaries]
+        staged = []
+        encoded_routes = (data.metadata or {}).get("rollout_routing_matrices")
+        for start, end in mini_batch_boundaries:
+            mini_batch = data[start:end]
+            # TensorBatch metadata is intentionally not sliced by the generic
+            # container. Router rows are per trajectory, so the Fireworks
+            # dispatch owns their provider-specific boundary slicing.
+            mini_batch.metadata = dict(data.metadata or {})
+            if encoded_routes is not None:
+                mini_batch.metadata["rollout_routing_matrices"] = [
+                    list(row) for row in encoded_routes[start:end]
+                ]
+            staged.append(mini_batch)
+        return staged
 
     def forward_backward_from_staged(
         self,

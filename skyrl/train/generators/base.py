@@ -52,6 +52,11 @@ class GeneratorOutput(TypedDict):
     # record its split.
     trajectory_time_splits: Optional[Dict[str, List[float]]]
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
+    # Optional provider-encoded routing rows aligned to ``response_ids``.
+    # An empty string means the trainer should choose the route for that
+    # loss-masked context position. This avoids expanding opaque hosted route
+    # payloads into a large padded expert-index tensor.
+    rollout_routing_matrices: NotRequired[Optional[List[List[str]]]]
     # Exact hosted sampler version used for each output row, when available.
     sampler_versions: NotRequired[Optional[List[int]]]
     # Applicable only for step-wise training

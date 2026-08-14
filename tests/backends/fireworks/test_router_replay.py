@@ -2,6 +2,7 @@ import base64
 
 import numpy as np
 import pytest
+import torch
 
 from skyrl.backends.fireworks.router_replay import (
     decode_fireworks_routing_matrices,
@@ -90,3 +91,53 @@ def test_decode_uses_writable_compact_uint8_array() -> None:
     assert routes.dtype == np.uint8
     assert routes.shape == (1, 3, 1)
     assert routes.flags.writeable
+
+
+def test_completion_only_routes_are_padded_over_prompt_and_masked_context() -> None:
+    route_a = _encode(bytes([1, 2, 3]))
+    route_b = _encode(bytes([4, 5, 6]))
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.tensor([[10, 11, 20, 30, 21]]),
+            "attention_mask": torch.ones((1, 5), dtype=torch.bool),
+            "response_mask": torch.tensor([[1, 1, 1]], dtype=torch.bool),
+            "loss_mask": torch.tensor([[1, 0, 1]], dtype=torch.float32),
+        }
+    )
+    batch.metadata = {
+        "rollout_routing_matrices": [[route_a, "", route_b]],
+    }
+
+    recovered = routing_matrices_for_model_inputs(batch, [4])
+
+    assert recovered == [("", route_a, "", route_b)]
+
+
+def test_completion_only_routes_require_every_trainable_response_route() -> None:
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.tensor([[10, 20, 21]]),
+            "attention_mask": torch.ones((1, 3), dtype=torch.bool),
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "loss_mask": torch.tensor([[1, 1]], dtype=torch.float32),
+        }
+    )
+    batch.metadata = {"rollout_routing_matrices": [[_encode(b"abc"), ""]]}
+
+    with pytest.raises(ValueError, match="missing a route for trainable"):
+        routing_matrices_for_model_inputs(batch, [2])
+
+
+def test_completion_only_routes_reject_response_length_mismatch() -> None:
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.tensor([[10, 20, 21]]),
+            "attention_mask": torch.ones((1, 3), dtype=torch.bool),
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "loss_mask": torch.tensor([[1, 1]], dtype=torch.float32),
+        }
+    )
+    batch.metadata = {"rollout_routing_matrices": [[_encode(b"abc")]]}
+
+    with pytest.raises(ValueError, match="response-token aligned"):
+        routing_matrices_for_model_inputs(batch, [2])

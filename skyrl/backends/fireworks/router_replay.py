@@ -69,9 +69,121 @@ def routing_matrices_for_model_inputs(
     fresh routes for an uncaptured suffix.
     """
 
+    attention_mask = batch.get("attention_mask")
+    response_mask = batch.get("response_mask")
+    loss_mask = batch.get("loss_mask")
+    encoded_response_rows = (batch.metadata or {}).get(
+        "rollout_routing_matrices"
+    )
+    if encoded_response_rows is not None:
+        if not isinstance(attention_mask, torch.Tensor):
+            raise ValueError("Fireworks router replay requires attention_mask")
+        if not isinstance(response_mask, torch.Tensor):
+            raise ValueError(
+                "Fireworks completion-only router replay requires response_mask"
+            )
+        if not isinstance(loss_mask, torch.Tensor):
+            raise ValueError(
+                "Fireworks completion-only router replay requires loss_mask"
+            )
+        if not (
+            attention_mask.ndim == response_mask.ndim == loss_mask.ndim == 2
+        ):
+            raise ValueError(
+                "Fireworks completion-only attention, response, and loss masks "
+                "must be rank 2"
+            )
+        if len(encoded_response_rows) != len(model_input_lengths):
+            raise ValueError(
+                "Fireworks completion-only router replay expected one route row "
+                f"per trajectory, got {len(encoded_response_rows)} for "
+                f"{len(model_input_lengths)} trajectories"
+            )
+
+        encoded_batch: list[tuple[str, ...]] = []
+        attention_cpu = attention_mask.detach().cpu().bool()
+        response_cpu = response_mask.detach().cpu().bool()
+        loss_cpu = loss_mask.detach().cpu().bool()
+        for row_index, (response_routes, expected_length) in enumerate(
+            zip(encoded_response_rows, model_input_lengths, strict=True)
+        ):
+            if expected_length <= 0:
+                raise ValueError(
+                    f"Fireworks router replay row {row_index} has invalid "
+                    f"model-input length {expected_length}"
+                )
+            if not isinstance(response_routes, (list, tuple)):
+                raise ValueError(
+                    "Fireworks completion-only routing rows must be lists of strings"
+                )
+            trajectory_len = int(attention_cpu[row_index].sum().item())
+            response_len = int(response_cpu[row_index].sum().item())
+            prompt_len = trajectory_len - response_len
+            if trajectory_len != expected_length + 1 or prompt_len <= 0:
+                raise ValueError(
+                    f"Fireworks router replay row {row_index} expected a one-token "
+                    f"training shift, got trajectory={trajectory_len}, "
+                    f"model_input={expected_length}, prompt={prompt_len}"
+                )
+            if len(response_routes) != response_len:
+                raise ValueError(
+                    "Fireworks completion-only routing rows must be response-token "
+                    f"aligned: row {row_index} has {len(response_routes)} routes "
+                    f"for {response_len} response tokens"
+                )
+
+            response_width = response_cpu.shape[1]
+            response_slice = slice(response_width - response_len, response_width)
+            trainable = loss_cpu[row_index, response_slice].tolist()
+            payload_width: int | None = None
+            normalized: list[str] = []
+            for token_index, (encoded, is_trainable) in enumerate(
+                zip(response_routes, trainable, strict=True)
+            ):
+                if not isinstance(encoded, str):
+                    raise ValueError(
+                        "Fireworks completion-only routing matrices must be strings"
+                    )
+                if not encoded:
+                    if is_trainable:
+                        raise ValueError(
+                            "Fireworks completion-only router replay is missing a "
+                            f"route for trainable response token {token_index} in "
+                            f"row {row_index}"
+                        )
+                    normalized.append("")
+                    continue
+                try:
+                    payload = base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise ValueError(
+                        "Fireworks completion-only routing matrix is not valid base64"
+                    ) from exc
+                if not payload:
+                    raise ValueError(
+                        "Fireworks completion-only routing matrix decoded to an "
+                        "empty payload"
+                    )
+                if payload_width is None:
+                    payload_width = len(payload)
+                elif len(payload) != payload_width:
+                    raise ValueError(
+                        "Fireworks completion-only routing payloads must have a "
+                        "consistent decoded size"
+                    )
+                normalized.append(encoded)
+
+            aligned = tuple([""] * (prompt_len - 1) + normalized)
+            if len(aligned) != expected_length:
+                raise ValueError(
+                    "Fireworks completion-only routing alignment produced "
+                    f"{len(aligned)} rows for model-input length {expected_length}"
+                )
+            encoded_batch.append(aligned)
+        return encoded_batch
+
     routes = batch.get("rollout_expert_indices")
     router_padding_mask = batch.get("router_padding_mask")
-    attention_mask = batch.get("attention_mask")
     if not isinstance(routes, torch.Tensor):
         raise ValueError("Fireworks router replay requires rollout_expert_indices in every staged batch")
     if not isinstance(router_padding_mask, torch.Tensor):
