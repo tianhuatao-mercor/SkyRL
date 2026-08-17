@@ -870,6 +870,9 @@ class AlgorithmConfig(BaseConfig):
     - ``"dppo"``: DPPO, from Rethinking the Trust Region in LLM Reinforcement Learning
       (https://arxiv.org/pdf/2602.04879). Uses rollout logprobs and absolute probability
       divergences rather than probability ratios, improving on PPO clipping behavior.
+    - ``"dapo"``: DAPO's asymmetric dual-clip PPO objective. The managed Fireworks
+      backend routes this name to its native fused DAPO loss after SkyRL computes
+      old-policy logprobs and token-level rollout correction.
     """
     loss_reduction: str = "token_mean"
     """Type of loss reduction to use, applied per mini-batch by rescaling advantages:

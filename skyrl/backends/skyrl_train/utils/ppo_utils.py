@@ -455,6 +455,7 @@ class PolicyLossType(StrEnum):
     CROSS_ENTROPY = "cross_entropy"
     IMPORTANCE_SAMPLING = "importance_sampling"
     DPPO = "dppo"
+    DAPO = "dapo"
 
 
 # Losses that optimize against rollout logprobs, so the "old" logprobs forward pass can be
@@ -472,6 +473,7 @@ LOSSES_WITH_OLD_LOGPROBS = frozenset(
         PolicyLossType.SAPO,
         PolicyLossType.CROSS_ENTROPY,
         PolicyLossType.IMPORTANCE_SAMPLING,
+        PolicyLossType.DAPO,
     }
 )
 
@@ -507,6 +509,7 @@ class PolicyLossRegistry(BaseFunctionRegistry):
             "cross_entropy": [PolicyLossType.CROSS_ENTROPY, cross_entropy_loss],
             "importance_sampling": [PolicyLossType.IMPORTANCE_SAMPLING, importance_sampling_loss],
             "dppo": [PolicyLossType.DPPO, dppo_policy_loss],
+            "dapo": [PolicyLossType.DAPO, ppo_policy_loss],
             "rollout_is": [PolicyLossType.ROLLOUT_IS, rollout_is_policy_loss],
         }
 
@@ -554,6 +557,7 @@ def sync_registries():
 
 @register_policy_loss(PolicyLossType.REGULAR)
 @register_policy_loss(PolicyLossType.DUAL_CLIP)
+@register_policy_loss(PolicyLossType.DAPO)
 def ppo_policy_loss(
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
@@ -562,7 +566,9 @@ def ppo_policy_loss(
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
-    assert config.policy_loss_type in ["regular", "dual_clip"], "loss_type must be either 'regular' or 'dual_clip'"
+    assert config.policy_loss_type in ["regular", "dual_clip", "dapo"], (
+        "loss_type must be 'regular', 'dual_clip', or 'dapo'"
+    )
 
     ratio = safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
     surr1 = ratio * advantages
@@ -570,7 +576,7 @@ def ppo_policy_loss(
     loss = -torch.min(surr1, surr2)
     clip_ratio = masked_mean((-surr2 > -surr1).float(), loss_mask).mean().detach().item()
     clip_pg_losses1 = loss
-    if config.policy_loss_type == "dual_clip":
+    if config.policy_loss_type in ("dual_clip", "dapo"):
         pg_losses3 = -advantages * config.clip_ratio_c
         clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
         loss = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)

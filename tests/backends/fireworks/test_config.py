@@ -73,6 +73,21 @@ def test_validate_fireworks_binary_tv_dppo_prompt_mean_config() -> None:
     validate_cfg(cfg)
 
 
+def test_validate_fireworks_native_dapo_config_with_warmup() -> None:
+    cfg = _valid_fireworks_cfg()
+    cfg.trainer.algorithm.policy_loss_type = "dapo"
+    cfg.trainer.algorithm.loss_reduction = "token_mean"
+    cfg.trainer.algorithm.eps_clip_low = 0.2
+    cfg.trainer.algorithm.eps_clip_high = 0.28
+    cfg.trainer.algorithm.clip_ratio_c = 10.0
+    cfg.trainer.algorithm.off_policy_correction.tis_ratio_type = "token"
+    cfg.trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high = 2.0
+    cfg.trainer.recompute_old_logprobs_per_minibatch = True
+    cfg.trainer.policy.optimizer_config.num_warmup_steps = 40
+
+    validate_cfg(cfg)
+
+
 def test_validate_fireworks_rejects_binary_kl_dppo() -> None:
     cfg = _valid_fireworks_cfg()
     cfg.trainer.algorithm.policy_loss_type = "dppo"

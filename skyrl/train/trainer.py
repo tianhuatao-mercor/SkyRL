@@ -1387,6 +1387,12 @@ class RayPPOTrainer:
             - `["values"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         fwd_keys = ["sequences", "attention_mask"]
+        # Hosted Fireworks DAPO trims the trainer's full-sequence forward
+        # logprobs back to each response suffix before returning them.  Keep
+        # the response mask in the forward batch so the dispatch can recover
+        # those per-row lengths without inferring prompt boundaries.
+        if training_input.get("response_mask") is not None:
+            fwd_keys.append("response_mask")
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
         if training_input.get("router_padding_mask") is not None:

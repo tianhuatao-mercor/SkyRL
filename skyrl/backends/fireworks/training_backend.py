@@ -13,7 +13,11 @@ from typing import Any, Optional
 from loguru import logger
 
 from skyrl.backends.fireworks.dppo import build_tinker_binary_tv_dppo_request
-from skyrl.backends.fireworks.grpo import build_tinker_grpo_datums
+from skyrl.backends.fireworks.grpo import (
+    build_tinker_dapo_datums,
+    build_tinker_grpo_datums,
+    build_tinker_logprob_datums,
+)
 from skyrl.backends.fireworks.router_replay import routing_payload_counts
 from skyrl.backends.fireworks.runtime import FireworksRuntime
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
@@ -32,12 +36,17 @@ class FireworksPolicyDispatch:
         *,
         datum_builder=build_tinker_grpo_datums,
         dppo_request_builder=build_tinker_binary_tv_dppo_request,
+        dapo_datum_builder=build_tinker_dapo_datums,
+        logprob_datum_builder=build_tinker_logprob_datums,
     ) -> None:
         self.cfg = cfg
         self.runtime = runtime
         self._datum_builder = datum_builder
         self._dppo_request_builder = dppo_request_builder
+        self._dapo_datum_builder = dapo_datum_builder
+        self._logprob_datum_builder = logprob_datum_builder
         self._last_optim_metrics: dict[str, float] = {}
+        self._optimizer_step_count = 0
 
     def get_lcm_dp_size(self) -> int:
         return 1
@@ -119,9 +128,27 @@ class FireworksPolicyDispatch:
                     custom_loss,
                     loss_type_input="logprobs",
                 )
+            elif policy_loss_type == "dapo":
+                off_policy = self.cfg.trainer.algorithm.off_policy_correction
+                dapo_builder_kwargs: dict[str, Any] = {
+                    "max_seq_len": self.cfg.trainer.fireworks.max_seq_len,
+                    "token_tis_ratio_clip_high": (
+                        off_policy.token_tis_ratio_clip_high
+                    ),
+                }
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    dapo_builder_kwargs["enable_router_replay"] = True
+                datums, dapo_metrics = self._dapo_datum_builder(
+                    staged_batch,
+                    **dapo_builder_kwargs,
+                )
+                if self.cfg.trainer.fireworks.enable_router_replay:
+                    routing_rows, routing_bytes = routing_payload_counts(datums)
+                future = self.runtime.training_client.forward_backward(datums, "dapo")
             else:  # guarded by config validation; keep dispatch defensive
                 raise ValueError(
-                    "Fireworks policy dispatch supports only rollout_is or dppo, " f"got {policy_loss_type!r}"
+                    "Fireworks policy dispatch supports only rollout_is, dppo, or dapo, "
+                    f"got {policy_loss_type!r}"
                 )
             result = future.result(timeout=self.cfg.trainer.fireworks.request_timeout_s)
         except BaseException:
@@ -150,6 +177,8 @@ class FireworksPolicyDispatch:
                 )
             record(**record_kwargs)
         metrics = {key: float(value) for key, value in (getattr(result, "metrics", None) or {}).items()}
+        if policy_loss_type == "dapo":
+            metrics.update(dapo_metrics)
         if self.cfg.trainer.fireworks.enable_router_replay:
             metrics["router_replay_rows"] = float(routing_rows)
             metrics["router_replay_bytes"] = float(routing_bytes)
@@ -171,8 +200,16 @@ class FireworksPolicyDispatch:
             raise ImportError("Fireworks optimizer construction requires the tinker package") from exc
 
         optimizer = self.cfg.trainer.policy.optimizer_config
+        warmup_steps = int(optimizer.num_warmup_steps)
+        learning_rate = float(optimizer.lr)
+        if warmup_steps > 0:
+            # Megatron's constant-with-warmup schedule starts at zero and
+            # advances once after each optimizer call.  The hosted backend
+            # receives optimizer parameters per call, so reproduce that
+            # schedule explicitly.
+            learning_rate *= min(self._optimizer_step_count / warmup_steps, 1.0)
         params = tinker.AdamParams(
-            learning_rate=optimizer.lr,
+            learning_rate=learning_rate,
             beta1=optimizer.adam_betas[0],
             beta2=optimizer.adam_betas[1],
             eps=self.cfg.trainer.fireworks.adam_eps,
@@ -211,9 +248,12 @@ class FireworksPolicyDispatch:
         result = optim_step(params, **optim_kwargs).result(
             timeout=self.cfg.trainer.fireworks.request_timeout_s
         )
+        self._optimizer_step_count += 1
         self._last_optim_metrics = {
             key: float(value) for key, value in (getattr(result, "metrics", None) or {}).items()
         }
+        if warmup_steps > 0:
+            self._last_optim_metrics.setdefault("learning_rate", learning_rate)
         # Do not treat RMS or per-bucket norms as the global norm merely
         # because their names contain ``grad_norm``. Prefer the provider's
         # canonical key, then narrowly support exact legacy spellings.
@@ -274,11 +314,73 @@ class FireworksPolicyDispatch:
 
         self._require_policy(model)
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError("Fireworks GRPO requires rollout logprobs so the local policy forward is skipped")
+    def _forward_old_policy(self, model: str, batch: TrainingInputBatch) -> WorkerOutput:
+        self._require_policy(model)
+        if self.cfg.trainer.algorithm.policy_loss_type != "dapo":
+            raise NotImplementedError(
+                "A hosted policy forward is currently implemented only for native DAPO"
+            )
+        datums, response_lengths = self._logprob_datum_builder(
+            batch,
+            max_seq_len=self.cfg.trainer.fireworks.max_seq_len,
+        )
+        result = self.runtime.training_client.forward(datums, "cross_entropy").result(
+            timeout=self.cfg.trainer.fireworks.request_timeout_s
+        )
+        outputs = list(getattr(result, "loss_fn_outputs", ()) or ())
+        if len(outputs) != len(response_lengths):
+            raise RuntimeError(
+                "Fireworks DAPO old-policy forward returned the wrong number of rows: "
+                f"expected {len(response_lengths)}, got {len(outputs)}"
+            )
+        response_width = int(batch["response_mask"].shape[1])
+        trimmed: list[dict[str, list[float]]] = []
+        for row_index, (output, response_len) in enumerate(
+            zip(outputs, response_lengths, strict=True)
+        ):
+            if "logprobs" not in output:
+                raise RuntimeError(
+                    "Fireworks DAPO old-policy forward omitted logprobs for row "
+                    f"{row_index}; fields={sorted(output)}"
+                )
+            value = output["logprobs"]
+            raw = getattr(value, "data", value)
+            values = [float(item) for item in raw]
+            if len(values) < response_len:
+                raise RuntimeError(
+                    "Fireworks DAPO old-policy logprobs are shorter than the response "
+                    f"for row {row_index}: {len(values)} < {response_len}"
+                )
+            trimmed.append(
+                {
+                    "logprobs": [0.0] * (response_width - response_len)
+                    + values[-response_len:]
+                }
+            )
+        return WorkerOutput(
+            loss_fn_output_type="logprobs",
+            loss_fn_outputs=trimmed,
+            metrics={
+                key: float(value)
+                for key, value in (getattr(result, "metrics", None) or {}).items()
+            },
+        )
 
-    def forward_from_staged(self, *args, **kwargs):
-        raise NotImplementedError("Fireworks GRPO requires rollout logprobs so the local policy forward is skipped")
+    def forward(self, model: str, batch: TrainingInputBatch, *args, **kwargs):
+        if args or kwargs:
+            raise NotImplementedError(
+                "Fireworks DAPO policy forward does not accept per-call overrides"
+            )
+        return self._forward_old_policy(model, batch)
+
+    def forward_from_staged(
+        self, model: str, staged_batch: TrainingInputBatch, *args, **kwargs
+    ):
+        if args or kwargs:
+            raise NotImplementedError(
+                "Fireworks DAPO staged policy forward does not accept per-call overrides"
+            )
+        return self._forward_old_policy(model, staged_batch)
 
     _CHECKPOINT_MANIFEST = "fireworks_checkpoint.json"
     _CHECKPOINT_FORMAT_VERSION = 2
@@ -402,6 +504,7 @@ class FireworksPolicyDispatch:
             ),
             "includes_optimizer_state": True,
             "global_step": step_number,
+            "optimizer_step_count": self._optimizer_step_count,
         }
         manifest["usage_at_checkpoint"] = self.runtime.usage_report()
         io.makedirs(ckpt_dir, exist_ok=True)
@@ -468,6 +571,14 @@ class FireworksPolicyDispatch:
             else self.runtime.training_client.load_state
         )
         load(load_path).result(timeout=self.cfg.trainer.fireworks.request_timeout_s)
+        saved_optimizer_steps = manifest.get("optimizer_step_count")
+        if saved_optimizer_steps is not None:
+            if not isinstance(saved_optimizer_steps, int) or saved_optimizer_steps < 0:
+                raise ValueError(
+                    "Fireworks checkpoint optimizer_step_count must be a non-negative integer: "
+                    f"{manifest_path}"
+                )
+            self._optimizer_step_count = saved_optimizer_steps
         logger.info(
             "Loaded Fireworks DCP checkpoint: reference={}, optimizer_restored={}",
             load_path,

@@ -252,3 +252,154 @@ def build_tinker_grpo_datums(
             enable_router_replay=enable_router_replay,
         )
     ]
+
+
+def build_tinker_logprob_datums(
+    batch: TrainingInputBatch,
+    *,
+    max_seq_len: int | None = None,
+) -> tuple[list["tinker.Datum"], list[int]]:
+    """Build cross-entropy datums for a hosted old-policy forward.
+
+    Fireworks returns one target-token logprob for every shifted model-input
+    position.  The caller uses the returned response lengths to retain only
+    the response suffix and left-pad it back to SkyRL's response tensor width.
+    """
+
+    if batch.batch_size == 0:
+        return [], []
+
+    try:
+        import tinker
+    except ImportError as exc:  # pragma: no cover - depends on optional installation
+        raise ImportError(
+            "Fireworks policy-forward datum construction requires the 'tinker' package; "
+            "install SkyRL with the Fireworks/Tinker extra"
+        ) from exc
+
+    sequences = _require_matrix(batch, "sequences")
+    attention_mask = _require_matrix(batch, "attention_mask")
+    response_mask = _require_matrix(batch, "response_mask")
+    datums: list[tinker.Datum] = []
+    response_lengths: list[int] = []
+    for row_index in range(batch.batch_size):
+        tokens = _unpadded_tokens(
+            sequences[row_index], attention_mask[row_index], row_index=row_index
+        )
+        response_len = _right_aligned_length(
+            response_mask[row_index],
+            field_name="response_mask",
+            row_index=row_index,
+        )
+        if response_len == 0:
+            raise ValueError(
+                f"Fireworks policy-forward sample {row_index} has an empty response"
+            )
+        model_input_token_ids = tokens[:-1]
+        if max_seq_len is not None and len(model_input_token_ids) > max_seq_len:
+            raise ValueError(
+                f"Fireworks policy-forward sample {row_index} has model-input length "
+                f"{len(model_input_token_ids)}, exceeding max_seq_len={max_seq_len}"
+            )
+        datums.append(
+            tinker.Datum(
+                model_input=make_tinker_model_input(model_input_token_ids, None),
+                loss_fn_inputs={
+                    "target_tokens": tinker.TensorData(
+                        data=tokens[1:], dtype="int64"
+                    ),
+                    # Cross-entropy forward returns target-token logprobs.  The
+                    # weights do not affect those logits, but the Fireworks
+                    # datum schema requires one weight per target position.
+                    "weights": tinker.TensorData(
+                        data=[0.0] * len(model_input_token_ids), dtype="float32"
+                    ),
+                },
+            )
+        )
+        response_lengths.append(response_len)
+    return datums, response_lengths
+
+
+def build_tinker_dapo_datums(
+    batch: TrainingInputBatch,
+    *,
+    max_seq_len: int | None = None,
+    token_tis_ratio_clip_high: float = 2.0,
+    enable_router_replay: bool = False,
+) -> tuple[list["tinker.Datum"], dict[str, float]]:
+    """Build native DAPO datums with SkyRL's token-level TIS correction.
+
+    The provider ``dapo`` kernel receives old-policy logprobs for its PPO
+    ratio.  The separate behavior-policy correction
+    ``clip(exp(old_policy - rollout), max=C)`` is detached and folded into
+    the already loss-reduction-scaled token advantages, matching SkyRL's
+    Megatron DAPO path.
+    """
+
+    if not math.isfinite(token_tis_ratio_clip_high) or token_tis_ratio_clip_high <= 0:
+        raise ValueError("token_tis_ratio_clip_high must be finite and positive")
+    specs = training_batch_to_grpo_datum_specs(
+        batch,
+        max_seq_len=max_seq_len,
+        enable_router_replay=enable_router_replay,
+    )
+    old_logprobs = _require_matrix(batch, "action_log_probs")
+    response_mask = _require_matrix(batch, "response_mask")
+    if old_logprobs.shape != response_mask.shape:
+        raise ValueError(
+            "Fireworks DAPO action_log_probs must align with response_mask; "
+            f"got {tuple(old_logprobs.shape)} vs {tuple(response_mask.shape)}"
+        )
+
+    datums: list[tinker.Datum] = []
+    capped_tokens = 0
+    trainable_tokens = 0
+    ratio_sum = 0.0
+    for row_index, spec in enumerate(specs):
+        response_len = _right_aligned_length(
+            response_mask[row_index],
+            field_name="response_mask",
+            row_index=row_index,
+        )
+        response_width = response_mask.shape[1]
+        response_slice = slice(response_width - response_len, response_width)
+        old_response = [
+            float(value) for value in old_logprobs[row_index, response_slice].tolist()
+        ]
+        prompt_prediction_count = len(spec.model_input_token_ids) - response_len
+        old_full = [0.0] * prompt_prediction_count + old_response
+        corrected_advantages: list[float] = []
+        for old_lp, rollout_lp, advantage, mask in zip(
+            old_full,
+            spec.rollout_logprobs,
+            spec.advantages,
+            spec.loss_mask,
+            strict=True,
+        ):
+            if not mask:
+                corrected_advantages.append(0.0)
+                continue
+            if not math.isfinite(old_lp):
+                raise ValueError(
+                    f"action_log_probs[{row_index}] contains a non-finite trainable value"
+                )
+            ratio = math.exp(max(-20.0, min(20.0, old_lp - rollout_lp)))
+            capped = min(ratio, token_tis_ratio_clip_high)
+            corrected_advantages.append(float(advantage * capped))
+            capped_tokens += int(ratio > token_tis_ratio_clip_high)
+            trainable_tokens += 1
+            ratio_sum += ratio
+
+        dapo_spec = replace(
+            spec,
+            rollout_logprobs=tuple(old_full),
+            advantages=tuple(corrected_advantages),
+        )
+        datums.append(_to_tinker_datum(dapo_spec))
+
+    denominator = max(trainable_tokens, 1)
+    return datums, {
+        "tis_token_clip_high_ratio": capped_tokens / denominator,
+        "tis_importance_ratio_mean": ratio_sum / denominator,
+    }

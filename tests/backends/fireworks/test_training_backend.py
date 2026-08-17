@@ -24,11 +24,25 @@ class _Future:
 
 class _TrainingClient:
     def __init__(self):
+        self.forward_calls = []
         self.forward_backward_calls = []
         self.forward_backward_custom_calls = []
         self.optim_params = []
         self.saved_states = []
         self.loaded_states = []
+
+    def forward(self, datums, loss_fn):
+        self.forward_calls.append((datums, loss_fn))
+        return _Future(
+            SimpleNamespace(
+                loss_fn_outputs=[
+                    {"logprobs": [-9.0, -8.0, -0.3, -0.2]}
+                    for _ in datums
+                ],
+                metrics={"forward_tokens": 4.0 * len(datums)},
+                loss_fn_output_type="logprobs",
+            )
+        )
 
     def forward_backward(self, datums, loss_fn):
         self.forward_backward_calls.append((datums, loss_fn))
@@ -232,6 +246,86 @@ def test_policy_dispatch_submits_binary_tv_dppo_custom_loss(monkeypatch) -> None
     )
 
 
+def test_policy_dispatch_submits_native_dapo_with_old_policy_tis(monkeypatch) -> None:
+    cfg = _cfg()
+    cfg.trainer.algorithm.policy_loss_type = "dapo"
+    cfg.trainer.algorithm.off_policy_correction.tis_ratio_type = "token"
+    cfg.trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high = 2.0
+    training_client = _TrainingClient()
+    runtime = SimpleNamespace(
+        training_client=training_client,
+        record_forward_backward=MagicMock(),
+    )
+    built_requests = []
+
+    def dapo_builder(batch, **kwargs):
+        built_requests.append((batch, kwargs))
+        return ["dapo-datum"] * batch.batch_size, {
+            "tis_token_clip_high_ratio": 0.25
+        }
+
+    monotonic_values = iter((70.0, 72.0))
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.training_backend.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        runtime,
+        dapo_datum_builder=dapo_builder,
+    )
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.arange(6).reshape(2, 3),
+            "attention_mask": torch.ones((2, 3), dtype=torch.bool),
+        }
+    )
+
+    output = dispatch.forward_backward_from_staged("policy", batch)
+
+    assert training_client.forward_backward_calls == [
+        (["dapo-datum", "dapo-datum"], "dapo")
+    ]
+    assert built_requests[0][1] == {
+        "max_seq_len": 128,
+        "token_tis_ratio_clip_high": 2.0,
+    }
+    assert output.metrics["tis_token_clip_high_ratio"] == pytest.approx(0.25)
+
+
+def test_policy_dispatch_dapo_forward_returns_right_aligned_response_logprobs() -> None:
+    cfg = _cfg()
+    cfg.trainer.algorithm.policy_loss_type = "dapo"
+    training_client = _TrainingClient()
+
+    def logprob_builder(batch, *, max_seq_len):
+        assert max_seq_len == 128
+        return ["row-a", "row-b"], [2, 3]
+
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        SimpleNamespace(training_client=training_client),
+        logprob_datum_builder=logprob_builder,
+    )
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.arange(10).reshape(2, 5),
+            "attention_mask": torch.ones((2, 5), dtype=torch.bool),
+            "response_mask": torch.tensor([[0, 1, 1], [1, 1, 1]]),
+        }
+    )
+
+    output = dispatch.forward("policy", batch)
+
+    assert training_client.forward_calls == [
+        (["row-a", "row-b"], "cross_entropy")
+    ]
+    assert output.loss_fn_outputs == [
+        {"logprobs": [0.0, -0.3, -0.2]},
+        {"logprobs": [-8.0, -0.3, -0.2]},
+    ]
+
+
 def test_policy_dispatch_optimizer_uses_skyrl_optimizer_config() -> None:
     cfg = _cfg()
     cfg.trainer.policy.optimizer_config.lr = 2e-5
@@ -250,6 +344,24 @@ def test_policy_dispatch_optimizer_uses_skyrl_optimizer_config() -> None:
     assert params.weight_decay == pytest.approx(0.1)
     assert params.grad_clip_norm == pytest.approx(2.0)
     assert grad_norm == pytest.approx(0.75)
+
+
+def test_policy_dispatch_optimizer_applies_constant_warmup() -> None:
+    cfg = _cfg()
+    cfg.trainer.policy.optimizer_config.lr = 1e-6
+    cfg.trainer.policy.optimizer_config.num_warmup_steps = 2
+    training_client = _TrainingClient()
+    dispatch = FireworksPolicyDispatch(
+        cfg, SimpleNamespace(training_client=training_client)
+    )
+
+    dispatch.optim_step("policy")
+    dispatch.optim_step("policy")
+    dispatch.optim_step("policy")
+
+    assert [params.learning_rate for params in training_client.optim_params] == pytest.approx(
+        [0.0, 0.5e-6, 1e-6]
+    )
 
 
 def test_policy_dispatch_opts_in_and_exposes_provider_optimizer_metrics() -> None:

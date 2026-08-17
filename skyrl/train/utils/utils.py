@@ -340,9 +340,10 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
 
     if algorithm.advantage_estimator != "grpo":
         raise ValueError("The initial Fireworks backend is GRPO-only")
-    if algorithm.policy_loss_type not in ("rollout_is", "dppo"):
+    if algorithm.policy_loss_type not in ("rollout_is", "dppo", "dapo"):
         raise ValueError(
-            "The Fireworks GRPO backend requires " "trainer.algorithm.policy_loss_type='rollout_is' or 'dppo'"
+            "The Fireworks GRPO backend requires policy_loss_type='rollout_is', "
+            "'dppo', or 'dapo'"
         )
     if algorithm.policy_loss_type == "dppo" and algorithm.dppo.dppo_type != "binary_tv":
         raise NotImplementedError("The Fireworks custom DPPO loss currently supports only dppo_type='binary_tv'")
@@ -358,6 +359,49 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
                     "Fireworks DPPO thresholds must be finite and non-negative; "
                     f"trainer.algorithm.dppo.{name}={value!r}"
                 )
+    if algorithm.policy_loss_type == "dapo":
+        if trainer.fully_async.enabled:
+            raise NotImplementedError(
+                "Fireworks native DAPO currently requires fully synchronous training"
+            )
+        if algorithm.loss_reduction != "token_mean":
+            raise ValueError("Fireworks native DAPO requires loss_reduction='token_mean'")
+        if not math.isclose(algorithm.eps_clip_low, 0.2) or not math.isclose(
+            algorithm.eps_clip_high, 0.28
+        ):
+            raise ValueError(
+                "Fireworks native DAPO currently supports the validated asymmetric "
+                "clip bounds eps_clip_low=0.2 and eps_clip_high=0.28"
+            )
+        if not math.isclose(algorithm.clip_ratio_c, 10.0):
+            raise ValueError(
+                "Fireworks native DAPO currently requires the reference dual-clip setting "
+                "clip_ratio_c=10.0"
+            )
+        correction = algorithm.off_policy_correction
+        if correction.tis_ratio_type != "token" or not math.isclose(
+            correction.token_tis_ratio_clip_high, 2.0
+        ):
+            raise ValueError(
+                "Fireworks native DAPO requires token TIS with "
+                "token_tis_ratio_clip_high=2.0"
+            )
+        unsupported_correction = (
+            correction.sequence_mask_metric is not None
+            or correction.outlier_token_is_threshold_low is not None
+            or correction.outlier_token_is_threshold_high is not None
+            or correction.token_mask_is_threshold_low is not None
+            or correction.token_mask_is_threshold_high is not None
+        )
+        if unsupported_correction:
+            raise NotImplementedError(
+                "Fireworks native DAPO supports token TIS only, without additional "
+                "sequence/outlier/token masks"
+            )
+        if not trainer.recompute_old_logprobs_per_minibatch:
+            raise ValueError(
+                "Fireworks native DAPO requires recompute_old_logprobs_per_minibatch=true"
+            )
     if algorithm.use_kl_loss or algorithm.use_kl_in_reward:
         raise ValueError("The initial Fireworks GRPO backend requires KL loss and KL reward penalty to be disabled")
     if trainer.critic.model.path:
@@ -365,7 +409,10 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
     if trainer.update_epochs_per_batch != 1:
         raise ValueError("The initial Fireworks GRPO backend requires trainer.update_epochs_per_batch=1")
 
-    if off_policy_correction_enabled(algorithm.off_policy_correction):
+    if (
+        algorithm.policy_loss_type != "dapo"
+        and off_policy_correction_enabled(algorithm.off_policy_correction)
+    ):
         raise NotImplementedError(
             "SkyRL off_policy_correction is not yet translated to Fireworks; use rollout_is without an extra mask"
         )
@@ -393,10 +440,10 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
         raise ValueError("Set generator.inference_engine.enable_ray_prometheus_stats=false for Fireworks")
 
     optimizer = trainer.policy.optimizer_config
-    if optimizer.num_warmup_steps != 0 or optimizer.scheduler != "constant_with_warmup":
+    if optimizer.num_warmup_steps < 0 or optimizer.scheduler != "constant_with_warmup":
         raise NotImplementedError(
-            "The initial Fireworks backend supports a constant learning rate only "
-            "(scheduler='constant_with_warmup', num_warmup_steps=0)"
+            "The Fireworks backend supports scheduler='constant_with_warmup' with a "
+            "non-negative num_warmup_steps"
         )
 
     for name, sampling in (
