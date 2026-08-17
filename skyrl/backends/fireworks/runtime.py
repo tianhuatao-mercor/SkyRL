@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from loguru import logger
+
 from skyrl.backends.tinker.runtime import configure_tinker_pyqwest_system_certs
 from skyrl.train.config import FireworksConfig
 
@@ -97,6 +99,8 @@ class FireworksRuntime:
         ),
         "fireworks/usage/sampled_tokens_total": "_sampled_tokens",
         "fireworks/usage/sampling_request_seconds_total": "_sampling_request_seconds",
+        "fireworks/usage/sampling_timeouts_total": "_sampling_timeouts",
+        "fireworks/usage/sampling_retries_total": "_sampling_retries",
         "fireworks/usage/forward_backward_calls_total": "_forward_backward_calls",
         "fireworks/usage/training_tokens_total": "_training_tokens",
         "fireworks/usage/forward_backward_seconds_total": "_forward_backward_seconds",
@@ -127,6 +131,8 @@ class FireworksRuntime:
         self._sampler: Any | None = None
         self._sampler_identity: SamplerVersion | None = None
         self._active_samples = 0
+        self._sampling_semaphore: asyncio.Semaphore | None = None
+        self._sampling_semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._next_version = 0
         self._closed = False
         self._started_monotonic = (
@@ -148,6 +154,8 @@ class FireworksRuntime:
         self._prompt_cache_unknown_tokens = 0
         self._sampled_tokens = 0
         self._sampling_request_seconds = 0.0
+        self._sampling_timeouts = 0
+        self._sampling_retries = 0
         self._forward_backward_calls = 0
         self._training_tokens = 0
         self._forward_backward_seconds = 0.0
@@ -499,6 +507,8 @@ class FireworksRuntime:
                 "fireworks/usage/sampling_request_seconds_total": (
                     self._sampling_request_seconds
                 ),
+                "fireworks/usage/sampling_timeouts_total": self._sampling_timeouts,
+                "fireworks/usage/sampling_retries_total": self._sampling_retries,
                 "fireworks/usage/forward_backward_calls_total": (
                     self._forward_backward_calls
                 ),
@@ -763,21 +773,58 @@ class FireworksRuntime:
         pause/resume during an asynchronous hot-load.
         """
 
-        with self._use_sampler() as (sampler, identity):
-            native_sample = getattr(sampler, "sample_async", None)
-            if native_sample is None:
-                raise RuntimeError(
-                    "The dedicated Fireworks sampler must expose sample_async()"
-                )
-            result = await asyncio.wait_for(
-                native_sample(
-                    prompt=prompt,
-                    num_samples=1,
-                    sampling_params=sampling_params,
-                ),
-                timeout=self.config.sampling_timeout_s,
-            )
-            return result, identity
+        semaphore = self._sampling_semaphore_for_running_loop()
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            with self._use_sampler() as (sampler, identity):
+                native_sample = getattr(sampler, "sample_async", None)
+                if native_sample is None:
+                    raise RuntimeError(
+                        "The dedicated Fireworks sampler must expose sample_async()"
+                    )
+                for attempt in range(1, self.config.sampling_max_attempts + 1):
+                    try:
+                        result = await asyncio.wait_for(
+                            native_sample(
+                                prompt=prompt,
+                                num_samples=1,
+                                sampling_params=sampling_params,
+                            ),
+                            timeout=self.config.sampling_timeout_s,
+                        )
+                        return result, identity
+                    except TimeoutError:
+                        with self._usage_lock:
+                            self._sampling_timeouts += 1
+                        if attempt >= self.config.sampling_max_attempts:
+                            raise
+                        with self._usage_lock:
+                            self._sampling_retries += 1
+                        logger.warning(
+                            "Fireworks sampling timed out after {}s; retrying attempt {}/{}",
+                            self.config.sampling_timeout_s,
+                            attempt + 1,
+                            self.config.sampling_max_attempts,
+                        )
+                        if self.config.sampling_retry_backoff_s:
+                            await asyncio.sleep(self.config.sampling_retry_backoff_s)
+                raise AssertionError("Fireworks sampling retry loop was empty")
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
+    def _sampling_semaphore_for_running_loop(self) -> asyncio.Semaphore | None:
+        max_concurrency = self.config.sampling_max_concurrency
+        if max_concurrency is None:
+            return None
+        loop = asyncio.get_running_loop()
+        if self._sampling_semaphore is None:
+            self._sampling_semaphore = asyncio.Semaphore(max_concurrency)
+            self._sampling_semaphore_loop = loop
+        elif self._sampling_semaphore_loop is not loop:
+            raise RuntimeError("Fireworks sampling concurrency limiter cannot span event loops")
+        return self._sampling_semaphore
 
     async def sample_with_router_replay_async(
         self,
@@ -789,17 +836,43 @@ class FireworksRuntime:
 
         if not self.config.enable_router_replay:
             raise RuntimeError("Fireworks router replay is not enabled")
-        with self._use_sampler() as (sampler, identity):
-            native_sample = getattr(sampler, "sample_with_prompt_tokens", None)
-            if native_sample is None:
-                raise RuntimeError(
-                    "The Fireworks DeploymentSampler must expose " "sample_with_prompt_tokens() for router replay"
-                )
-            result = await asyncio.wait_for(
-                native_sample(prompt_token_ids, n=1, **sampling_kwargs),
-                timeout=self.config.sampling_timeout_s,
-            )
-            return result, identity
+        semaphore = self._sampling_semaphore_for_running_loop()
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            with self._use_sampler() as (sampler, identity):
+                native_sample = getattr(sampler, "sample_with_prompt_tokens", None)
+                if native_sample is None:
+                    raise RuntimeError(
+                        "The Fireworks DeploymentSampler must expose "
+                        "sample_with_prompt_tokens() for router replay"
+                    )
+                for attempt in range(1, self.config.sampling_max_attempts + 1):
+                    try:
+                        result = await asyncio.wait_for(
+                            native_sample(prompt_token_ids, n=1, **sampling_kwargs),
+                            timeout=self.config.sampling_timeout_s,
+                        )
+                        return result, identity
+                    except TimeoutError:
+                        with self._usage_lock:
+                            self._sampling_timeouts += 1
+                        if attempt >= self.config.sampling_max_attempts:
+                            raise
+                        with self._usage_lock:
+                            self._sampling_retries += 1
+                        logger.warning(
+                            "Fireworks route-aware sampling timed out after {}s; retrying attempt {}/{}",
+                            self.config.sampling_timeout_s,
+                            attempt + 1,
+                            self.config.sampling_max_attempts,
+                        )
+                        if self.config.sampling_retry_backoff_s:
+                            await asyncio.sleep(self.config.sampling_retry_backoff_s)
+                raise AssertionError("Fireworks route-aware sampling retry loop was empty")
+        finally:
+            if semaphore is not None:
+                semaphore.release()
 
     async def close(self, *, preserve_trainer: bool = False) -> None:
         """Drain active calls and close managed resources. Idempotent.

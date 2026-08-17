@@ -542,6 +542,90 @@ async def test_active_sample_spans_hotload_on_same_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sampling_concurrency_wait_does_not_consume_request_timeout() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    class SerialSampler(_Sampler):
+        async def sample_async(self, *, prompt, num_samples, sampling_params):
+            nonlocal calls
+            calls += 1
+            if prompt == "first":
+                first_started.set()
+                await release_first.wait()
+            else:
+                await asyncio.sleep(0.1)
+            return prompt
+
+    class SerialService(_Service):
+        def create_sampling_client(self, *, tokenizer):
+            sampler = SerialSampler()
+            self.samplers.append(sampler)
+            return sampler
+
+    runtime = _runtime(
+        service=SerialService(),
+        config=FireworksConfig(
+            sampling_timeout_s=0.2,
+            sampling_max_concurrency=1,
+        ),
+    )
+    await runtime.publish_sampler_weights()
+    first = asyncio.create_task(runtime.sample_async(prompt="first", sampling_params=None))
+    await first_started.wait()
+    second = asyncio.create_task(runtime.sample_async(prompt="second", sampling_params=None))
+
+    # The second call waits 0.15s for admission, then takes 0.1s to execute. Its
+    # total wall time exceeds 0.2s, but its active-request time does not.
+    await asyncio.sleep(0.15)
+    assert second.done() is False
+    release_first.set()
+
+    assert (await first)[0] == "first"
+    assert (await second)[0] == "second"
+    assert calls == 2
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_sampling_timeout_retries_only_the_failed_request() -> None:
+    calls = 0
+
+    class RetrySampler(_Sampler):
+        async def sample_async(self, *, prompt, num_samples, sampling_params):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.05)
+            return "recovered"
+
+    class RetryService(_Service):
+        def create_sampling_client(self, *, tokenizer):
+            sampler = RetrySampler()
+            self.samplers.append(sampler)
+            return sampler
+
+    runtime = _runtime(
+        service=RetryService(),
+        config=FireworksConfig(
+            sampling_timeout_s=0.01,
+            sampling_max_attempts=2,
+        ),
+    )
+    await runtime.publish_sampler_weights()
+
+    result, _ = await runtime.sample_async(prompt="prompt", sampling_params=None)
+
+    assert result == "recovered"
+    assert calls == 2
+    metrics = runtime.usage_metrics()
+    assert metrics["fireworks/usage/sampling_timeouts_total"] == 1
+    assert metrics["fireworks/usage/sampling_retries_total"] == 1
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_hotload_preserves_published_identity_and_client() -> None:
     class FailingService(_Service):
         def hotload_sampler_snapshot(self, path):

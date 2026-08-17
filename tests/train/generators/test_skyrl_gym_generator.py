@@ -15,7 +15,7 @@ from skyrl.train.generators.base import (
     GeneratorInput,
     GeneratorOutput,
 )
-from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator, TurnOutput
+from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator, TrajectoryOutput, TurnOutput
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 
 # Mock constants, where 4 is the eos token id
@@ -556,6 +556,48 @@ async def test_generate_interface_compliance(
 
         # This should not raise an error even with None env_extras
         assert validate_generator_input(input_batch_with_none), "Input with None env_extras should be valid"
+
+
+@pytest.mark.asyncio
+async def test_generate_retries_only_failed_trajectory_and_preserves_group_shape(
+    mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg
+):
+    generator_cfg.batched = False
+    generator_cfg.trajectory_max_attempts = 2
+    generator_cfg.trajectory_retry_backoff_s = 0
+    generator_cfg.generation_batch_timeout_s = 1
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+    recovered = TrajectoryOutput(
+        response_ids=[11, 12],
+        reward=1.0,
+        stop_reason="stop",
+        loss_mask=[1, 1],
+        prompt_ids=[1, 2],
+        rollout_logprobs=[-0.1, -0.2],
+        env_metrics={},
+        sampler_version=0,
+        e2e_time=0.1,
+        time_splits={"llm": 0.1, "env": 0.0},
+    )
+    generator.agent_loop = AsyncMock(side_effect=[TimeoutError(), recovered])
+    input_batch: GeneratorInput = {
+        "prompts": [[{"role": "user", "content": "prompt"}]],
+        "env_extras": [{"answer": "answer"}],
+        "env_classes": [mock_env_cfg.env_class],
+    }
+
+    output = await generator.generate(input_batch, disable_tqdm=True)
+
+    assert output["response_ids"] == [[11, 12]]
+    assert output["rewards"] == [1.0]
+    assert output["rollout_metrics"]["generate/num_trajectory_retries"] == 1
+    assert output["rollout_metrics"]["generate/num_trajectories_retried"] == 1
+    assert generator.agent_loop.await_count == 2
 
 
 @pytest.mark.asyncio

@@ -1229,6 +1229,16 @@ class GeneratorConfig(BaseConfig):
     The total size of the training batch is ``trainer.train_batch_size * n_samples_per_prompt``."""
     batched: bool = False
     """Use batched inference. Only applicable for single-turn generation."""
+    trajectory_max_attempts: int = 1
+    """Maximum attempts for one non-batched trajectory.
+
+    Successful trajectories are retained while only failed trajectories are
+    retried. ``1`` preserves the historical fail-fast behavior.
+    """
+    trajectory_retry_backoff_s: float = 0.0
+    """Delay before retrying a failed trajectory."""
+    generation_batch_timeout_s: Optional[float] = None
+    """Optional wall-clock deadline covering initial trajectory attempts and retries."""
     max_turns: int = 1
     """Maximum number of turns for multi-turn RL generation."""
     max_input_length: Optional[int] = None
@@ -1278,6 +1288,13 @@ class GeneratorConfig(BaseConfig):
     to collapse multi-turn step-wise sequences into single sequences before training."""
 
     def __post_init__(self):
+
+        if self.trajectory_max_attempts < 1:
+            raise ValueError("generator.trajectory_max_attempts must be >= 1")
+        if self.trajectory_retry_backoff_s < 0:
+            raise ValueError("generator.trajectory_retry_backoff_s must be >= 0")
+        if self.generation_batch_timeout_s is not None and self.generation_batch_timeout_s <= 0:
+            raise ValueError("generator.generation_batch_timeout_s must be positive when set")
 
         if self.eval_sampling_params is None:
             self.eval_sampling_params = SamplingParams(
@@ -1345,6 +1362,12 @@ class FireworksConfig(BaseConfig):
     """Maximum submitted model-input length."""
     request_timeout_s: int = 3600
     sampling_timeout_s: int = 600
+    sampling_max_concurrency: Optional[int] = None
+    """Maximum active rollout requests. Queued requests do not consume their sampling timeout."""
+    sampling_max_attempts: int = 1
+    """Maximum attempts for one Fireworks sampling request; retries only timeouts."""
+    sampling_retry_backoff_s: float = 0.0
+    """Delay before retrying a timed-out Fireworks sampling request."""
     trainer_timeout_s: int = 900
     trainer_inactivity_timeout_s: int = 300
     """Stop an orphaned trainer after this many seconds without activity.

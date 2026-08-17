@@ -307,6 +307,12 @@ def _validate_fireworks_cfg(cfg: SkyRLTrainConfig) -> None:
         )
     if fireworks.replica_count <= 0:
         raise ValueError("Dedicated Fireworks training requires replica_count > 0")
+    if fireworks.sampling_max_concurrency is not None and fireworks.sampling_max_concurrency <= 0:
+        raise ValueError("trainer.fireworks.sampling_max_concurrency must be positive when set")
+    if fireworks.sampling_max_attempts < 1:
+        raise ValueError("trainer.fireworks.sampling_max_attempts must be >= 1")
+    if fireworks.sampling_retry_backoff_s < 0:
+        raise ValueError("trainer.fireworks.sampling_retry_backoff_s must be >= 0")
     if fireworks.enable_router_replay != inference.enable_return_routed_experts:
         raise ValueError(
             "Fireworks router replay requires both "

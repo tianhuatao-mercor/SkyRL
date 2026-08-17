@@ -868,28 +868,54 @@ class SkyRLGymGenerator(GeneratorInterface):
             )
 
         # Async agent loop to generate trajectories in parallel.
-        tasks = []
-        for i in range(len(prompts)):
-            tasks.append(
-                self.agent_loop(
-                    prompts[i],
-                    env_classes[i],
-                    env_extras[i],
-                    max_tokens,
-                    max_input_length,
-                    sampling_params=sampling_params,
-                    trajectory_id=trajectory_ids[i] if trajectory_ids is not None else None,
-                    cache_salt=cache_salt,
-                )
-            )
+        async def _run_trajectory(index: int) -> tuple[TrajectoryOutput | StepWiseOutput, int]:
+            for attempt in range(1, self.generator_cfg.trajectory_max_attempts + 1):
+                try:
+                    output = await self.agent_loop(
+                        prompts[index],
+                        env_classes[index],
+                        env_extras[index],
+                        max_tokens,
+                        max_input_length,
+                        sampling_params=sampling_params,
+                        trajectory_id=trajectory_ids[index] if trajectory_ids is not None else None,
+                        cache_salt=cache_salt,
+                    )
+                    return output, attempt - 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if attempt >= self.generator_cfg.trajectory_max_attempts:
+                        raise
+                    logger.warning(
+                        "Trajectory {} failed with {}; retrying attempt {}/{}",
+                        index,
+                        type(exc).__name__,
+                        attempt + 1,
+                        self.generator_cfg.trajectory_max_attempts,
+                    )
+                    if self.generator_cfg.trajectory_retry_backoff_s:
+                        await asyncio.sleep(self.generator_cfg.trajectory_retry_backoff_s)
+            raise AssertionError("Trajectory retry loop was empty")
 
-        all_outputs = await tqdm.gather(
+        tasks = [_run_trajectory(i) for i in range(len(prompts))]
+        gather = tqdm.gather(
             *tasks,
             desc="Generating Trajectories",
             miniters=max(1, len(tasks) // 10),
             mininterval=5,
             disable=disable_tqdm,
         )
+        if self.generator_cfg.generation_batch_timeout_s is None:
+            results = await gather
+        else:
+            results = await asyncio.wait_for(
+                gather,
+                timeout=self.generator_cfg.generation_batch_timeout_s,
+            )
+        all_outputs = [output for output, _ in results]
+        trajectory_retry_count = sum(retries for _, retries in results)
+        trajectories_retried = sum(retries > 0 for _, retries in results)
         # Per-trajectory end-to-end generation times (one entry per prompt, preserving input order).
         # ``e2e_time`` is optional for agent loops; if any trajectory did not record it, we omit the
         # field entirely rather than emit a partially-populated list.
@@ -997,6 +1023,8 @@ class SkyRLGymGenerator(GeneratorInterface):
             trajectory_completion_times=trajectory_generation_times_per_prompt,
             trajectory_time_splits=trajectory_time_splits_per_prompt,
         )
+        rollout_metrics["generate/num_trajectory_retries"] = trajectory_retry_count
+        rollout_metrics["generate/num_trajectories_retried"] = trajectories_retried
 
         if self.generator_cfg.zero_reward_on_non_stop:
             # set reward to 0 if the stop reason is not "stop"
