@@ -162,6 +162,99 @@ def test_connect_uses_managed_dedicated_resources(monkeypatch) -> None:
     assert service.closed is True
 
 
+def test_connect_installs_required_chunk_ack_barrier(monkeypatch) -> None:
+    from fireworks.training.sdk import FiretitanServiceClient
+
+    class ManagedService(_Service):
+        def create_training_client(self, **kwargs):
+            del kwargs
+            return _TrainingClient()
+
+    service = ManagedService()
+    installed = []
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.configure_tinker_pyqwest_system_certs",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        FiretitanServiceClient,
+        "from_firetitan_config",
+        staticmethod(lambda **kwargs: service),
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.install_chunk_ack_barrier",
+        lambda client: installed.append(client) or SimpleNamespace(
+            metrics=lambda: {"fireworks/chunk_ack_barrier/operations_total": 0.0}
+        ),
+    )
+    config = FireworksConfig(
+        base_model="accounts/fireworks/models/qwen3-4b",
+        training_shape_id="accounts/fireworks/trainingShapes/qwen3-4b-minimum",
+        trainer_job_id="skyrl-required-ack-trainer",
+        deployment_id="skyrl-required-ack-rollout",
+        require_chunk_ack_barrier=True,
+    )
+
+    runtime = FireworksRuntime.connect(
+        config=config,
+        tokenizer="tokenizer",
+        tokenizer_model="Qwen/Qwen3-4B",
+        lora_rank=0,
+        lora_alpha=32,
+        learning_rate=1e-6,
+    )
+
+    assert installed == [runtime.training_client]
+    assert runtime.usage_metrics()[
+        "fireworks/chunk_ack_barrier/operations_total"
+    ] == 0.0
+
+
+def test_connect_cleans_up_when_required_chunk_ack_barrier_fails(monkeypatch) -> None:
+    from fireworks.training.sdk import FiretitanServiceClient
+
+    class ManagedService(_Service):
+        def create_training_client(self, **kwargs):
+            del kwargs
+            return _TrainingClient()
+
+    service = ManagedService()
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.configure_tinker_pyqwest_system_certs",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        FiretitanServiceClient,
+        "from_firetitan_config",
+        staticmethod(lambda **kwargs: service),
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.fireworks.runtime.install_chunk_ack_barrier",
+        lambda client: (_ for _ in ()).throw(RuntimeError("barrier rejected")),
+    )
+    config = FireworksConfig(
+        base_model="accounts/fireworks/models/qwen3-4b",
+        training_shape_id="accounts/fireworks/trainingShapes/qwen3-4b-minimum",
+        trainer_job_id="skyrl-rejected-ack-trainer",
+        deployment_id="skyrl-rejected-ack-rollout",
+        require_chunk_ack_barrier=True,
+    )
+
+    with pytest.raises(RuntimeError, match="barrier rejected"):
+        FireworksRuntime.connect(
+            config=config,
+            tokenizer="tokenizer",
+            tokenizer_model="Qwen/Qwen3-4B",
+            lora_rank=0,
+            lora_alpha=32,
+            learning_rate=1e-6,
+        )
+
+    assert service.closed is True
+
+
 def test_failed_close_preserves_trainer_but_still_closes_service() -> None:
     service = _Service()
     service._managed_handle = SimpleNamespace(cleanup_trainer_on_close=True)

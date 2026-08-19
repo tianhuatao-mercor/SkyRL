@@ -151,6 +151,48 @@ def test_binary_tv_custom_loss_matches_expected_loss_mask_and_gradients() -> Non
     )
 
 
+def test_binary_tv_custom_loss_scales_backward_but_preserves_raw_metric() -> None:
+    spec = _spec(
+        behavior_probs=[0.2, 0.2],
+        advantages=[2.0, -1.0],
+        loss_mask=[1.0, 1.0],
+    )
+    current = torch.log(torch.tensor([0.3, 0.1])).detach().requires_grad_()
+    loss_fn = make_binary_tv_dppo_loss(
+        [spec],
+        delta_low=0.15,
+        delta_high=0.15,
+        backward_loss_scale=4.0,
+    )
+
+    loss, metrics = loss_fn([SimpleNamespace()], [current])
+    loss.backward()
+
+    assert loss.item() == pytest.approx(4.0 * metrics["final_loss"])
+    assert metrics["dppo_backward_loss_scale"] == 4.0
+    assert metrics["dppo_scaled_final_loss"] == pytest.approx(loss.item())
+    assert current.grad is not None
+    expected_unscaled_grad = torch.tensor([-3.0, 0.5])
+    assert torch.allclose(current.grad, 4.0 * expected_unscaled_grad)
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
+def test_binary_tv_custom_loss_rejects_invalid_backward_scale(scale: float) -> None:
+    spec = _spec(
+        behavior_probs=[0.2],
+        advantages=[1.0],
+        loss_mask=[1.0],
+    )
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        make_binary_tv_dppo_loss(
+            [spec],
+            delta_low=0.15,
+            delta_high=0.15,
+            backward_loss_scale=scale,
+        )
+
+
 def test_binary_tv_custom_loss_uses_strict_delta_thresholds() -> None:
     spec = _spec(
         behavior_probs=[0.2, 0.2, 0.2, 0.2],

@@ -115,6 +115,13 @@ class FireworksPolicyDispatch:
                     "delta_low": dppo.delta_low,
                     "delta_high": dppo.delta_high,
                 }
+                backward_loss_scale = float(
+                    self.cfg.trainer.fireworks.dppo_backward_loss_scale
+                )
+                if backward_loss_scale != 1.0:
+                    dppo_builder_kwargs["backward_loss_scale"] = (
+                        backward_loss_scale
+                    )
                 if self.cfg.trainer.fireworks.enable_router_replay:
                     dppo_builder_kwargs["enable_router_replay"] = True
                 datums, custom_loss = self._dppo_request_builder(

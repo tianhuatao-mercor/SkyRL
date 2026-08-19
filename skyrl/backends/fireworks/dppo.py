@@ -134,6 +134,7 @@ def make_binary_tv_dppo_loss(
     *,
     delta_low: float,
     delta_high: float,
+    backward_loss_scale: float = 1.0,
 ) -> Callable[[list[Any], list[torch.Tensor]], tuple[torch.Tensor, dict[str, float]]]:
     """Return a Fireworks custom loss matching SkyRL binary-TV DPPO.
 
@@ -151,6 +152,8 @@ def make_binary_tv_dppo_loss(
         or delta_high < 0
     ):
         raise ValueError("DPPO delta thresholds must be finite and non-negative")
+    if not math.isfinite(backward_loss_scale) or backward_loss_scale <= 0:
+        raise ValueError("DPPO backward loss scale must be finite and positive")
 
     def loss_fn(
         data: list[Any],
@@ -276,7 +279,12 @@ def make_binary_tv_dppo_loss(
                 retained_ratio_histogram.count / trainable_tokens
             )
             metrics["rollout_train_approx_kl"] = approx_kl_sum / trainable_tokens
-        return total_loss, metrics
+        if backward_loss_scale != 1.0:
+            metrics["dppo_backward_loss_scale"] = float(backward_loss_scale)
+            metrics["dppo_scaled_final_loss"] = float(
+                total_loss.detach().item() * backward_loss_scale
+            )
+        return total_loss * backward_loss_scale, metrics
 
     return loss_fn
 
@@ -287,6 +295,7 @@ def build_tinker_binary_tv_dppo_request(
     max_seq_len: int | None,
     delta_low: float,
     delta_high: float,
+    backward_loss_scale: float = 1.0,
     enable_router_replay: bool = False,
 ) -> tuple[list[Any], Callable[..., tuple[torch.Tensor, dict[str, float]]]]:
     """Build target-token datums plus the aligned custom DPPO closure."""
@@ -322,4 +331,5 @@ def build_tinker_binary_tv_dppo_request(
         specs,
         delta_low=delta_low,
         delta_high=delta_high,
+        backward_loss_scale=backward_loss_scale,
     )

@@ -1380,6 +1380,14 @@ class FireworksConfig(BaseConfig):
     deployment_timeout_s: int = 900
     hotload_timeout_s: int = 600
     adam_eps: float = 1e-8
+    dppo_backward_loss_scale: float = 1.0
+    """Multiply only the backward DPPO loss sent to Fireworks.
+
+    The unscaled objective remains in ``final_loss`` telemetry. This explicit
+    diagnostic/mitigation knob should remain ``1.0`` for ordinary training.
+    """
+    require_chunk_ack_barrier: bool = False
+    """Fail closed unless SkyRL installs its version-gated chunk ACK barrier."""
     emit_grad_norm_metrics: Literal["off", "basic", "detailed"] = "basic"
     """Trainer-side optimizer gradient-norm telemetry.
 

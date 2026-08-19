@@ -246,6 +246,46 @@ def test_policy_dispatch_submits_binary_tv_dppo_custom_loss(monkeypatch) -> None
     )
 
 
+def test_policy_dispatch_passes_nondefault_dppo_backward_scale() -> None:
+    cfg = _cfg()
+    cfg.trainer.algorithm.policy_loss_type = "dppo"
+    cfg.trainer.fireworks.dppo_backward_loss_scale = 4.0
+    training_client = _TrainingClient()
+    runtime = SimpleNamespace(
+        training_client=training_client,
+        record_forward_backward=MagicMock(),
+    )
+    custom_loss = object()
+    built_kwargs = []
+
+    def dppo_request_builder(batch, **kwargs):
+        built_kwargs.append(kwargs)
+        return ["dppo-datum"] * batch.batch_size, custom_loss
+
+    dispatch = FireworksPolicyDispatch(
+        cfg,
+        runtime,
+        dppo_request_builder=dppo_request_builder,
+    )
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.arange(6).reshape(2, 3),
+            "attention_mask": torch.ones((2, 3), dtype=torch.bool),
+        }
+    )
+
+    dispatch.forward_backward_from_staged("policy", batch)
+
+    assert built_kwargs == [
+        {
+            "max_seq_len": 128,
+            "delta_low": cfg.trainer.algorithm.dppo.delta_low,
+            "delta_high": cfg.trainer.algorithm.dppo.delta_high,
+            "backward_loss_scale": 4.0,
+        }
+    ]
+
+
 def test_policy_dispatch_submits_native_dapo_with_old_policy_tis(monkeypatch) -> None:
     cfg = _cfg()
     cfg.trainer.algorithm.policy_loss_type = "dapo"

@@ -17,6 +17,7 @@ from typing import Any
 
 from loguru import logger
 
+from skyrl.backends.fireworks.chunk_ack import install_chunk_ack_barrier
 from skyrl.backends.tinker.runtime import configure_tinker_pyqwest_system_certs
 from skyrl.train.config import FireworksConfig
 
@@ -163,6 +164,7 @@ class FireworksRuntime:
         self._router_bytes_captured = 0
         self._router_rows_submitted = 0
         self._router_bytes_submitted = 0
+        self._chunk_ack_barrier_stats: Any | None = None
 
     @classmethod
     def connect(
@@ -249,7 +251,7 @@ class FireworksRuntime:
             _disable_managed_trainer_deletion(service)
             _close_quietly(service)
             raise
-        return cls(
+        runtime = cls(
             service=service,
             training_client=training_client,
             tokenizer=tokenizer,
@@ -257,6 +259,15 @@ class FireworksRuntime:
             started_monotonic=started_monotonic,
             started_at_utc=started_at_utc,
         )
+        if config.require_chunk_ack_barrier:
+            try:
+                runtime._chunk_ack_barrier_stats = install_chunk_ack_barrier(
+                    training_client
+                )
+            except BaseException:
+                _close_quietly(service)
+                raise
+        return runtime
 
     @property
     def trainer_job_id(self) -> str | None:
@@ -529,6 +540,8 @@ class FireworksRuntime:
                     self._router_bytes_submitted
                 ),
             }
+        if self._chunk_ack_barrier_stats is not None:
+            metrics.update(self._chunk_ack_barrier_stats.metrics())
         trainer_gpus_per_replica = self.config.billing_trainer_gpus_per_replica
         rollout_gpus_per_replica = self.config.billing_rollout_gpus_per_replica
         gpu_price = self.config.billing_gpu_price_per_hour_usd
