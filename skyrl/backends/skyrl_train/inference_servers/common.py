@@ -5,6 +5,7 @@ Uses Ray's public network utilities for consistency with Ray's cluster managemen
 """
 
 import logging
+import os
 import socket
 from dataclasses import dataclass
 from typing import Tuple
@@ -58,6 +59,21 @@ def get_node_ip() -> str:
     Returns the node IP from Ray's global worker if Ray is initialized
     """
     return ray.util.get_node_ip_address()
+
+
+def get_inference_bind_host() -> str:
+    """Return the address used by local inference HTTP servers.
+
+    The default preserves the existing all-interface behavior.  Operators can
+    opt into a narrower boundary (for example ``127.0.0.1`` for a single-node
+    colocated run) without changing application configuration.
+    """
+    return os.environ.get("SKYRL_INFERENCE_BIND_HOST", "0.0.0.0")
+
+
+def get_inference_advertise_host() -> str:
+    """Return the inference address advertised to local SkyRL clients."""
+    return os.environ.get("SKYRL_INFERENCE_ADVERTISE_HOST") or get_node_ip()
 
 
 def get_open_port(start_port: int | None = None) -> int:

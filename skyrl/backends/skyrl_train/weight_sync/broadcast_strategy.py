@@ -5,6 +5,10 @@ from training workers to inference engines using NCCL/Gloo broadcast operations.
 """
 
 import asyncio
+import json
+import logging
+import math
+import os
 import socket
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -24,6 +28,8 @@ from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
     WeightTransferSender,
     WeightTransferStrategy,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -112,6 +118,41 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         self._init_info = init_info
         self._model_update_group = model_update_group
         self._inference_client = inference_client
+        self._completed_transfers = 0
+
+    def _record_completed_transfer(self, weight_metadata: Dict[str, list]) -> None:
+        result_dir = os.environ.get("SKYRL_QUAL_RESULT_DIR")
+        if not result_dir:
+            return
+        names = weight_metadata["names"]
+        dtype_names = weight_metadata["dtype_names"]
+        shapes = weight_metadata["shapes"]
+        if not (len(names) == len(dtype_names) == len(shapes)):
+            raise RuntimeError("weight metadata arrays differ in length")
+        total_bytes = 0
+        for dtype_name, shape in zip(dtype_names, shapes):
+            dtype = getattr(torch, str(dtype_name).removeprefix("torch."))
+            total_bytes += math.prod(int(size) for size in shape) * torch.empty((), dtype=dtype).element_size()
+        self._completed_transfers += 1
+        record = {
+            "backend": "nccl",
+            "completed_after_finish_weight_update": True,
+            "tensor_bytes": total_bytes,
+            "tensor_count": len(names),
+            "transfer_index": self._completed_transfers,
+        }
+        path = os.path.join(result_dir, f"weight-sync-transfer-{self._completed_transfers}.json")
+        with open(path, "x", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        logger.info(
+            "SKYRL_WEIGHT_SYNC_TRANSFER_COMPLETE index=%s tensors=%s bytes=%s",
+            self._completed_transfers,
+            len(names),
+            total_bytes,
+        )
 
     async def send_chunks(
         self,
@@ -175,6 +216,7 @@ class BroadcastWeightTransferSender(WeightTransferSender):
             await update_task
 
             await self._inference_client.finish_weight_update()
+            self._record_completed_transfer(weight_metadata)
         else:
             # Non-rank-0 still needs to participate in the all-gather
             for _ in weight_iterator():
@@ -218,7 +260,7 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
         # Use world_size reported by the inference servers (+1 for trainer rank 0).
         world_size = inference_world_size + 1
 
-        master_addr = ray._private.services.get_node_ip_address()
+        master_addr = os.environ.get("SKYRL_WEIGHT_SYNC_MASTER_ADDR") or ray._private.services.get_node_ip_address()
         with socket.socket() as sock:
             sock.bind(("", 0))
             master_port = sock.getsockname()[1]

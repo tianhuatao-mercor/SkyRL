@@ -32,7 +32,10 @@ def test_process_exit_raises_runtime_error():
     mock_process.is_alive.return_value = False
     mock_process.exitcode = 1
 
-    with patch("skyrl.backends.skyrl_train.inference_servers.vllm_router.get_node_ip", return_value="127.0.0.1"):
+    with patch(
+        "skyrl.backends.skyrl_train.inference_servers.vllm_router.get_inference_advertise_host",
+        return_value="127.0.0.1",
+    ):
         with patch.object(router, "_process", mock_process):
             # Bypass actual process start; just test health check failure path
             router._process = mock_process
@@ -111,6 +114,14 @@ class TestBuildRouterArgs:
         assert args.port == 30000
         assert args.policy == "consistent_hash"
         assert args.vllm_pd_disaggregation is False
+
+    def test_bind_host_from_environment(self, monkeypatch):
+        monkeypatch.setenv("SKYRL_INFERENCE_BIND_HOST", "127.0.0.1")
+        cfg = SkyRLTrainConfig()
+        ie_cfg = cfg.generator.inference_engine
+        with patch("skyrl.backends.skyrl_train.inference_servers.common.get_open_port", return_value=30000):
+            args = build_router_args(ie_cfg, server_urls=["http://127.0.0.1:8000"])
+        assert args.host == "127.0.0.1"
 
     def test_pd_mode(self):
         cfg = SkyRLTrainConfig()

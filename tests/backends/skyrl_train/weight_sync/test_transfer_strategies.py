@@ -1,8 +1,11 @@
+import json
+
 import pytest
 
 from skyrl.backends.skyrl_train.weight_sync import (
     BroadcastInitInfo,
     BroadcastTransferStrategy,
+    BroadcastWeightTransferSender,
     BroadcastWeightUpdateRequest,
     CudaIpcInitInfo,
     CudaIpcTransferStrategy,
@@ -103,6 +106,32 @@ class TestCreateInitInfo:
         init_info = BroadcastTransferStrategy.create_init_info(ie_cfg, inference_world_size=1)
 
         assert init_info.override_existing_receiver is False
+
+    def test_broadcast_create_init_info_uses_master_address_override(self, monkeypatch):
+        ie_cfg = self._make_ie_cfg()
+        monkeypatch.setenv("SKYRL_WEIGHT_SYNC_MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setattr("ray._private.services.get_node_ip_address", lambda: "10.0.0.7")
+
+        init_info = BroadcastTransferStrategy.create_init_info(ie_cfg, inference_world_size=1)
+
+        assert init_info.master_addr == "127.0.0.1"
+
+    def test_broadcast_completed_transfer_evidence(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SKYRL_QUAL_RESULT_DIR", str(tmp_path))
+        sender = BroadcastWeightTransferSender(None, None, None)
+
+        sender._record_completed_transfer(
+            {
+                "names": ["a", "b"],
+                "dtype_names": ["bfloat16", "float32"],
+                "shapes": [[2, 3], [4]],
+            }
+        )
+
+        record = json.loads((tmp_path / "weight-sync-transfer-1.json").read_text())
+        assert record["tensor_count"] == 2
+        assert record["tensor_bytes"] == 28
+        assert record["completed_after_finish_weight_update"] is True
 
     def test_delta_create_init_info(self):
         ie_cfg = self._make_ie_cfg(weight_sync_backend="delta", run_engines_locally=False)

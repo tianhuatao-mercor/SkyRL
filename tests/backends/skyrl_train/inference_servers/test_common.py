@@ -11,6 +11,8 @@ from skyrl.backends.skyrl_train.inference_servers.common import (
     compute_dp_master_port,
     dp_tcpstore_probe_window,
     find_and_reserve_port,
+    get_inference_advertise_host,
+    get_inference_bind_host,
     get_node_ip,
     get_open_port,
 )
@@ -26,6 +28,26 @@ class TestGetIp:
         assert len(ip) > 0
         assert ip != ""
         assert "." in ip or ":" in ip
+
+
+class TestInferenceHosts:
+    def test_defaults_preserve_existing_behavior(self, monkeypatch):
+        monkeypatch.delenv("SKYRL_INFERENCE_BIND_HOST", raising=False)
+        monkeypatch.delenv("SKYRL_INFERENCE_ADVERTISE_HOST", raising=False)
+        monkeypatch.setattr(
+            "skyrl.backends.skyrl_train.inference_servers.common.get_node_ip",
+            lambda: "10.0.0.7",
+        )
+
+        assert get_inference_bind_host() == "0.0.0.0"
+        assert get_inference_advertise_host() == "10.0.0.7"
+
+    def test_loopback_overrides(self, monkeypatch):
+        monkeypatch.setenv("SKYRL_INFERENCE_BIND_HOST", "127.0.0.1")
+        monkeypatch.setenv("SKYRL_INFERENCE_ADVERTISE_HOST", "127.0.0.1")
+
+        assert get_inference_bind_host() == "127.0.0.1"
+        assert get_inference_advertise_host() == "127.0.0.1"
 
 
 class TestGetOpenPort:
