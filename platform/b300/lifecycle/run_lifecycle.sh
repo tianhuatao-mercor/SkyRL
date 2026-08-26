@@ -62,12 +62,14 @@ checkpoint_dir="$CHECKPOINT_ROOT/$run_id/checkpoints"
 export_dir="$CHECKPOINT_ROOT/$run_id/exports"
 result_dir="$qual_dir/results"
 infra_log_dir="$qual_dir/inference"
-scratch_dir="/opt/dlami/nvme/cache/l/${run_id:0:15}"
+scratch_parent="/opt/dlami/nvme/cache/tmp/sl"
+scratch_dir="$scratch_parent/${run_id:0:15}"
 container_name="b300-skyrl-$run_id"
 
 for path in "$qual_dir" "$CHECKPOINT_ROOT/$run_id" "$scratch_dir"; do
   [[ ! -e "$path" ]] || die "refusing to reuse existing run path: $path"
 done
+[[ -d /opt/dlami/nvme/cache/tmp && -w /opt/dlami/nvme/cache/tmp ]] || die "local NVMe cache/tmp root is not user-writable"
 [[ -z $(docker ps -aq --filter "name=^/${container_name}$") ]] || die "container name already exists"
 
 mkdir -p "$result_dir" "$infra_log_dir" "$checkpoint_dir" "$export_dir" "$scratch_dir"/{h,t,r,xdg,triton,vllm}
