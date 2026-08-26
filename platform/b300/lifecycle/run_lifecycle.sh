@@ -372,7 +372,7 @@ docker_args=(
   --mount type=bind,src=/shared,dst=/shared,readonly
   --mount "type=bind,src=$qual_dir,dst=$qual_dir"
   --mount "type=bind,src=$CHECKPOINT_ROOT/$run_id,dst=$CHECKPOINT_ROOT/$run_id"
-  --mount "type=bind,src=$scratch_dir,dst=$scratch_dir"
+  --mount "type=bind,src=$scratch_dir,dst=/c"
   --mount "type=bind,src=$payload_dir/platform/b300/lifecycle/qualification_entrypoint.py,dst=/opt/qualification/qualification_entrypoint.py,readonly"
   --mount "type=bind,src=$payload_dir/skyrl/backends/skyrl_train/inference_servers/common.py,dst=/workspace/SkyRL/skyrl/backends/skyrl_train/inference_servers/common.py,readonly"
   --mount "type=bind,src=$payload_dir/skyrl/backends/skyrl_train/inference_servers/utils.py,dst=/workspace/SkyRL/skyrl/backends/skyrl_train/inference_servers/utils.py,readonly"
@@ -402,12 +402,12 @@ docker_args=(
   --env NCCL_DEBUG=INFO
   --env NCCL_DEBUG_SUBSYS=INIT,NET,ENV
   --env "NCCL_DEBUG_FILE=$qual_dir/nccl-%h-%p.log"
-  --env "HOME=$scratch_dir/h"
-  --env "TMPDIR=$scratch_dir/t"
-  --env "RAY_TMPDIR=$scratch_dir/r"
-  --env "XDG_CACHE_HOME=$scratch_dir/xdg"
-  --env "TRITON_CACHE_DIR=$scratch_dir/triton"
-  --env "VLLM_CACHE_ROOT=$scratch_dir/vllm"
+  --env HOME=/c/h
+  --env TMPDIR=/c/t
+  --env RAY_TMPDIR=/c/r
+  --env XDG_CACHE_HOME=/c/xdg
+  --env TRITON_CACHE_DIR=/c/triton
+  --env VLLM_CACHE_ROOT=/c/vllm
 )
 while IFS= read -r device; do
   docker_args+=(--device "$device:$device")
