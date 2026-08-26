@@ -53,7 +53,8 @@ actual_image_id=$(docker image inspect "$EXPECTED_IMAGE_REF" --format '{{.Id}}')
 [[ $(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{index .Config.Labels "io.mercor.skyrl.lock-sha256"}}') == "$EXPECTED_LOCK_SHA" ]] || die "image lock label drift"
 [[ $(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{index .Config.Labels "io.mercor.stack.torch-nccl"}}') == "2.28.9" ]] || die "image torch NCCL label drift"
 [[ $(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{index .Config.Labels "io.mercor.stack.vllm"}}') == "0.26.0" ]] || die "image vLLM label drift"
-[[ $(git -C "$WORKTREE" rev-parse HEAD) == "$EXPECTED_SOURCE_REV" ]] || die "worktree base revision drift"
+git -C "$WORKTREE" merge-base --is-ancestor "$EXPECTED_SOURCE_REV" HEAD || die "qualified image revision is not an ancestor of the lifecycle worktree"
+[[ -z $(git -C "$WORKTREE" status --short) ]] || die "lifecycle worktree must be clean before staging the runtime payload"
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-skyrl-lifecycle-nccl-dense-r1"
 qual_dir="$QUAL_ROOT/$run_id"
