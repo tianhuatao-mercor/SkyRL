@@ -36,3 +36,17 @@ both wrapped `model.*` state and Megatron-Core's direct `embedding.*` plus
 `decoder.*` distributed-checkpoint layout; `--output` permits a verification
 record to be written to a separate audit directory without mutating a frozen
 source run.
+
+After the lifecycle passes, independently reload its frozen step-1 Hugging Face
+export in a fresh, one-GPU vLLM process and replay the two recorded greedy eval
+prompts:
+
+```bash
+platform/b300/lifecycle/run_fresh_vllm_replay.sh --execute --gpu 0
+```
+
+This follow-up does not train or synchronize weights. It verifies the source
+run and checkpoint checksums before GPU allocation, mounts `/shared` read-only,
+binds vLLM only to loopback, requires exact response token IDs on two replay
+passes, bounds aligned logprob drift to `2e-3`, proves cleanup, and freezes a
+separate evidence directory for the fresh process.
