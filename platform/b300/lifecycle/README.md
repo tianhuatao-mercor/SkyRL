@@ -30,4 +30,9 @@ The hard runtime bound is 30 minutes. PASS requires two accounted NCCL
 transfers, weight versions 1 then 2, a finite nonzero policy gradient, changed
 trainer parameters, post-update inference above the measured unchanged-weight
 noise floor, a complete step-1 checkpoint, and run-owned cleanup. Evidence and
-checkpoint paths are made read-only after final checksums are written.
+checkpoint paths are made read-only after final checksums are written. Failed
+attempts are also checksummed and frozen by the exit trap. The verifier accepts
+both wrapped `model.*` state and Megatron-Core's direct `embedding.*` plus
+`decoder.*` distributed-checkpoint layout; `--output` permits a verification
+record to be written to a separate audit directory without mutating a frozen
+source run.

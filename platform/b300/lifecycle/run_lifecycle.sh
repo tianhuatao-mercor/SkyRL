@@ -122,6 +122,18 @@ on_exit() {
     cleanup_owned_container || true
     snapshot post-failure || true
     printf '{"exit_code":%d,"status":"FAIL"}\n' "$rc" >"$qual_dir/launcher-result.json" 2>/dev/null || true
+    if [[ -d "$CHECKPOINT_ROOT/$run_id" ]]; then
+      (
+        cd "$CHECKPOINT_ROOT/$run_id"
+        find . -type f -print0 | sort -z | xargs -0 -r sha256sum
+      ) >"$qual_dir/checkpoint-files.sha256" 2>/dev/null || true
+    fi
+    (
+      cd "$qual_dir"
+      find . -type f ! -name EVIDENCE.sha256 -print0 | sort -z | xargs -0 -r sha256sum
+    ) >"$qual_dir/EVIDENCE.sha256" 2>/dev/null || true
+    chmod -R a-w "$qual_dir" "$CHECKPOINT_ROOT/$run_id" 2>/dev/null || true
+    finalized=true
   fi
 }
 trap on_exit EXIT
@@ -465,6 +477,7 @@ ps -eo comm=,args= | awk '
   --post-containers "$qual_dir/post-containers.txt" \
   --post-processes "$qual_dir/post-processes.txt" \
   --run-id "$run_id" \
+  2> >(tee "$qual_dir/artifact-verification.stderr" >&2) \
   | tee "$qual_dir/artifact-verification.stdout"
 
 (

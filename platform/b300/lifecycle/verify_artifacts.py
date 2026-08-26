@@ -216,6 +216,41 @@ def _positive_grad_norm(metrics: dict) -> tuple[str, float]:
     return max(finite_positive, key=lambda item: item[1])
 
 
+def _checkpoint_state_layout(sharded_keys: set[str], common_state: dict) -> dict[str, object]:
+    if not sharded_keys:
+        raise RuntimeError("checkpoint sharded state is empty")
+    if not isinstance(common_state, dict):
+        raise RuntimeError(f"checkpoint common state is not a mapping: {type(common_state).__name__}")
+
+    sharded_roots = {key.split(".", 1)[0] for key in sharded_keys}
+    common_roots = set(common_state)
+    all_roots = sharded_roots | common_roots
+    required_non_model = {"optimizer", "lr_scheduler", "rng"}
+    if not required_non_model.issubset(all_roots):
+        raise RuntimeError(
+            f"checkpoint non-model state is incomplete: expected {required_non_model}, found {all_roots}"
+        )
+
+    if "model" in sharded_roots:
+        model_layout = "wrapped_model"
+    elif {"embedding", "decoder"}.issubset(sharded_roots):
+        # Megatron-Core distributed checkpoints store GPT model roots directly
+        # when the model is not wrapped in a top-level state-dict key.
+        model_layout = "megatron_gpt_split"
+    else:
+        raise RuntimeError(
+            "checkpoint model state is incomplete: expected sharded root 'model' "
+            f"or Megatron roots {{'embedding', 'decoder'}}, found {sharded_roots}"
+        )
+
+    return {
+        "common_top_level": sorted(common_roots),
+        "model_layout": model_layout,
+        "sharded_top_level": sorted(sharded_roots),
+        "top_level": sorted(all_roots),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--result-dir", type=Path, required=True)
@@ -226,6 +261,11 @@ def main() -> None:
     parser.add_argument("--post-containers", type=Path, required=True)
     parser.add_argument("--post-processes", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the verification record outside result-dir for an immutable after-the-fact audit",
+    )
     args = parser.parse_args()
 
     checks: dict[str, object] = {}
@@ -327,10 +367,7 @@ def main() -> None:
     metadata = FileSystemReader(str(policy_dir)).read_metadata()
     sharded_keys = set(metadata.state_dict_metadata)
     common_state = torch.load(policy_dir / "common.pt", map_location="cpu", weights_only=False)
-    top_level = {key.split(".", 1)[0] for key in sharded_keys} | set(common_state)
-    required_state = {"model", "optimizer", "lr_scheduler", "rng"}
-    if not required_state.issubset(top_level):
-        raise RuntimeError(f"checkpoint state is incomplete: expected {required_state}, found {top_level}")
+    state_layout = _checkpoint_state_layout(sharded_keys, common_state)
     data_state = torch.load(step_dir / "data.pt", map_location="cpu", weights_only=False)
     trainer_state = torch.load(step_dir / "trainer_state.pt", map_location="cpu", weights_only=False)
     if not isinstance(data_state, dict) or not data_state:
@@ -346,7 +383,11 @@ def main() -> None:
     latest = (args.checkpoint_dir / "latest_ckpt_global_step.txt").read_text(encoding="utf-8").strip()
     if latest != "1":
         raise RuntimeError(f"unexpected latest checkpoint step: {latest!r}")
-    checks["checkpoint"] = {"global_step": 1, "required_components": [str(path) for path in required]}
+    checks["checkpoint"] = {
+        "global_step": 1,
+        "required_components": [str(path) for path in required],
+        "state_layout": state_layout,
+    }
 
     if args.post_gpu_processes.read_text(encoding="utf-8").strip():
         raise RuntimeError("GPU compute processes remain after shutdown")
@@ -376,7 +417,7 @@ def main() -> None:
     checks["log_markers"] = required_markers
 
     result = {"checks": checks, "status": "PASS"}
-    _atomic_json(args.result_dir / "artifact-verification.json", result)
+    _atomic_json(args.output or args.result_dir / "artifact-verification.json", result)
     print(json.dumps(result, sort_keys=True))
 
 
