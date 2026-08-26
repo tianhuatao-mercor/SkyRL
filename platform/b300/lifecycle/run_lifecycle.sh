@@ -141,7 +141,8 @@ done
 
 ps -eo comm=,args= | awk '
   $1 == "raylet" || $1 == "gcs_server" ||
-  $0 ~ /ray::/ || $0 ~ /vllm\.entrypoints/ || $0 ~ /qualification_entrypoint\.py/ {print}
+  (($1 == "python" || $1 == "python3") &&
+  ($0 ~ /ray::/ || $0 ~ /vllm\.entrypoints/ || $0 ~ /qualification_entrypoint\.py/)) {print}
 ' >"$qual_dir/pre-conflicting-processes.txt"
 [[ ! -s "$qual_dir/pre-conflicting-processes.txt" ]] || die "conflicting Ray/vLLM/SkyRL processes exist before launch"
 [[ -z $(docker ps -aq --filter "label=io.mercor.qualification.owner=$OWNER_LABEL") ]] || die "another lifecycle container exists"
@@ -449,7 +450,8 @@ done
 [[ -z $(docker ps -aq --filter "label=io.mercor.qualification.run-id=$run_id") ]] || die "run-owned container remains after shutdown"
 ps -eo comm=,args= | awk '
   $1 == "raylet" || $1 == "gcs_server" ||
-  $0 ~ /ray::/ || $0 ~ /vllm\.entrypoints/ || $0 ~ /qualification_entrypoint\.py/ {print}
+  (($1 == "python" || $1 == "python3") &&
+  ($0 ~ /ray::/ || $0 ~ /vllm\.entrypoints/ || $0 ~ /qualification_entrypoint\.py/)) {print}
 ' >"$qual_dir/post-conflicting-processes.txt"
 [[ ! -s "$qual_dir/post-conflicting-processes.txt" ]] || die "run-owned Ray/vLLM/SkyRL processes remain after shutdown"
 
