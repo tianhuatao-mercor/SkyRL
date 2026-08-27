@@ -70,10 +70,8 @@ infra_log_dir="$qual_dir/inference"
 scratch_prefix="/opt/dlami/nvme/cache/tmp/sl/${run_id:0:15}"
 head_scratch="${scratch_prefix}-h"
 worker_scratch="${scratch_prefix}-w"
-driver_scratch="${scratch_prefix}-d"
 head_name="b300-skyrl-$run_id-head"
 worker_name="b300-skyrl-$run_id-worker"
-driver_name="b300-skyrl-$run_id-driver"
 
 for path in "$qual_dir" "$checkpoint_root"; do
   [[ ! -e "$path" ]] || die "refusing to reuse existing run path: $path"
@@ -82,7 +80,6 @@ mkdir -p "$result_dir" "$infra_log_dir" "$checkpoint_dir" "$export_dir" "$qual_d
 
 head_container_id=""
 worker_container_id=""
-driver_container_id=""
 finalized=false
 
 capture_node_snapshot() {
@@ -146,8 +143,6 @@ cleanup_one() {
 
 cleanup_all() {
   local rc=0
-  cleanup_one "$HEAD_ALIAS" driver "$driver_container_id" "$driver_name" || rc=1
-  driver_container_id=""
   cleanup_one "$WORKER_ALIAS" worker "$worker_container_id" "$worker_name" || rc=1
   worker_container_id=""
   cleanup_one "$HEAD_ALIAS" head "$head_container_id" "$head_name" || rc=1
@@ -373,7 +368,7 @@ SKYRL_CONFIG_PREFLIGHT_ONLY=1 \
   /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
   "$qual_dir/recipe/qualification_entrypoint.py" "${cmd[@]:2}"
 
-for spec in "$HEAD_ALIAS:$head_scratch" "$WORKER_ALIAS:$worker_scratch" "$HEAD_ALIAS:$driver_scratch"; do
+for spec in "$HEAD_ALIAS:$head_scratch" "$WORKER_ALIAS:$worker_scratch"; do
   host=${spec%%:*}
   scratch=${spec#*:}
   [[ $(node_exec "$host" bash -lc 'test -w /opt/dlami/nvme/cache/tmp && printf yes') == yes ]] || die "NVMe cache root is not writable on $host"
@@ -515,8 +510,9 @@ done
 
 node_exec "$HEAD_ALIAS" docker exec "$head_container_id" /opt/venvs/skyrl-megatron/bin/ray status "--address=$HEAD_IP:$RAY_PORT" >"$qual_dir/ray-status-pre-driver.txt"
 
-driver_container_id=$(create_container \
-  "$HEAD_ALIAS" driver "$driver_name" "$HEAD_GPU" "$driver_scratch" \
+driver_exec=(
+  docker exec
+  "$head_container_id"
   env \
   "HOME=/c/h-driver" \
   "RAY_ADDRESS=$HEAD_IP:$RAY_PORT" \
@@ -529,25 +525,24 @@ driver_container_id=$(create_container \
   "SKYRL_QUAL_ROLLOUT_RESOURCE=$ROLLOUT_RESOURCE" \
   "SKYRL_QUAL_EXPECTED_RAY_NODE_IPS=$HEAD_IP,$WORKER_IP" \
   SKYRL_RAY_PG_TIMEOUT_IN_S=180 \
-  "${cmd[@]}")
-verify_container_identity "$HEAD_ALIAS" "$driver_container_id" "$driver_name" || die "driver container identity mismatch"
-node_exec "$HEAD_ALIAS" docker inspect "$driver_container_id" >"$qual_dir/container-prestart-driver.json"
+  "${cmd[@]}"
+)
+printf '%s\0' "${driver_exec[@]}" | jq -Rs 'split("\u0000")[:-1]' >"$qual_dir/docker-exec-driver.json"
+node_exec "$HEAD_ALIAS" docker inspect "$head_container_id" >"$qual_dir/container-pre-driver-head.json"
+printf -v driver_remote_command '%q ' "${driver_exec[@]}"
 
 set +e
 timeout --foreground --signal=TERM --kill-after=60s 1800s \
-  ssh "${SSH_OPTIONS[@]}" "$HEAD_ALIAS" "docker start --attach '$driver_container_id'" 2>&1 |
+  ssh "${SSH_OPTIONS[@]}" "$HEAD_ALIAS" "$driver_remote_command" 2>&1 |
   tee "$qual_dir/attached.log"
 driver_start_rc=${PIPESTATUS[0]}
 set -e
-node_exec "$HEAD_ALIAS" docker inspect "$driver_container_id" >"$qual_dir/container-postexit-driver.json"
-driver_exit_code=$(node_exec "$HEAD_ALIAS" docker inspect "$driver_container_id" --format '{{.State.ExitCode}}')
 
 cleanup_all
 capture_node_snapshot "$HEAD_ALIAS" post
 capture_node_snapshot "$WORKER_ALIAS" post
 
 [[ "$driver_start_rc" -eq 0 ]] || die "bounded driver failed or timed out: rc=$driver_start_rc"
-[[ "$driver_exit_code" -eq 0 ]] || die "driver container exit code was $driver_exit_code"
 
 for host in "$HEAD_ALIAS" "$WORKER_ALIAS"; do
   jq -e '.gpu_processes|length==0' "$qual_dir/post-$host-snapshot.json" >/dev/null || die "GPU processes remain on $host"
@@ -598,8 +593,7 @@ jq -n \
   --arg worker "$WORKER_ALIAS:$WORKER_GPUS" \
   --arg head_scratch "$head_scratch" \
   --arg worker_scratch "$worker_scratch" \
-  --arg driver_scratch "$driver_scratch" \
-  '{container_exit_code:0,driver_gpu:$head,driver_scratch_preserved:$driver_scratch,head_scratch_preserved:$head_scratch,inference_gpus:$worker,num_engines:2,num_nodes:2,run_id:$run_id,status:"PASS",worker_scratch_preserved:$worker_scratch}' \
+  '{driver_exit_code:0,driver_gpu:$head,head_scratch_preserved:$head_scratch,inference_gpus:$worker,num_engines:2,num_nodes:2,run_id:$run_id,status:"PASS",worker_scratch_preserved:$worker_scratch}' \
   >"$qual_dir/launcher-result.json"
 
 freeze_evidence

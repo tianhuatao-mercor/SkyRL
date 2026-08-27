@@ -113,10 +113,11 @@ platform/b300/lifecycle/run_multinode_lifecycle.sh \
   --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4
 ```
 
-The launcher owns exactly three labeled containers (Ray head, Ray worker, and
-driver), advertises only three GPUs to the transient Ray cluster, hard-limits
-the driver to 30 minutes, and freezes both successful and failed evidence. PASS
-requires the original lifecycle assertions, exact two-node placement evidence,
-cross-node trainer-to-vLLM synchronization over EFA, and clean teardown on both
-nodes. Local NVMe scratch paths are preserved and recorded rather than broadly
-cleaned.
+The launcher owns exactly two labeled containers (Ray head and Ray worker) and
+executes the bounded driver inside the head container so Ray can resolve its
+local node unambiguously. It advertises only three GPUs to the transient Ray
+cluster, hard-limits the driver to 30 minutes, and freezes both successful and
+failed evidence. PASS requires the original lifecycle assertions, exact
+two-node placement evidence, cross-node trainer-to-vLLM synchronization over
+EFA, and clean teardown on both nodes. Local NVMe scratch paths are preserved
+and recorded rather than broadly cleaned.
