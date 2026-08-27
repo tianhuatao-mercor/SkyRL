@@ -121,3 +121,20 @@ failed evidence. PASS requires the original lifecycle assertions, exact
 two-node placement evidence, cross-node trainer-to-vLLM synchronization over
 EFA, and clean teardown on both nodes. Local NVMe scratch paths are preserved
 and recorded rather than broadly cleaned.
+
+After that gate passes, the matching two-node resume gate accepts only its
+frozen step-1 checkpoint, starts fresh Ray/container state, advances exactly
+one optimizer step, and repeats the placement, EFA, source-integrity, export-
+identity, inference-change, and cleanup assertions:
+
+```bash
+platform/b300/lifecycle/run_multinode_lifecycle.sh \
+  --execute \
+  --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4 \
+  --resume-from /shared/checkpoints/qualifications/20260827T011849Z-skyrl-lifecycle-2node-2eng-r1/checkpoints/global_step_1
+```
+
+The source evidence and checkpoint trees are verified before, after, and after
+artifact verification. The same recorded end-of-epoch boundary workaround is
+required, while all inference URLs remain private VPC addresses and both exact
+containers remain run-owned and bounded by the launcher's cleanup trap.

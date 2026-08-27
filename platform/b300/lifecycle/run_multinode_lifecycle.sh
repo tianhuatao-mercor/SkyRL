@@ -25,6 +25,12 @@ readonly WORKER_GPUS="0,1"
 readonly RAY_PORT="6387"
 readonly DRIVER_RESOURCE="b300_lifecycle_driver"
 readonly ROLLOUT_RESOURCE="b300_lifecycle_rollout"
+readonly RESUME_SOURCE_RUN_ID="20260827T011849Z-skyrl-lifecycle-2node-2eng-r1"
+readonly RESUME_SOURCE_QUAL="$QUAL_ROOT/$RESUME_SOURCE_RUN_ID"
+readonly RESUME_SOURCE_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/$RESUME_SOURCE_RUN_ID"
+readonly RESUME_SOURCE_STEP="$RESUME_SOURCE_CHECKPOINT_ROOT/checkpoints/global_step_1"
+readonly RESUME_SOURCE_EXPORT="$RESUME_SOURCE_CHECKPOINT_ROOT/exports/global_step_1/policy"
+readonly RESUME_SOURCE_RESULTS="$RESUME_SOURCE_QUAL/results"
 readonly SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=20)
 
 die() {
@@ -33,15 +39,17 @@ die() {
 }
 
 usage() {
-  printf 'Usage: %s --execute --dataset-dir %s\n' "$0" "$DATASET_DIR"
+  printf 'Usage: %s --execute --dataset-dir %s [--resume-from %s]\n' "$0" "$DATASET_DIR" "$RESUME_SOURCE_STEP"
 }
 
 execute=false
 dataset_dir=""
+resume_from=""
 while (($#)); do
   case "$1" in
     --execute) execute=true; shift ;;
     --dataset-dir) dataset_dir=${2:?}; shift 2 ;;
+    --resume-from) resume_from=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -52,6 +60,31 @@ done
 [[ $(hostname -s) == "$HEAD_HOSTNAME" ]] || die "this gate must be launched from $HEAD_ALIAS"
 [[ -d "$WORKTREE/.git" || -f "$WORKTREE/.git" ]] || die "lifecycle worktree missing"
 
+baseline_step=0
+final_step=1
+training_epochs=1
+max_training_steps=1
+resume_mode=null
+resume_path=null
+repeat_eval_step=0
+run_suffix="skyrl-lifecycle-2node-2eng-r1"
+if [[ -n "$resume_from" ]]; then
+  [[ "$resume_from" == "$RESUME_SOURCE_STEP" ]] || die "resume gate requires the exact frozen checkpoint: $RESUME_SOURCE_STEP"
+  [[ -d "$RESUME_SOURCE_STEP" && -d "$RESUME_SOURCE_EXPORT" && -d "$RESUME_SOURCE_RESULTS" ]] || die "resume source artifacts are incomplete"
+  [[ ! -w "$RESUME_SOURCE_QUAL" && ! -w "$RESUME_SOURCE_CHECKPOINT_ROOT" ]] || die "resume source roots must be read-only"
+  baseline_step=1
+  final_step=2
+  # The source step-1 dataloader snapshot is on the final batch while its
+  # iterator remains unfinished. One empty restored outer iteration is allowed
+  # before the next real batch; max_training_steps still stops exactly at 2.
+  training_epochs=3
+  max_training_steps=2
+  resume_mode=from_path
+  resume_path="$resume_from"
+  repeat_eval_step=2
+  run_suffix="skyrl-lifecycle-resume-2node-2eng-r1"
+fi
+
 node_exec() {
   local host=$1
   shift
@@ -60,7 +93,7 @@ node_exec() {
   ssh "${SSH_OPTIONS[@]}" "$host" "$quoted"
 }
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-skyrl-lifecycle-2node-2eng-r1"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$run_suffix"
 qual_dir="$QUAL_ROOT/$run_id"
 checkpoint_root="$CHECKPOINT_ROOT/$run_id"
 checkpoint_dir="$checkpoint_root/checkpoints"
@@ -179,6 +212,57 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+if [[ -n "$resume_from" ]]; then
+  (
+    cd "$RESUME_SOURCE_QUAL"
+    sha256sum -c EVIDENCE.sha256
+  ) >"$qual_dir/resume-source-evidence-pre.txt"
+  (
+    cd "$RESUME_SOURCE_CHECKPOINT_ROOT"
+    sha256sum -c "$RESUME_SOURCE_QUAL/checkpoint-files.sha256"
+  ) >"$qual_dir/resume-source-checkpoint-pre.txt"
+  jq -n \
+    --arg checkpoint "$RESUME_SOURCE_STEP" \
+    --arg export "$RESUME_SOURCE_EXPORT" \
+    --arg run_id "$RESUME_SOURCE_RUN_ID" \
+    '{checkpoint:$checkpoint,export:$export,run_id:$run_id}' >"$qual_dir/resume-source.json"
+  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python - \
+    "$RESUME_SOURCE_STEP/data.pt" "$qual_dir/resume-boundary-workaround.json" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+import torch
+
+source, output = map(Path, sys.argv[1:])
+state = torch.load(source, map_location="cpu", weights_only=False)
+record = {
+    "iterator_finished": state.get("_iterator_finished"),
+    "num_yielded": state.get("_num_yielded"),
+    "sampler_iter_yielded": state.get("_sampler_iter_yielded"),
+    "samples_yielded": state.get("_sampler_iter_state", {}).get("samples_yielded"),
+    "workaround": "allow-one-empty-restored-outer-iteration-before-step-2",
+}
+expected = {
+    "iterator_finished": False,
+    "num_yielded": 1,
+    "sampler_iter_yielded": 1,
+    "samples_yielded": 4,
+    "workaround": "allow-one-empty-restored-outer-iteration-before-step-2",
+}
+if record != expected:
+    raise SystemExit(f"unexpected resume boundary state: {record}")
+temporary = output.with_suffix(output.suffix + ".tmp")
+with temporary.open("x", encoding="utf-8") as stream:
+    json.dump(record, stream, sort_keys=True, indent=2)
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+temporary.replace(output)
+PY
+fi
+
 /shared/verify-handoff | tee "$qual_dir/verify-handoff.txt"
 
 [[ -z $(git -C "$WORKTREE" status --short) ]] || die "lifecycle worktree must be clean before launch"
@@ -252,7 +336,7 @@ else
   (cd "$payload_dir" && sha256sum -c PAYLOAD.sha256)
 fi
 
-install -m 0444 "$WORKTREE/platform/b300/lifecycle/"{qualification_entrypoint.py,run_multinode_lifecycle.sh,validate_pinned_inputs.py,verify_artifacts.py,verify_multinode_artifacts.py} "$qual_dir/recipe/"
+install -m 0444 "$WORKTREE/platform/b300/lifecycle/"{qualification_entrypoint.py,run_multinode_lifecycle.sh,validate_pinned_inputs.py,verify_artifacts.py,verify_multinode_artifacts.py,verify_resume_artifacts.py} "$qual_dir/recipe/"
 git -C "$WORKTREE" status --short >"$qual_dir/worktree-status.txt"
 git -C "$WORKTREE" rev-parse HEAD >"$qual_dir/worktree-revision.txt"
 git -C "$WORKTREE" remote -v >"$qual_dir/worktree-remotes.txt"
@@ -288,8 +372,8 @@ cmd=(
   trainer.algorithm.use_kl_loss=false
   trainer.algorithm.use_kl_in_reward=false
   trainer.algorithm.temperature=0.8
-  trainer.epochs=1
-  trainer.max_training_steps=1
+  trainer.epochs="$training_epochs"
+  trainer.max_training_steps="$max_training_steps"
   trainer.update_epochs_per_batch=1
   trainer.train_batch_size=4
   trainer.policy_mini_batch_size=4
@@ -305,8 +389,8 @@ cmd=(
   trainer.ckpt_interval=1
   trainer.hf_save_interval=1
   trainer.max_ckpts_to_keep=-1
-  trainer.resume_mode=null
-  trainer.resume_path=null
+  trainer.resume_mode="$resume_mode"
+  trainer.resume_path="$resume_path"
   trainer.ckpt_path="$checkpoint_dir"
   trainer.export_path="$export_dir"
   trainer.log_path="$infra_log_dir"
@@ -532,7 +616,7 @@ driver_exec=(
   "SKYRL_INFERENCE_ADVERTISE_HOST=ray-node-ip" \
   "SKYRL_WEIGHT_SYNC_MASTER_ADDR=$HEAD_IP" \
   "SKYRL_QUAL_RESULT_DIR=$result_dir" \
-  SKYRL_QUAL_REPEAT_EVAL_STEP=0 \
+  "SKYRL_QUAL_REPEAT_EVAL_STEP=$repeat_eval_step" \
   "SKYRL_QUAL_DRIVER_RESOURCE=$DRIVER_RESOURCE" \
   "SKYRL_QUAL_ROLLOUT_RESOURCE=$ROLLOUT_RESOURCE" \
   "SKYRL_QUAL_EXPECTED_RAY_NODE_IPS=$HEAD_IP,$WORKER_IP" \
@@ -566,21 +650,67 @@ awk '1' "$qual_dir/post-$HEAD_ALIAS-gpu-processes.csv" "$qual_dir/post-$WORKER_A
 awk '1' "$qual_dir/post-$HEAD_ALIAS-containers.txt" "$qual_dir/post-$WORKER_ALIAS-containers.txt" >"$qual_dir/post-containers-combined.txt"
 awk '1' "$qual_dir/post-$HEAD_ALIAS-processes.txt" "$qual_dir/post-$WORKER_ALIAS-processes.txt" >"$qual_dir/post-processes-combined.txt"
 
-/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
-  "$qual_dir/recipe/verify_artifacts.py" \
-  --result-dir "$result_dir" \
-  --checkpoint-dir "$checkpoint_dir" \
-  --export-dir "$export_dir" \
-  --attached-log "$qual_dir/attached.log" \
-  --post-gpu-processes "$qual_dir/post-selected-gpu-processes.csv" \
-  --post-containers "$qual_dir/post-containers-combined.txt" \
-  --post-processes "$qual_dir/post-processes-combined.txt" \
-  --run-id "$run_id" \
-  --expected-inference-receivers 2 \
-  --expected-inference-host "$WORKER_IP" \
-  --inference-log-dir "$infra_log_dir" \
-  2> >(tee "$qual_dir/artifact-verification.stderr" >&2) |
-  tee "$qual_dir/artifact-verification.stdout"
+if [[ -n "$resume_from" ]]; then
+  (
+    cd "$RESUME_SOURCE_QUAL"
+    sha256sum -c EVIDENCE.sha256
+  ) >"$qual_dir/resume-source-evidence-post.txt"
+  (
+    cd "$RESUME_SOURCE_CHECKPOINT_ROOT"
+    sha256sum -c "$RESUME_SOURCE_QUAL/checkpoint-files.sha256"
+  ) >"$qual_dir/resume-source-checkpoint-post.txt"
+
+  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+    "$qual_dir/recipe/verify_resume_artifacts.py" \
+    --result-dir "$result_dir" \
+    --checkpoint-dir "$checkpoint_dir" \
+    --export-dir "$export_dir" \
+    --source-result-dir "$RESUME_SOURCE_RESULTS" \
+    --source-export-dir "$RESUME_SOURCE_EXPORT" \
+    --resume-checkpoint "$RESUME_SOURCE_STEP" \
+    --source-evidence-pre "$qual_dir/resume-source-evidence-pre.txt" \
+    --source-evidence-post "$qual_dir/resume-source-evidence-post.txt" \
+    --source-checkpoint-pre "$qual_dir/resume-source-checkpoint-pre.txt" \
+    --source-checkpoint-post "$qual_dir/resume-source-checkpoint-post.txt" \
+    --resume-boundary-record "$qual_dir/resume-boundary-workaround.json" \
+    --attached-log "$qual_dir/attached.log" \
+    --post-gpu-processes "$qual_dir/post-selected-gpu-processes.csv" \
+    --post-containers "$qual_dir/post-containers-combined.txt" \
+    --post-processes "$qual_dir/post-processes-combined.txt" \
+    --run-id "$run_id" \
+    --expected-inference-receivers 2 \
+    --expected-inference-host "$WORKER_IP" \
+    --inference-log-dir "$infra_log_dir" \
+    2> >(tee "$qual_dir/artifact-verification.stderr" >&2) |
+    tee "$qual_dir/artifact-verification.stdout"
+
+  (
+    cd "$RESUME_SOURCE_QUAL"
+    sha256sum -c EVIDENCE.sha256
+  ) >"$qual_dir/resume-source-evidence-final.txt"
+  (
+    cd "$RESUME_SOURCE_CHECKPOINT_ROOT"
+    sha256sum -c "$RESUME_SOURCE_QUAL/checkpoint-files.sha256"
+  ) >"$qual_dir/resume-source-checkpoint-final.txt"
+  cmp -s "$qual_dir/resume-source-evidence-pre.txt" "$qual_dir/resume-source-evidence-final.txt" || die "source evidence changed during resume verification"
+  cmp -s "$qual_dir/resume-source-checkpoint-pre.txt" "$qual_dir/resume-source-checkpoint-final.txt" || die "source checkpoint changed during resume verification"
+else
+  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+    "$qual_dir/recipe/verify_artifacts.py" \
+    --result-dir "$result_dir" \
+    --checkpoint-dir "$checkpoint_dir" \
+    --export-dir "$export_dir" \
+    --attached-log "$qual_dir/attached.log" \
+    --post-gpu-processes "$qual_dir/post-selected-gpu-processes.csv" \
+    --post-containers "$qual_dir/post-containers-combined.txt" \
+    --post-processes "$qual_dir/post-processes-combined.txt" \
+    --run-id "$run_id" \
+    --expected-inference-receivers 2 \
+    --expected-inference-host "$WORKER_IP" \
+    --inference-log-dir "$infra_log_dir" \
+    2> >(tee "$qual_dir/artifact-verification.stderr" >&2) |
+    tee "$qual_dir/artifact-verification.stdout"
+fi
 
 /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
   "$qual_dir/recipe/verify_multinode_artifacts.py" \
@@ -600,12 +730,15 @@ awk '1' "$qual_dir/post-$HEAD_ALIAS-processes.txt" "$qual_dir/post-$WORKER_ALIAS
   tee "$qual_dir/multinode-verification.stdout"
 
 jq -n \
+  --argjson baseline_step "$baseline_step" \
+  --argjson final_step "$final_step" \
   --arg run_id "$run_id" \
   --arg head "$HEAD_ALIAS:$HEAD_GPU" \
   --arg worker "$WORKER_ALIAS:$WORKER_GPUS" \
   --arg head_scratch "$head_scratch" \
+  --arg resume_from "$resume_from" \
   --arg worker_scratch "$worker_scratch" \
-  '{driver_exit_code:0,driver_gpu:$head,head_scratch_preserved:$head_scratch,inference_gpus:$worker,num_engines:2,num_nodes:2,run_id:$run_id,status:"PASS",worker_scratch_preserved:$worker_scratch}' \
+  '{baseline_step:$baseline_step,driver_exit_code:0,driver_gpu:$head,final_step:$final_step,head_scratch_preserved:$head_scratch,inference_gpus:$worker,num_engines:2,num_nodes:2,resume_from:($resume_from | if length == 0 then null else . end),run_id:$run_id,status:"PASS",worker_scratch_preserved:$worker_scratch}' \
   >"$qual_dir/launcher-result.json"
 
 freeze_evidence

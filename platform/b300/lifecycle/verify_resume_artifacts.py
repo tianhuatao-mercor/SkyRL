@@ -102,12 +102,13 @@ def _verify_hash_log(pre_path: Path, post_path: Path, label: str) -> dict[str, o
     return {"files": len(pre), "pre_post_identical": True}
 
 
-def _verify_router(log_dir: Path, expected_receivers: int) -> dict[str, object]:
+def _verify_router(log_dir: Path, expected_receivers: int, expected_host: str) -> dict[str, object]:
     router_logs = sorted(log_dir.glob("router-*.log"))
     if len(router_logs) != 1:
         raise RuntimeError(f"expected exactly one router log, found {router_logs}")
     text = router_logs[0].read_text(encoding="utf-8", errors="replace")
-    routes = re.findall(r"worker='(http://127\.0\.0\.1:\d+)' \(index=(\d+)\)", text)
+    host_pattern = re.escape(expected_host)
+    routes = re.findall(rf"worker='(http://{host_pattern}:\d+)' \(index=(\d+)\)", text)
     counts = {
         index: sum(1 for _, observed in routes if observed == index)
         for index in sorted({observed for _, observed in routes})
@@ -142,6 +143,7 @@ def main() -> None:
     parser.add_argument("--post-processes", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--expected-inference-receivers", type=int, default=2)
+    parser.add_argument("--expected-inference-host", default="127.0.0.1")
     parser.add_argument("--inference-log-dir", type=Path, required=True)
     parser.add_argument(
         "--output",
@@ -151,6 +153,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.expected_inference_receivers < 1:
         parser.error("--expected-inference-receivers must be positive")
+    if not args.expected_inference_host or ":" in args.expected_inference_host:
+        parser.error("--expected-inference-host must be a non-empty IPv4 address or hostname")
 
     checks: dict[str, object] = {}
     outcome = _json(args.result_dir / "lifecycle-outcome.json")
@@ -188,7 +192,7 @@ def main() -> None:
         or train_start.get("inference_server_count") != args.expected_inference_receivers
         or not isinstance(urls, list)
         or len(set(urls)) != args.expected_inference_receivers
-        or any(not url.startswith("http://127.0.0.1:") for url in urls)
+        or any(not url.startswith(f"http://{args.expected_inference_host}:") for url in urls)
     ):
         raise RuntimeError(f"invalid resumed train-start topology: {train_start}")
     eval_start = _json(args.result_dir / "event-eval-start-2.json")
@@ -257,7 +261,9 @@ def main() -> None:
     ):
         raise RuntimeError(f"resumed transfer accounting differs: {sync_records}")
     checks["weight_sync_transfers"] = sync_records
-    checks["router_distribution"] = _verify_router(args.inference_log_dir, args.expected_inference_receivers)
+    checks["router_distribution"] = _verify_router(
+        args.inference_log_dir, args.expected_inference_receivers, args.expected_inference_host
+    )
 
     resumed_export = args.export_dir / "global_step_1" / "policy"
     final_export = args.export_dir / "global_step_2" / "policy"
