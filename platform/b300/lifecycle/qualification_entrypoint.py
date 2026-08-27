@@ -97,7 +97,7 @@ class LifecycleEvidenceCallback(TrainingCallback):
     def on_train_start(self, trainer, callback_input, control) -> None:
         # Initial sync is complete when this callback fires. Export the exact
         # trainer weights used for the baseline inference before any update.
-        trainer.save_models(checkpoint_step=0)
+        trainer.save_models(checkpoint_step=callback_input.global_step)
         server_urls = list(getattr(trainer.inference_engine_client, "server_urls", []))
         _atomic_json(
             "event-train-start.json",
@@ -166,10 +166,11 @@ class TransportCanaryTrainer(RayPPOTrainer):
 
     async def eval(self, vllm_metrics_scraper=None):
         metrics = await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
-        if self.global_step == 0:
-            # Repeat the pinned greedy baseline with unchanged weights to measure
-            # the platform's inference noise floor. Preserve the first built-in
-            # eval dump by disabling only that dump during the repeat.
+        repeat_step = os.environ.get("SKYRL_QUAL_REPEAT_EVAL_STEP", "0")
+        if repeat_step == str(self.global_step):
+            # Repeat the selected pinned greedy evaluation with unchanged
+            # weights to measure the platform's inference noise floor. Preserve
+            # the first built-in eval dump by disabling only that dump.
             dump_eval_results = self.cfg.trainer.dump_eval_results
             self.cfg.trainer.dump_eval_results = False
             try:

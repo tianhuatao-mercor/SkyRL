@@ -66,3 +66,27 @@ platform/b300/lifecycle/run_lifecycle.sh \
 In addition to the original lifecycle assertions, the verifier requires a
 three-rank trainer/receiver NCCL group, two distinct loopback server URLs, and
 router evidence that both engine indexes handled requests.
+
+After that scale gate passes, the bounded restart gate loads its exact frozen
+step-1 distributed checkpoint into a fresh process, writes only to a new run
+tree, advances one step, and synchronizes both engines again:
+
+```bash
+platform/b300/lifecycle/run_lifecycle.sh \
+  --execute \
+  --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4 \
+  --num-engines 2 \
+  --gpus 0,1,2 \
+  --resume-from /shared/checkpoints/qualifications/20260827T000439Z-skyrl-lifecycle-nccl-dense-2eng-r1/checkpoints/global_step_1
+```
+
+The launcher accepts no other resume source for this qualification. It verifies
+the frozen source evidence and checkpoint before, after, and following artifact
+verification. PASS additionally requires the fresh trainer's step-1 export to
+match the source tensors exactly, explicit trainer/optimizer/dataloader restore
+markers, a real step-2 update and checkpoint, two three-rank NCCL transfers,
+traffic through both engines, repeatable step-2 inference, and clean teardown.
+The source dataloader state was saved on the final batch while its iterator was
+still marked unfinished. The gate therefore records that state and allows one
+empty restored outer iteration before the next epoch; `max_training_steps=2`
+still limits execution to exactly one new optimizer step.
