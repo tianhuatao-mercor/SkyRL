@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import subprocess
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
@@ -391,13 +392,29 @@ class Worker(DistributedTorchRayActor):
             self._memory_history_started = True
             logger.info(f"[MemorySnapshot] recording rank {self._rank} with max_entries={max_entries}")
 
-        if (
-            _rank_selected_by_env("SKYRL_NSYS_PROFILE_RANKS", getattr(self, "_rank", -1))
-            and not getattr(self, "_nsys_profile_started", False)
+        if _rank_selected_by_env("SKYRL_NSYS_PROFILE_RANKS", getattr(self, "_rank", -1)) and not getattr(
+            self, "_nsys_profile_started", False
         ):
-            torch.cuda.cudart().cudaProfilerStart()
+            nsys_path = os.environ["SKYRL_NSYS_PATH"]
+            session = os.environ["SKYRL_NSYS_SESSION"]
+            output = os.environ["SKYRL_NSYS_OUTPUT"]
+            result = subprocess.run(
+                [
+                    nsys_path,
+                    "start",
+                    f"--session={session}",
+                    "--sample=none",
+                    "--cpuctxsw=none",
+                    f"--output={output}",
+                    "--force-overwrite=true",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
             self._nsys_profile_started = True
-            logger.info(f"[NsightSystems] cudaProfilerStart on rank {self._rank}")
+            logger.info(f"[NsightSystems] started session {session} on rank {self._rank}: {result.stdout.strip()}")
 
         if self.profiler is not None:
             self.profiler.start()
@@ -416,9 +433,17 @@ class Worker(DistributedTorchRayActor):
             self._memory_history_started = False
             logger.info(f"[MemorySnapshot] stopped recording rank {self._rank}")
         if getattr(self, "_nsys_profile_started", False):
-            torch.cuda.cudart().cudaProfilerStop()
+            nsys_path = os.environ["SKYRL_NSYS_PATH"]
+            session = os.environ["SKYRL_NSYS_SESSION"]
+            result = subprocess.run(
+                [nsys_path, "stop", f"--session={session}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
             self._nsys_profile_started = False
-            logger.info(f"[NsightSystems] cudaProfilerStop on rank {self._rank}")
+            logger.info(f"[NsightSystems] stopped session {session} on rank {self._rank}: {result.stdout.strip()}")
 
     def dump_profiler_summary(self):
         """Return this rank's last-window kernel summary, or None."""
