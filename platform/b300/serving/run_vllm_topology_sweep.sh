@@ -253,6 +253,13 @@ run_shape() {
   IFS='|' read -r gpu_spec tp extra_text <<<"$packed"
   local -a extra=()
   [[ -z "$extra_text" ]] || read -r -a extra <<<"$extra_text"
+  local -a model_kernel_args=()
+  if [[ "$model_family" == moe ]]; then
+    # The pinned FlashInfer TRT-LLM BF16 MoE cubins do not contain an sm_103
+    # kernel image. Keep FlashInfer attention, but use vLLM's supported Triton
+    # backend for the expert layers on B300.
+    model_kernel_args=(--moe-backend triton)
+  fi
   local gpu_count
   gpu_count=$(awk -F, '{print NF}' <<<"$gpu_spec")
   wait_for_gpu_cleanup "$gpu_spec" || die "selected GPUs did not begin clean for $shape"
@@ -282,7 +289,6 @@ run_shape() {
     --env HF_HUB_DISABLE_TELEMETRY=1
     --env VLLM_NO_USAGE_STATS=1
     --env VLLM_USE_FLASHINFER_SAMPLER=0
-    --env VLLM_USE_FLASHINFER_MOE_FP16=0
     --env RAY_USAGE_STATS_ENABLED=0
     --env PYTHONDONTWRITEBYTECODE=1
     --env PYTHONNOUSERSITE=1
@@ -310,6 +316,7 @@ run_shape() {
     --enable-chunked-prefill
     --no-enable-prefix-caching
     --attention-backend FLASHINFER
+    "${model_kernel_args[@]}"
     --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}'
     --no-enable-log-requests
     "${extra[@]}"
