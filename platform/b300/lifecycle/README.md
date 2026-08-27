@@ -107,10 +107,33 @@ HTTP listeners bind only to their per-node private VPC addresses, and the NCCL
 verifier requires EFA-direct, Libfabric, and GPU Direct RDMA markers on both
 nodes with no socket fallback.
 
+Inventory, placement, FSx identity, Ray resources, GPU IDs, and the exact OCI
+runtime are supplied by a versioned contract rather than launcher constants:
+
+```text
+platform/b300/lifecycle/topologies/aws-b300-20260826-two-node.json
+```
+
+Validate its schema and compare it with live nodes without creating containers
+or consuming GPUs:
+
+```bash
+/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  platform/b300/lifecycle/preflight_multinode_topology.py \
+  --topology platform/b300/lifecycle/topologies/aws-b300-20260826-two-node.json
+```
+
+The preflight fails closed on alias/IP/hostname, FSx, GPU count or occupancy,
+EFA device count, conflicting lifecycle state, image ID, source revision, or
+dependency-lock drift. A future cluster supplies a new reviewed contract; it
+does not require embedding cloud-specific addresses in the launcher. Schema 1
+intentionally describes the already-qualified one-policy/two-engine shape.
+
 ```bash
 platform/b300/lifecycle/run_multinode_lifecycle.sh \
   --execute \
-  --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4
+  --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4 \
+  --topology platform/b300/lifecycle/topologies/aws-b300-20260826-two-node.json
 ```
 
 The launcher owns exactly two labeled containers (Ray head and Ray worker) and
@@ -131,6 +154,7 @@ identity, inference-change, and cleanup assertions:
 platform/b300/lifecycle/run_multinode_lifecycle.sh \
   --execute \
   --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4 \
+  --topology platform/b300/lifecycle/topologies/aws-b300-20260826-two-node.json \
   --resume-from /shared/checkpoints/qualifications/20260827T011849Z-skyrl-lifecycle-2node-2eng-r1/checkpoints/global_step_1
 ```
 

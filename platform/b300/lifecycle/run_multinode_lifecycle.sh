@@ -1,30 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly EXPECTED_IMAGE_ID="sha256:e98a7978ad815edbd55d460f0f45ec059dcc2df4584e5c8da9c6183b99b2940c"
-readonly EXPECTED_IMAGE_REF="skyrl-megatron-b300-cu128-canary:7c528991c4f9-r1"
-readonly EXPECTED_SOURCE_REV="7c528991c4f9d470dd9295e10589d99dc3e05053"
-readonly EXPECTED_LOCK_SHA="0f3a2126b68747e7d4b854574e9e418c0c4a8f6c9f605865600b04e5d0a2a537"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly WORKTREE="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+readonly DEFAULT_TOPOLOGY="$SCRIPT_DIR/topologies/aws-b300-20260826-two-node.json"
+readonly PLATFORM_PYTHON="/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python"
 readonly MODEL_DIR="/shared/models/qwen3-0.6b-c1899de"
 readonly MODEL_REV="c1899de289a04d12100db370d81485cdf75e47ca"
 readonly DATASET_DIR="/shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4"
 readonly DATASET_ID="ebcf5477cdd43cf42a380cc0ee168a5c7c4ddcc08521c95d133fa6d5cebaec59"
-readonly WORKTREE="/shared/code/SkyRL-b300-lifecycle"
 readonly QUAL_ROOT="/shared/environments/b300/qualifications"
 readonly CHECKPOINT_ROOT="/shared/checkpoints/qualifications"
 readonly RECIPE_ROOT="/shared/environments/b300/recipes"
-readonly OWNER_LABEL="skyrl-lifecycle"
-readonly HEAD_ALIAS="aws-b300-node1"
-readonly WORKER_ALIAS="aws-b300-node2"
-readonly HEAD_HOSTNAME="ip-172-31-67-119"
-readonly WORKER_HOSTNAME="ip-172-31-67-174"
-readonly HEAD_IP="172.31.67.119"
-readonly WORKER_IP="172.31.67.174"
-readonly HEAD_GPU="2"
-readonly WORKER_GPUS="0,1"
-readonly RAY_PORT="6387"
-readonly DRIVER_RESOURCE="b300_lifecycle_driver"
-readonly ROLLOUT_RESOURCE="b300_lifecycle_rollout"
 readonly RESUME_SOURCE_RUN_ID="20260827T011849Z-skyrl-lifecycle-2node-2eng-r1"
 readonly RESUME_SOURCE_QUAL="$QUAL_ROOT/$RESUME_SOURCE_RUN_ID"
 readonly RESUME_SOURCE_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/$RESUME_SOURCE_RUN_ID"
@@ -39,17 +26,20 @@ die() {
 }
 
 usage() {
-  printf 'Usage: %s --execute --dataset-dir %s [--resume-from %s]\n' "$0" "$DATASET_DIR" "$RESUME_SOURCE_STEP"
+  printf 'Usage: %s --execute --dataset-dir %s [--topology %s] [--resume-from %s]\n' \
+    "$0" "$DATASET_DIR" "$DEFAULT_TOPOLOGY" "$RESUME_SOURCE_STEP"
 }
 
 execute=false
 dataset_dir=""
 resume_from=""
+topology="$DEFAULT_TOPOLOGY"
 while (($#)); do
   case "$1" in
     --execute) execute=true; shift ;;
     --dataset-dir) dataset_dir=${2:?}; shift 2 ;;
     --resume-from) resume_from=${2:?}; shift 2 ;;
+    --topology) topology=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -57,6 +47,32 @@ done
 
 [[ "$execute" == true ]] || die "refusing GPU launch without --execute"
 [[ "$dataset_dir" == "$DATASET_DIR" ]] || die "dataset must be the exact pinned artifact: $DATASET_DIR"
+[[ -f "$topology" ]] || die "topology contract missing: $topology"
+topology_json=$("$PLATFORM_PYTHON" "$SCRIPT_DIR/topology_contract.py" --topology "$topology") || die "invalid topology contract"
+readonly topology_json
+readonly TOPOLOGY_SHA256=$("$PLATFORM_PYTHON" "$SCRIPT_DIR/topology_contract.py" --topology "$topology" --sha256-only)
+readonly EXPECTED_IMAGE_ID=$(jq -er '.runtime.image_id' <<<"$topology_json")
+readonly EXPECTED_IMAGE_REF=$(jq -er '.runtime.image_ref' <<<"$topology_json")
+readonly EXPECTED_SOURCE_REV=$(jq -er '.runtime.source_revision' <<<"$topology_json")
+readonly EXPECTED_LOCK_SHA=$(jq -er '.runtime.lock_sha256' <<<"$topology_json")
+readonly OWNER_LABEL=$(jq -er '.qualification.owner_label' <<<"$topology_json")
+readonly HEAD_ALIAS=$(jq -er '.roles.head.ssh_alias' <<<"$topology_json")
+readonly WORKER_ALIAS=$(jq -er '.roles.rollout.ssh_alias' <<<"$topology_json")
+readonly HEAD_HOSTNAME=$(jq -er '.roles.head.hostname' <<<"$topology_json")
+readonly WORKER_HOSTNAME=$(jq -er '.roles.rollout.hostname' <<<"$topology_json")
+readonly HEAD_IP=$(jq -er '.roles.head.private_ip' <<<"$topology_json")
+readonly WORKER_IP=$(jq -er '.roles.rollout.private_ip' <<<"$topology_json")
+readonly HEAD_GPU=$(jq -er '.roles.head.host_gpu_ids | map(tostring) | join(",")' <<<"$topology_json")
+readonly WORKER_GPUS=$(jq -er '.roles.rollout.host_gpu_ids | map(tostring) | join(",")' <<<"$topology_json")
+readonly HEAD_GPU_COUNT=$(jq -er '.roles.head.host_gpu_ids | length' <<<"$topology_json")
+readonly WORKER_GPU_COUNT=$(jq -er '.roles.rollout.host_gpu_ids | length' <<<"$topology_json")
+readonly HEAD_CPU_SLOTS=$(jq -er '.roles.head.ray_cpu_slots' <<<"$topology_json")
+readonly WORKER_CPU_SLOTS=$(jq -er '.roles.rollout.ray_cpu_slots' <<<"$topology_json")
+readonly RAY_PORT=$(jq -er '.ray.port' <<<"$topology_json")
+readonly DRIVER_RESOURCE=$(jq -er '.ray.driver_resource' <<<"$topology_json")
+readonly ROLLOUT_RESOURCE=$(jq -er '.ray.rollout_resource' <<<"$topology_json")
+mapfile -t HEAD_GPU_IDS < <(jq -er '.roles.head.host_gpu_ids[]' <<<"$topology_json")
+mapfile -t WORKER_GPU_IDS < <(jq -er '.roles.rollout.host_gpu_ids[]' <<<"$topology_json")
 [[ $(hostname -s) == "$HEAD_HOSTNAME" ]] || die "this gate must be launched from $HEAD_ALIAS"
 [[ -d "$WORKTREE/.git" || -f "$WORKTREE/.git" ]] || die "lifecycle worktree missing"
 
@@ -265,6 +281,15 @@ fi
 
 /shared/verify-handoff | tee "$qual_dir/verify-handoff.txt"
 
+"$PLATFORM_PYTHON" "$SCRIPT_DIR/preflight_multinode_topology.py" \
+  --topology "$topology" >"$qual_dir/topology-preflight.json"
+printf '%s\n' "$topology_json" >"$qual_dir/topology-contract.json"
+install -m 0444 "$topology" "$qual_dir/topology-source.json"
+(
+  cd "$qual_dir"
+  sha256sum topology-source.json >topology-source.sha256
+)
+
 [[ -z $(git -C "$WORKTREE" status --short) ]] || die "lifecycle worktree must be clean before launch"
 git -C "$WORKTREE" merge-base --is-ancestor "$EXPECTED_SOURCE_REV" HEAD || die "qualified source is not an ancestor of the worktree"
 
@@ -280,7 +305,14 @@ head_mount=$(node_exec "$HEAD_ALIAS" findmnt -T /shared -n -o SOURCE,FSTYPE)
 worker_mount=$(node_exec "$WORKER_ALIAS" findmnt -T /shared -n -o SOURCE,FSTYPE)
 [[ "$head_mount" == "$worker_mount" && "$head_mount" == *"nfs4"* ]] || die "FSx mount drift between the two nodes"
 
-for spec in "$HEAD_ALIAS:$HEAD_GPU" "$WORKER_ALIAS:0" "$WORKER_ALIAS:1"; do
+selected_gpu_specs=()
+for gpu in "${HEAD_GPU_IDS[@]}"; do
+  selected_gpu_specs+=("$HEAD_ALIAS:$gpu")
+done
+for gpu in "${WORKER_GPU_IDS[@]}"; do
+  selected_gpu_specs+=("$WORKER_ALIAS:$gpu")
+done
+for spec in "${selected_gpu_specs[@]}"; do
   host=${spec%%:*}
   gpu=${spec##*:}
   used=$(node_exec "$host" nvidia-smi --id="$gpu" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
@@ -336,7 +368,8 @@ else
   (cd "$payload_dir" && sha256sum -c PAYLOAD.sha256)
 fi
 
-install -m 0444 "$WORKTREE/platform/b300/lifecycle/"{qualification_entrypoint.py,run_multinode_lifecycle.sh,validate_pinned_inputs.py,verify_artifacts.py,verify_multinode_artifacts.py,verify_resume_artifacts.py} "$qual_dir/recipe/"
+install -m 0444 "$WORKTREE/platform/b300/lifecycle/"{preflight_multinode_topology.py,qualification_entrypoint.py,run_multinode_lifecycle.sh,topology_contract.py,validate_pinned_inputs.py,verify_artifacts.py,verify_multinode_artifacts.py,verify_resume_artifacts.py} "$qual_dir/recipe/"
+install -m 0444 "$topology" "$qual_dir/recipe/topology-source.json"
 git -C "$WORKTREE" status --short >"$qual_dir/worktree-status.txt"
 git -C "$WORKTREE" rev-parse HEAD >"$qual_dir/worktree-revision.txt"
 git -C "$WORKTREE" remote -v >"$qual_dir/worktree-remotes.txt"
@@ -405,7 +438,7 @@ cmd=(
   trainer.enable_ray_gpu_monitor=false
   generator.inference_engine.backend=vllm
   generator.inference_engine.run_engines_locally=true
-  generator.inference_engine.num_engines=2
+  generator.inference_engine.num_engines="$WORKER_GPU_COUNT"
   generator.inference_engine.tensor_parallel_size=1
   generator.inference_engine.pipeline_parallel_size=1
   generator.inference_engine.data_parallel_size=1
@@ -546,8 +579,8 @@ head_container_id=$(create_container \
   --head \
   "--node-ip-address=$HEAD_IP" \
   "--port=$RAY_PORT" \
-  --num-gpus=1 \
-  --num-cpus=32 \
+  "--num-gpus=$HEAD_GPU_COUNT" \
+  "--num-cpus=$HEAD_CPU_SLOTS" \
   "--resources={\"$DRIVER_RESOURCE\":1}" \
   --disable-usage-stats \
   --dashboard-host=127.0.0.1 \
@@ -559,7 +592,8 @@ node_exec "$HEAD_ALIAS" docker start "$head_container_id" >"$qual_dir/container-
 node_exec "$HEAD_ALIAS" bash -lc "for i in \$(seq 1 60); do if timeout 1 bash -c '</dev/tcp/$HEAD_IP/$RAY_PORT' 2>/dev/null; then exit 0; fi; sleep 1; done; exit 1" || die "Ray head did not accept private-IP connections within 60 seconds"
 node_exec "$HEAD_ALIAS" docker exec "$head_container_id" \
   /opt/venvs/skyrl-megatron/bin/python -c \
-  'import json, os, torch; count=torch.cuda.device_count(); print(json.dumps({"cuda_available":torch.cuda.is_available(),"cuda_device_count":count,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),"devices":[torch.cuda.get_device_name(i) for i in range(count)],"status":"PASS" if count == 1 else "FAIL"},sort_keys=True)); assert count == 1' \
+  'import json, os, sys, torch; expected=int(sys.argv[1]); count=torch.cuda.device_count(); print(json.dumps({"cuda_available":torch.cuda.is_available(),"cuda_device_count":count,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),"devices":[torch.cuda.get_device_name(i) for i in range(count)],"expected_device_count":expected,"status":"PASS" if count == expected else "FAIL"},sort_keys=True)); assert count == expected' \
+  "$HEAD_GPU_COUNT" \
   >"$qual_dir/head-cuda-visibility.json"
 
 worker_container_id=$(create_container \
@@ -567,8 +601,8 @@ worker_container_id=$(create_container \
   /opt/venvs/skyrl-megatron/bin/ray start \
   "--address=$HEAD_IP:$RAY_PORT" \
   "--node-ip-address=$WORKER_IP" \
-  --num-gpus=2 \
-  --num-cpus=32 \
+  "--num-gpus=$WORKER_GPU_COUNT" \
+  "--num-cpus=$WORKER_CPU_SLOTS" \
   "--resources={\"$ROLLOUT_RESOURCE\":1}" \
   --disable-usage-stats \
   --block)
@@ -581,9 +615,9 @@ ray_probe_code="$(printf '%s\n' \
   "ray.init(address='$HEAD_IP:$RAY_PORT', log_to_driver=False, logging_level='ERROR')" \
   'nodes = {node["NodeManagerAddress"]: node for node in ray.nodes() if node["Alive"]}' \
   "assert set(nodes) == {'$HEAD_IP', '$WORKER_IP'}, sorted(nodes)" \
-  "assert nodes['$HEAD_IP']['Resources'].get('GPU') == 1" \
+  "assert nodes['$HEAD_IP']['Resources'].get('GPU') == $HEAD_GPU_COUNT" \
   "assert nodes['$HEAD_IP']['Resources'].get('$DRIVER_RESOURCE', 0) >= 1" \
-  "assert nodes['$WORKER_IP']['Resources'].get('GPU') == 2" \
+  "assert nodes['$WORKER_IP']['Resources'].get('GPU') == $WORKER_GPU_COUNT" \
   "assert nodes['$WORKER_IP']['Resources'].get('$ROLLOUT_RESOURCE', 0) >= 1" \
   'print(json.dumps({"nodes": sorted(nodes), "status": "PASS"}, sort_keys=True))' \
   'ray.shutdown()')"
@@ -601,7 +635,8 @@ done
 [[ "$worker_ready" == true ]] || die "Ray worker did not register with the exact role resources"
 node_exec "$WORKER_ALIAS" docker exec "$worker_container_id" \
   /opt/venvs/skyrl-megatron/bin/python -c \
-  'import json, os, torch; count=torch.cuda.device_count(); print(json.dumps({"cuda_available":torch.cuda.is_available(),"cuda_device_count":count,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),"devices":[torch.cuda.get_device_name(i) for i in range(count)],"status":"PASS" if count == 2 else "FAIL"},sort_keys=True)); assert count == 2' \
+  'import json, os, sys, torch; expected=int(sys.argv[1]); count=torch.cuda.device_count(); print(json.dumps({"cuda_available":torch.cuda.is_available(),"cuda_device_count":count,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),"devices":[torch.cuda.get_device_name(i) for i in range(count)],"expected_device_count":expected,"status":"PASS" if count == expected else "FAIL"},sort_keys=True)); assert count == expected' \
+  "$WORKER_GPU_COUNT" \
   >"$qual_dir/worker-cuda-visibility.json"
 
 node_exec "$HEAD_ALIAS" docker exec "$head_container_id" /opt/venvs/skyrl-megatron/bin/ray status "--address=$HEAD_IP:$RAY_PORT" >"$qual_dir/ray-status-pre-driver.txt"
@@ -678,7 +713,7 @@ if [[ -n "$resume_from" ]]; then
     --post-containers "$qual_dir/post-containers-combined.txt" \
     --post-processes "$qual_dir/post-processes-combined.txt" \
     --run-id "$run_id" \
-    --expected-inference-receivers 2 \
+    --expected-inference-receivers "$WORKER_GPU_COUNT" \
     --expected-inference-host "$WORKER_IP" \
     --inference-log-dir "$infra_log_dir" \
     2> >(tee "$qual_dir/artifact-verification.stderr" >&2) |
@@ -705,7 +740,7 @@ else
     --post-containers "$qual_dir/post-containers-combined.txt" \
     --post-processes "$qual_dir/post-processes-combined.txt" \
     --run-id "$run_id" \
-    --expected-inference-receivers 2 \
+    --expected-inference-receivers "$WORKER_GPU_COUNT" \
     --expected-inference-host "$WORKER_IP" \
     --inference-log-dir "$infra_log_dir" \
     2> >(tee "$qual_dir/artifact-verification.stderr" >&2) |
@@ -738,7 +773,9 @@ jq -n \
   --arg head_scratch "$head_scratch" \
   --arg resume_from "$resume_from" \
   --arg worker_scratch "$worker_scratch" \
-  '{baseline_step:$baseline_step,driver_exit_code:0,driver_gpu:$head,final_step:$final_step,head_scratch_preserved:$head_scratch,inference_gpus:$worker,num_engines:2,num_nodes:2,resume_from:($resume_from | if length == 0 then null else . end),run_id:$run_id,status:"PASS",worker_scratch_preserved:$worker_scratch}' \
+  --arg topology_sha256 "$TOPOLOGY_SHA256" \
+  --argjson num_engines "$WORKER_GPU_COUNT" \
+  '{baseline_step:$baseline_step,driver_exit_code:0,driver_gpu:$head,final_step:$final_step,head_scratch_preserved:$head_scratch,inference_gpus:$worker,num_engines:$num_engines,num_nodes:2,resume_from:($resume_from | if length == 0 then null else . end),run_id:$run_id,status:"PASS",topology_sha256:$topology_sha256,worker_scratch_preserved:$worker_scratch}' \
   >"$qual_dir/launcher-result.json"
 
 freeze_evidence
