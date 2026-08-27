@@ -473,7 +473,7 @@ head_container_id=$(create_container \
 verify_container_identity "$HEAD_ALIAS" "$head_container_id" "$head_name" || die "head container identity mismatch"
 node_exec "$HEAD_ALIAS" docker inspect "$head_container_id" >"$qual_dir/container-prestart-head.json"
 node_exec "$HEAD_ALIAS" docker start "$head_container_id" >"$qual_dir/container-start-head.txt"
-node_exec "$HEAD_ALIAS" bash -lc "for i in \$(seq 1 60); do if ss -ltn | awk '{print \$4}' | grep -qx '$HEAD_IP:$RAY_PORT'; then exit 0; fi; sleep 1; done; exit 1" || die "Ray head did not listen within 60 seconds"
+node_exec "$HEAD_ALIAS" bash -lc "for i in \$(seq 1 60); do if timeout 1 bash -c '</dev/tcp/$HEAD_IP/$RAY_PORT' 2>/dev/null; then exit 0; fi; sleep 1; done; exit 1" || die "Ray head did not accept private-IP connections within 60 seconds"
 
 worker_container_id=$(create_container \
   "$WORKER_ALIAS" worker "$worker_name" "$WORKER_GPUS" "$worker_scratch" \
