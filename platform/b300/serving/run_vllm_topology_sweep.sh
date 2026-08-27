@@ -10,6 +10,7 @@ readonly LOCK_SHA256="0f3a2126b68747e7d4b854574e9e418c0c4a8f6c9f605865600b04e5d0
 readonly QUAL_ROOT="/shared/environments/b300/qualifications"
 readonly OWNER_LABEL="skyrl-serving-topology"
 readonly SERVER_PORT=18080
+readonly FLASHINFER_CUBINS_CONTAINER="/opt/venvs/skyrl-megatron/lib/python3.12/site-packages/flashinfer_cubin/cubins"
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -159,6 +160,25 @@ docker run --rm --pull=never --network none --entrypoint /opt/venvs/skyrl-megatr
   -c 'import importlib.metadata as m, json; print(json.dumps({p: m.version(p) for p in ("torch", "transformers", "vllm")}, sort_keys=True))' \
   >"$qual_dir/runtime-versions.json"
 
+flashinfer_cubins_scratch=""
+if [[ "$model_family" == moe ]]; then
+  flashinfer_cubins_scratch="/opt/dlami/nvme/cache/tmp/vb/${run_id:0:15}-flashinfer-cubins"
+  [[ ! -e "$flashinfer_cubins_scratch" ]] || die "FlashInfer cubin scratch path exists: $flashinfer_cubins_scratch"
+  mkdir -p "$flashinfer_cubins_scratch"
+  cubin_copy_cmd=(
+    docker run --rm --pull=never --network none
+    --user "$(id -u):$(id -g)"
+    --mount "type=bind,src=$flashinfer_cubins_scratch,dst=/out"
+    --entrypoint /bin/cp
+    "$IMAGE_ID" -a "$FLASHINFER_CUBINS_CONTAINER/." /out/
+  )
+  printf '%s\0' "${cubin_copy_cmd[@]}" | jq -Rs 'split("\u0000")[:-1]' >"$qual_dir/flashinfer-cubin-copy-command.json"
+  "${cubin_copy_cmd[@]}" >"$qual_dir/flashinfer-cubin-copy.log" 2>&1
+  printf '%s\n' "$flashinfer_cubins_scratch" >"$qual_dir/flashinfer-cubin-scratch.txt"
+  du -sb "$flashinfer_cubins_scratch" >"$qual_dir/flashinfer-cubin-size.txt"
+  find "$flashinfer_cubins_scratch" -type f -printf '.' | wc -c >"$qual_dir/flashinfer-cubin-file-count.txt"
+fi
+
 shape_params() {
   local shape=$1
   case "$shape" in
@@ -257,6 +277,13 @@ run_shape() {
   gpu_count=$(awk -F, '{print NF}' <<<"$gpu_spec")
   wait_for_gpu_cleanup "$gpu_spec" || die "selected GPUs did not begin clean for $shape"
 
+  local -a flashinfer_cubin_mount=()
+  if [[ -n "$flashinfer_cubins_scratch" ]]; then
+    flashinfer_cubin_mount=(
+      --mount "type=bind,src=$flashinfer_cubins_scratch,dst=$FLASHINFER_CUBINS_CONTAINER"
+    )
+  fi
+
   local scratch="/opt/dlami/nvme/cache/tmp/vb/${run_id:0:15}-$shape"
   [[ ! -e "$scratch" ]] || die "scratch path exists: $scratch"
   mkdir -p "$scratch"/{home,tmp,xdg,triton,vllm}
@@ -275,6 +302,7 @@ run_shape() {
     --ulimit nofile=1048576:1048576
     --mount type=bind,src=/shared,dst=/shared,readonly
     --mount "type=bind,src=$scratch,dst=/c"
+    "${flashinfer_cubin_mount[@]}"
     --env "NVIDIA_VISIBLE_DEVICES=$gpu_spec"
     --env HF_HUB_OFFLINE=1
     --env TRANSFORMERS_OFFLINE=1
