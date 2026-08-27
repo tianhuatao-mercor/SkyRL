@@ -68,12 +68,14 @@ def get_inference_bind_host() -> str:
     opt into a narrower boundary (for example ``127.0.0.1`` for a single-node
     colocated run) without changing application configuration.
     """
-    return os.environ.get("SKYRL_INFERENCE_BIND_HOST", "0.0.0.0")
+    value = os.environ.get("SKYRL_INFERENCE_BIND_HOST", "0.0.0.0")
+    return get_node_ip() if value == "ray-node-ip" else value
 
 
 def get_inference_advertise_host() -> str:
     """Return the inference address advertised to local SkyRL clients."""
-    return os.environ.get("SKYRL_INFERENCE_ADVERTISE_HOST") or get_node_ip()
+    value = os.environ.get("SKYRL_INFERENCE_ADVERTISE_HOST")
+    return get_node_ip() if not value or value == "ray-node-ip" else value
 
 
 def get_open_port(start_port: int | None = None) -> int:

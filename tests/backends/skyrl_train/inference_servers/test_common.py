@@ -49,6 +49,17 @@ class TestInferenceHosts:
         assert get_inference_bind_host() == "127.0.0.1"
         assert get_inference_advertise_host() == "127.0.0.1"
 
+    def test_ray_node_ip_overrides_are_resolved_per_process(self, monkeypatch):
+        monkeypatch.setenv("SKYRL_INFERENCE_BIND_HOST", "ray-node-ip")
+        monkeypatch.setenv("SKYRL_INFERENCE_ADVERTISE_HOST", "ray-node-ip")
+        monkeypatch.setattr(
+            "skyrl.backends.skyrl_train.inference_servers.common.get_node_ip",
+            lambda: "10.0.0.8",
+        )
+
+        assert get_inference_bind_host() == "10.0.0.8"
+        assert get_inference_advertise_host() == "10.0.0.8"
+
 
 class TestGetOpenPort:
     """Tests for get_open_port function."""

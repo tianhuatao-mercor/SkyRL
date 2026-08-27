@@ -1185,6 +1185,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "SKYRL_INFERENCE_ADVERTISE_HOST",
         "SKYRL_WEIGHT_SYNC_MASTER_ADDR",
         "SKYRL_QUAL_RESULT_DIR",
+        "SKYRL_QUAL_ROLLOUT_RESOURCE",
         "HF_HUB_OFFLINE",
         "TRANSFORMERS_OFFLINE",
         "HF_DATASETS_OFFLINE",

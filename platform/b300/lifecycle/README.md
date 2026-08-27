@@ -97,3 +97,26 @@ proven wrong, preserve its launcher result and use the read-only audit wrapper:
 ```bash
 platform/b300/lifecycle/run_resume_audit.sh --execute
 ```
+
+The first multi-node gate preserves the same one-step lifecycle while separating
+roles across two containers-as-Ray-nodes: one policy GPU on `aws-b300-node1`
+and two rollout GPUs on `aws-b300-node2`. Run-scoped custom Ray resources pin
+the experiment actor and rollout placement group; the rollout reservation
+exhausts node2's advertised GPUs, making node1 the only valid policy location.
+HTTP listeners bind only to their per-node private VPC addresses, and the NCCL
+verifier requires EFA-direct, Libfabric, and GPU Direct RDMA markers on both
+nodes with no socket fallback.
+
+```bash
+platform/b300/lifecycle/run_multinode_lifecycle.sh \
+  --execute \
+  --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4
+```
+
+The launcher owns exactly three labeled containers (Ray head, Ray worker, and
+driver), advertises only three GPUs to the transient Ray cluster, hard-limits
+the driver to 30 minutes, and freezes both successful and failed evidence. PASS
+requires the original lifecycle assertions, exact two-node placement evidence,
+cross-node trainer-to-vLLM synchronization over EFA, and clean teardown on both
+nodes. Local NVMe scratch paths are preserved and recorded rather than broadly
+cleaned.

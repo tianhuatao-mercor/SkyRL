@@ -8,6 +8,7 @@ import importlib.metadata
 import json
 import math
 import os
+import re
 import sys
 import traceback
 from collections import defaultdict
@@ -17,18 +18,20 @@ from typing import Any
 import ray
 import torch
 from loguru import logger
+from ray.util.placement_group import placement_group
 
 # SkyRL must be imported before Megatron modules in the B300 canary image.
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_dict
 from skyrl.train.entrypoints.main_base import BasePPOExp, validate_cfg
 from skyrl.train.trainer import RayPPOTrainer
-from skyrl.train.utils import initialize_ray
+from skyrl.train.utils import ResolvedPlacementGroup, get_ray_pg_ready_with_timeout, initialize_ray
 from skyrl.train.utils.callbacks import TrainingCallback
 from skyrl.train.utils.trajectory_logging import TrajectoryLogger
 from skyrl_gym.envs import register
 
 
 RESULT_DIR = Path(os.environ["SKYRL_QUAL_RESULT_DIR"])
+RAY_RESOURCE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
 
 def _jsonable(value: Any) -> Any:
@@ -57,6 +60,58 @@ def _atomic_json(name: str, value: object) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+
+
+def _validate_multinode_ray_cluster() -> None:
+    expected_ips_value = os.environ.get("SKYRL_QUAL_EXPECTED_RAY_NODE_IPS")
+    if not expected_ips_value:
+        return
+
+    expected_ips = expected_ips_value.split(",")
+    if len(expected_ips) != 2 or len(set(expected_ips)) != 2 or any(not value for value in expected_ips):
+        raise ValueError("SKYRL_QUAL_EXPECTED_RAY_NODE_IPS must contain two distinct addresses")
+    driver_resource = os.environ.get("SKYRL_QUAL_DRIVER_RESOURCE")
+    rollout_resource = os.environ.get("SKYRL_QUAL_ROLLOUT_RESOURCE")
+    if not driver_resource or not rollout_resource:
+        raise ValueError("the multi-node qualification requires driver and rollout Ray resources")
+
+    alive_nodes = [node for node in ray.nodes() if node["Alive"]]
+    nodes_by_ip = {node["NodeManagerAddress"]: node for node in alive_nodes}
+    if set(nodes_by_ip) != set(expected_ips) or len(alive_nodes) != 2:
+        raise RuntimeError(f"unexpected live Ray nodes: {sorted(nodes_by_ip)}")
+
+    head_resources = nodes_by_ip[expected_ips[0]]["Resources"]
+    rollout_resources = nodes_by_ip[expected_ips[1]]["Resources"]
+    expected_layout = (
+        head_resources.get("GPU") == 1
+        and head_resources.get(driver_resource, 0) >= 1
+        and head_resources.get(rollout_resource, 0) == 0
+        and rollout_resources.get("GPU") == 2
+        and rollout_resources.get(rollout_resource, 0) >= 1
+        and rollout_resources.get(driver_resource, 0) == 0
+    )
+    if not expected_layout:
+        raise RuntimeError(
+            "Ray role resources do not encode one head policy GPU and two rollout-worker GPUs: "
+            f"head={head_resources}, rollout={rollout_resources}"
+        )
+    _atomic_json(
+        "ray-cluster-preflight.json",
+        {
+            "driver_resource": driver_resource,
+            "expected_ips": expected_ips,
+            "nodes": [
+                {
+                    "node_id": nodes_by_ip[ip]["NodeID"],
+                    "node_manager_address": ip,
+                    "resources": nodes_by_ip[ip]["Resources"],
+                }
+                for ip in expected_ips
+            ],
+            "rollout_resource": rollout_resource,
+            "status": "PASS",
+        },
+    )
 
 
 class EvidenceTrajectoryLogger(TrajectoryLogger):
@@ -106,6 +161,32 @@ class LifecycleEvidenceCallback(TrainingCallback):
                 "inference_server_count": len(server_urls),
                 "inference_server_urls": server_urls,
                 "weight_version": self._version(trainer),
+            },
+        )
+        policy_group = trainer.dispatch._actor_groups["policy"]
+        policy_node_ids = ray.get(
+            policy_group.async_run_ray_method("pass_through", "get_ray_node_id")
+        )
+        policy_gpu_ids = ray.get(policy_group.async_run_ray_method("pass_through", "get_gpu_id"))
+        policy_master_endpoints = ray.get(
+            policy_group.async_run_ray_method("pass_through", "get_master_addr_port")
+        )
+        _atomic_json(
+            "runtime-topology.json",
+            {
+                "inference_server_urls": server_urls,
+                "policy_gpu_ids": policy_gpu_ids,
+                "policy_master_endpoints": policy_master_endpoints,
+                "policy_node_ids": policy_node_ids,
+                "ray_nodes": [
+                    {
+                        "alive": node["Alive"],
+                        "node_id": node["NodeID"],
+                        "node_manager_address": node["NodeManagerAddress"],
+                        "resources": node["Resources"],
+                    }
+                    for node in ray.nodes()
+                ],
             },
         )
 
@@ -181,6 +262,56 @@ class TransportCanaryTrainer(RayPPOTrainer):
 
 
 class LifecycleExp(BasePPOExp):
+    def __init__(self, cfg: SkyRLTrainConfig):
+        self._qualification_rollout_pg = None
+        super().__init__(cfg)
+
+    def _get_new_inference_client(self):
+        resource_name = os.environ.get("SKYRL_QUAL_ROLLOUT_RESOURCE")
+        if not resource_name:
+            return super()._get_new_inference_client()
+        if not RAY_RESOURCE_NAME.fullmatch(resource_name):
+            raise ValueError(f"invalid SKYRL_QUAL_ROLLOUT_RESOURCE: {resource_name!r}")
+
+        ie_cfg = self.cfg.generator.inference_engine
+        if (
+            ie_cfg.num_engines != 2
+            or ie_cfg.tensor_parallel_size != 1
+            or ie_cfg.pipeline_parallel_size != 1
+            or ie_cfg.data_parallel_size != 1
+            or self.cfg.trainer.placement.colocate_all
+        ):
+            raise ValueError("the role-pinned qualification requires two non-colocated one-GPU engines")
+
+        from skyrl.backends.skyrl_train.inference_servers.setup import build_new_inference_client
+
+        bundles = [{"CPU": 1, "GPU": 1, resource_name: 0.001} for _ in range(2)]
+        raw_pg = placement_group(bundles, strategy="STRICT_PACK")
+        get_ray_pg_ready_with_timeout(raw_pg)
+        resolved_pg = ResolvedPlacementGroup(raw_pg)
+        self._qualification_rollout_pg = raw_pg
+        _atomic_json(
+            "rollout-placement.json",
+            {
+                "bundle_gpu_ids": resolved_pg.bundle_gpu_ids,
+                "bundle_node_ids": resolved_pg.bundle_node_ids,
+                "bundle_specs": bundles,
+                "resource_name": resource_name,
+                "strategy": "STRICT_PACK",
+            },
+        )
+
+        client, server_setup = build_new_inference_client(
+            self.cfg,
+            self.tokenizer,
+            placement_group=resolved_pg,
+        )
+        self._inference_router = server_setup.router
+        self._server_groups = server_setup.server_groups
+        self._prefill_server_groups = server_setup.prefill_server_groups
+        self._decode_server_groups = server_setup.decode_server_groups
+        return client
+
     def get_trainer(
         self,
         cfg,
@@ -229,6 +360,13 @@ class LifecycleExp(BasePPOExp):
         for index, group in enumerate(unique_groups.values()):
             attempt(f"inference-server-group-{index}", group.shutdown)
 
+        if self._qualification_rollout_pg is not None:
+            attempt(
+                "rollout-placement-group",
+                lambda: ray.util.remove_placement_group(self._qualification_rollout_pg),
+            )
+            self._qualification_rollout_pg = None
+
         if self.trainer is not None and self.trainer.dispatch is not None:
             actor_groups = getattr(self.trainer.dispatch, "_actor_groups", {})
             actor_handles = {
@@ -269,6 +407,14 @@ class LifecycleExp(BasePPOExp):
 
 @ray.remote(num_cpus=1)
 def skyrl_entrypoint(cfg: SkyRLTrainConfig) -> None:
+    context = ray.get_runtime_context()
+    _atomic_json(
+        "driver-placement.json",
+        {
+            "node_id": context.get_node_id(),
+            "node_manager_address": ray.util.get_node_ip_address(),
+        },
+    )
     register(id="multiply", entry_point="examples.train.multiply.env:MultiplyEnv")
     LifecycleExp(cfg).run()
 
@@ -305,9 +451,17 @@ def main() -> None:
             "torch": torch.__version__,
         },
     )
+    driver_resource = os.environ.get("SKYRL_QUAL_DRIVER_RESOURCE")
+    if driver_resource and not RAY_RESOURCE_NAME.fullmatch(driver_resource):
+        raise ValueError(f"invalid SKYRL_QUAL_DRIVER_RESOURCE: {driver_resource!r}")
+
     initialize_ray(cfg)
     try:
-        ray.get(skyrl_entrypoint.remote(cfg))
+        _validate_multinode_ray_cluster()
+        entrypoint = skyrl_entrypoint
+        if driver_resource:
+            entrypoint = entrypoint.options(resources={driver_resource: 0.001})
+        ray.get(entrypoint.remote(cfg))
     finally:
         ray.shutdown()
 

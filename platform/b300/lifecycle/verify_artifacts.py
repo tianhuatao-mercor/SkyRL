@@ -263,6 +263,7 @@ def main() -> None:
     parser.add_argument("--post-processes", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--expected-inference-receivers", type=int, default=1)
+    parser.add_argument("--expected-inference-host", default="127.0.0.1")
     parser.add_argument("--inference-log-dir", type=Path)
     parser.add_argument(
         "--output",
@@ -272,6 +273,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.expected_inference_receivers < 1:
         parser.error("--expected-inference-receivers must be positive")
+    if not args.expected_inference_host or ":" in args.expected_inference_host:
+        parser.error("--expected-inference-host must be a non-empty IPv4 address or hostname")
 
     checks: dict[str, object] = {}
     outcome = _json(args.result_dir / "lifecycle-outcome.json")
@@ -292,7 +295,7 @@ def main() -> None:
             train_start.get("inference_server_count") != args.expected_inference_receivers
             or not isinstance(server_urls, list)
             or len(set(server_urls)) != args.expected_inference_receivers
-            or any(not url.startswith("http://127.0.0.1:") for url in server_urls)
+            or any(not url.startswith(f"http://{args.expected_inference_host}:") for url in server_urls)
         ):
             raise RuntimeError(f"invalid multi-engine topology evidence: {train_start}")
     checks["inference_topology"] = {
@@ -367,7 +370,8 @@ def main() -> None:
         if len(router_logs) != 1:
             raise RuntimeError(f"expected exactly one router log, found {router_logs}")
         router_text = router_logs[0].read_text(encoding="utf-8", errors="replace")
-        routes = re.findall(r"worker='(http://127\.0\.0\.1:\d+)' \(index=(\d+)\)", router_text)
+        host_pattern = re.escape(args.expected_inference_host)
+        routes = re.findall(rf"worker='(http://{host_pattern}:\d+)' \(index=(\d+)\)", router_text)
         route_counts = {
             index: sum(1 for _, observed_index in routes if observed_index == index)
             for index in sorted({observed_index for _, observed_index in routes})
@@ -457,10 +461,24 @@ def main() -> None:
     missing_markers = [marker for marker in required_markers if marker not in log_text]
     if missing_markers:
         raise RuntimeError(f"required lifecycle log markers missing: {missing_markers}")
-    fatal_markers = ["CUDA out of memory", "undefined symbol", "NCCL error", "Traceback (most recent call last)"]
-    found_fatal = [marker for marker in fatal_markers if marker in log_text]
-    if found_fatal:
-        raise RuntimeError(f"fatal markers found in log: {found_fatal}")
+    allowed_modelopt_warning = (
+        "UserWarning: Failed to import modelopt vllm plugin due to: "
+        "AttributeError('/opt/venvs/skyrl-megatron/lib/python3.12/site-packages/"
+        "tilelang/lib/libcudart_stub.so: undefined symbol: cudaDeviceReset'). "
+        "You may ignore this warning if you do not need this plugin."
+    )
+    allowed_count = log_text.count(allowed_modelopt_warning)
+    if allowed_count > 1:
+        raise RuntimeError(f"unexpected repeated ModelOpt vLLM plugin warning: {allowed_count}")
+    fatal_markers = ("CUDA out of memory", "undefined symbol", "NCCL error", "Traceback (most recent call last)")
+    fatal_lines = [
+        line
+        for line in log_text.splitlines()
+        if any(marker in line for marker in fatal_markers) and allowed_modelopt_warning not in line
+    ]
+    if fatal_lines:
+        raise RuntimeError(f"fatal markers found in log: {fatal_lines[:10]}")
+    checks["allowed_warnings"] = {"modelopt_vllm_plugin_cuda_stub": allowed_count}
     checks["log_markers"] = required_markers
 
     result = {"checks": checks, "status": "PASS"}
