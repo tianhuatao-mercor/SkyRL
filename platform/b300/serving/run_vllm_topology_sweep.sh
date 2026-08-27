@@ -293,7 +293,7 @@ run_shape() {
     --enable-chunked-prefill
     --no-enable-prefix-caching
     --attention-backend FLASHINFER
-    --disable-log-requests
+    --no-enable-log-requests
     "${extra[@]}"
   )
   printf '%s\0' "${server_cmd[@]}" | jq -Rs 'split("\u0000")[:-1]' >"$qual_dir/shapes/$shape-server-command.json"
