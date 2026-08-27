@@ -70,6 +70,24 @@ from skyrl.train.utils.utils import (
 
 _SET_AFFINITY = False
 
+
+def _rank_selected_by_env(env_name: str, rank: int) -> bool:
+    """Return whether ``rank`` is selected by a comma-separated env value.
+
+    The profiling launchers use this for bounded diagnostics without changing
+    the normal training configuration contract. ``all`` selects every rank;
+    an unset or empty value selects none.
+    """
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        return False
+    if value.lower() == "all":
+        return True
+    try:
+        return rank in {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be 'all' or comma-separated integer ranks, got {value!r}") from exc
+
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
         RemoteInferenceClient,
@@ -102,9 +120,16 @@ class DistributedTorchRayActor:
         os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0]) if ray_noset_visible_devices() else "0"
         self.sequence_parallel_size: int = sequence_parallel_size
 
-        self.record_memory = record_memory
-        if record_memory:
-            torch.cuda.memory._record_memory_history()
+        memory_rank_filter = os.environ.get("SKYRL_MEMORY_SNAPSHOT_RANKS", "").strip()
+        self.record_memory = record_memory and (
+            not memory_rank_filter or _rank_selected_by_env("SKYRL_MEMORY_SNAPSHOT_RANKS", rank)
+        )
+        # Start allocator history immediately before the bounded training loop,
+        # not during actor construction/model loading. Recording the full model
+        # initialization creates very large histories and can itself perturb
+        # memory headroom before the profiled updates begin.
+        self._memory_history_started = False
+        self._nsys_profile_started = False
 
         # Redirect worker output to log file (infra logs shouldn't pollute driver stdout)
         from skyrl.train.utils.ray_logging import redirect_actor_output_to_file
@@ -360,6 +385,20 @@ class Worker(DistributedTorchRayActor):
 
     def start_profile(self) -> None:
         """Arm the profiler before the training loop (no-op when disabled)."""
+        if getattr(self, "record_memory", False) and not getattr(self, "_memory_history_started", False):
+            max_entries = int(os.environ.get("SKYRL_MEMORY_HISTORY_MAX_ENTRIES", "200000"))
+            torch.cuda.memory._record_memory_history(max_entries=max_entries)
+            self._memory_history_started = True
+            logger.info(f"[MemorySnapshot] recording rank {self._rank} with max_entries={max_entries}")
+
+        if (
+            _rank_selected_by_env("SKYRL_NSYS_PROFILE_RANKS", getattr(self, "_rank", -1))
+            and not getattr(self, "_nsys_profile_started", False)
+        ):
+            torch.cuda.cudart().cudaProfilerStart()
+            self._nsys_profile_started = True
+            logger.info(f"[NsightSystems] cudaProfilerStart on rank {self._rank}")
+
         if self.profiler is not None:
             self.profiler.start()
 
@@ -372,6 +411,14 @@ class Worker(DistributedTorchRayActor):
         """Stop the profiler after the training loop, flushing any open window."""
         if self.profiler is not None:
             self.profiler.stop()
+        if getattr(self, "_memory_history_started", False):
+            torch.cuda.memory._record_memory_history(enabled=None)
+            self._memory_history_started = False
+            logger.info(f"[MemorySnapshot] stopped recording rank {self._rank}")
+        if getattr(self, "_nsys_profile_started", False):
+            torch.cuda.cudart().cudaProfilerStop()
+            self._nsys_profile_started = False
+            logger.info(f"[NsightSystems] cudaProfilerStop on rank {self._rank}")
 
     def dump_profiler_summary(self):
         """Return this rank's last-window kernel summary, or None."""
@@ -444,9 +491,10 @@ class Worker(DistributedTorchRayActor):
 
         rank = torch.distributed.get_rank()
         save_path = os.path.join(self.cfg.ckpt_path, "memory_snapshots")
-        if self._local_rank == 0 and not io.exists(save_path):
-            io.makedirs(save_path, exist_ok=True)
-        torch.distributed.barrier()
+        # Only a bounded subset of ranks may record allocator history. Do not
+        # use a world barrier here: non-recording ranks intentionally return
+        # above and would never enter it.
+        io.makedirs(save_path, exist_ok=True)
 
         tag_str = f"_{tag}" if tag else ""
         file_name = f"rank_{rank}{tag_str}_{self._snapshot_count}.pickle"
@@ -835,7 +883,8 @@ class PolicyWorkerBase(Worker):
         self.scheduler: LRScheduler = None
         self.optimizer: Optimizer = None
         self.strategy: DistributedStrategy = None
-        self.record_memory: bool = False
+        # ``DistributedTorchRayActor`` owns ``record_memory`` and applies the
+        # optional rank filter. Do not reset it after the base constructor.
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
 

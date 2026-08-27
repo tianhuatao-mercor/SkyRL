@@ -846,8 +846,12 @@ class SFTTrainer:
 
     @property
     def _torch_profiler_enabled(self) -> bool:
-        """Whether to dispatch policy profiler RPCs."""
-        return self.cfg.trainer.policy.torch_profiler_config.enable
+        """Whether to dispatch policy profiling/memory-recording RPCs."""
+        return (
+            self.cfg.trainer.policy.torch_profiler_config.enable
+            or self.cfg.trainer.policy.record_memory
+            or bool(os.environ.get("SKYRL_NSYS_PROFILE_RANKS", "").strip())
+        )
 
     def _build_collator(self, tokenizer):
         """Select the batch collator from the configured packing mode.

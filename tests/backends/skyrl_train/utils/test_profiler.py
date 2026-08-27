@@ -214,6 +214,17 @@ class TestWorkerProfilerRPCs:
         Worker.stop_profile(stub)
         assert calls == ["start", "step", "stop"]
 
+    def test_rank_selection_env(self, monkeypatch):
+        from skyrl.backends.skyrl_train.workers.worker import _rank_selected_by_env
+
+        monkeypatch.delenv("SKYRL_TEST_PROFILE_RANKS", raising=False)
+        assert _rank_selected_by_env("SKYRL_TEST_PROFILE_RANKS", 0) is False
+        monkeypatch.setenv("SKYRL_TEST_PROFILE_RANKS", "0,8,16")
+        assert _rank_selected_by_env("SKYRL_TEST_PROFILE_RANKS", 8) is True
+        assert _rank_selected_by_env("SKYRL_TEST_PROFILE_RANKS", 7) is False
+        monkeypatch.setenv("SKYRL_TEST_PROFILE_RANKS", "all")
+        assert _rank_selected_by_env("SKYRL_TEST_PROFILE_RANKS", 63) is True
+
 
 class TestBuildProfilerFromPolicyCfg:
     """Coverage for the worker profiler factory."""
