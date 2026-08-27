@@ -425,6 +425,28 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "optim_step")
         return grad_norms[0]
 
+    def estimate_training_flops(
+        self,
+        model: str,
+        *,
+        batch_size: int,
+        seqlen_sum: int,
+        seqlen_squared_sum: int,
+    ) -> float:
+        """Estimate one global batch's model FLOPs on a single worker.
+
+        Model configuration is materialized only inside Megatron workers, so
+        rank zero performs the inexpensive Megatron Bridge calculation. This
+        avoids broadcasting a provider object or issuing an RPC to every rank.
+        """
+        actor_info = self._actor_groups[model].actor_infos[0]
+        ref = actor_info.handle.estimate_training_flops.remote(
+            batch_size=batch_size,
+            seqlen_sum=seqlen_sum,
+            seqlen_squared_sum=seqlen_squared_sum,
+        )
+        return float(ray.get(ref))
+
     def set_lr(self, model: str, learning_rate: float, model_id: Optional[str] = None) -> None:
         """Set learning rate for model's optimizer.
 
