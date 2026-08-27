@@ -1,4 +1,6 @@
 import argparse
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -98,3 +100,16 @@ def test_cleanup_accepts_current_and_legacy_prefixes(resource_id: str) -> None:
 def test_cleanup_rejects_unmanaged_or_full_resource_names(resource_id: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         cleanup._resource_id(resource_id)
+
+
+def test_cleanup_module_exposes_cli_entrypoint() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "skyrl.backends.fireworks.cleanup", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "--trainer-job-id" in result.stdout
+    assert "--deployment-id" in result.stdout

@@ -131,3 +131,7 @@ def main() -> None:
         preserve_trainer=args.preserve_trainer,
     ):
         raise RuntimeError("Dedicated Fireworks resources did not reach terminal states")
+
+
+if __name__ == "__main__":
+    main()
