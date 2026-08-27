@@ -17,15 +17,17 @@ die() {
 }
 
 usage() {
-  printf 'Usage: %s --execute --model {dense|moe}\n' "$0"
+  printf 'Usage: %s --execute --model {dense|moe} [--shapes comma,separated,list]\n' "$0"
 }
 
 execute=false
 model_family=""
+requested_shapes=""
 while (($#)); do
   case "$1" in
     --execute) execute=true; shift ;;
     --model) model_family=${2:?}; shift 2 ;;
+    --shapes) requested_shapes=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -44,13 +46,26 @@ if [[ "$model_family" == dense ]]; then
   readonly MODEL_PATH="/shared/models/qwen3.8-27b-1d4bf0f"
   readonly MODEL_REPO="Qwen/Qwen3.8-27B"
   readonly MODEL_REVISION="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
-  shapes=(tp1 tp2 tp4 tp8)
+  allowed_shapes=(tp1 tp2 tp4 tp8)
 else
   readonly MODEL_PATH="/shared/models/qwen3.6-35b-a3b-995ad96"
   readonly MODEL_REPO="Qwen/Qwen3.6-35B-A3B"
   readonly MODEL_REVISION="995ad96eacd98c81ed38be0c5b274b04031597b0"
-  shapes=(tp1 tp2 tp2ep tp4 tp4ep dp8ep)
+  allowed_shapes=(tp1 tp2 tp2ep tp4 tp4ep dp8ep)
 fi
+if [[ -n "$requested_shapes" ]]; then
+  IFS=, read -r -a shapes <<<"$requested_shapes"
+else
+  shapes=("${allowed_shapes[@]}")
+fi
+((${#shapes[@]})) || die "at least one topology shape is required"
+for requested_shape in "${shapes[@]}"; do
+  supported=false
+  for allowed_shape in "${allowed_shapes[@]}"; do
+    [[ "$requested_shape" != "$allowed_shape" ]] || supported=true
+  done
+  [[ "$supported" == true ]] || die "unsupported $model_family topology: $requested_shape"
+done
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-vllm-${model_family}-topology-b300-r1"
 qual_dir="$QUAL_ROOT/$run_id"
@@ -139,6 +154,7 @@ git -C "$WORKTREE" rev-parse HEAD >"$qual_dir/worktree-revision.txt"
 git -C "$WORKTREE" status --short >"$qual_dir/worktree-status.txt"
 git -C "$WORKTREE" remote -v >"$qual_dir/worktree-remotes.txt"
 docker image inspect "$IMAGE_ID" >"$qual_dir/image-inspect.json"
+printf '%s\n' "${shapes[@]}" >"$qual_dir/selected-shapes.txt"
 docker run --rm --pull=never --network none --entrypoint /opt/venvs/skyrl-megatron/bin/python "$IMAGE_ID" \
   -c 'import importlib.metadata as m, json; print(json.dumps({p: m.version(p) for p in ("torch", "transformers", "vllm")}, sort_keys=True))' \
   >"$qual_dir/runtime-versions.json"
@@ -293,6 +309,7 @@ run_shape() {
     --enable-chunked-prefill
     --no-enable-prefix-caching
     --attention-backend FLASHINFER
+    --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}'
     --no-enable-log-requests
     "${extra[@]}"
   )
