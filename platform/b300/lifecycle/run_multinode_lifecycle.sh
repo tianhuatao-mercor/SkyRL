@@ -488,7 +488,30 @@ worker_container_id=$(create_container \
 verify_container_identity "$WORKER_ALIAS" "$worker_container_id" "$worker_name" || die "worker container identity mismatch"
 node_exec "$WORKER_ALIAS" docker inspect "$worker_container_id" >"$qual_dir/container-prestart-worker.json"
 node_exec "$WORKER_ALIAS" docker start "$worker_container_id" >"$qual_dir/container-start-worker.txt"
-node_exec "$WORKER_ALIAS" bash -lc "for i in \$(seq 1 60); do if docker logs '$worker_container_id' 2>&1 | grep -q 'Started a local Ray instance'; then exit 0; fi; if [[ \$(docker inspect '$worker_container_id' --format '{{.State.Running}}') != true ]]; then exit 1; fi; sleep 1; done; exit 1" || die "Ray worker did not join within 60 seconds"
+
+ray_probe_code="$(printf '%s\n' \
+  'import json, ray' \
+  "ray.init(address='$HEAD_IP:$RAY_PORT', log_to_driver=False, logging_level='ERROR')" \
+  'nodes = {node["NodeManagerAddress"]: node for node in ray.nodes() if node["Alive"]}' \
+  "assert set(nodes) == {'$HEAD_IP', '$WORKER_IP'}, sorted(nodes)" \
+  "assert nodes['$HEAD_IP']['Resources'].get('GPU') == 1" \
+  "assert nodes['$HEAD_IP']['Resources'].get('$DRIVER_RESOURCE', 0) >= 1" \
+  "assert nodes['$WORKER_IP']['Resources'].get('GPU') == 2" \
+  "assert nodes['$WORKER_IP']['Resources'].get('$ROLLOUT_RESOURCE', 0) >= 1" \
+  'print(json.dumps({"nodes": sorted(nodes), "status": "PASS"}, sort_keys=True))' \
+  'ray.shutdown()')"
+worker_ready=false
+for _ in $(seq 1 20); do
+  if node_exec "$HEAD_ALIAS" docker exec "$head_container_id" \
+    /opt/venvs/skyrl-megatron/bin/python -c "$ray_probe_code" \
+    >>"$qual_dir/ray-cluster-readiness-attempts.log" 2>&1; then
+    worker_ready=true
+    break
+  fi
+  [[ $(node_exec "$WORKER_ALIAS" docker inspect "$worker_container_id" --format '{{.State.Running}}') == true ]] || break
+  sleep 1
+done
+[[ "$worker_ready" == true ]] || die "Ray worker did not register with the exact role resources"
 
 node_exec "$HEAD_ALIAS" docker exec "$head_container_id" /opt/venvs/skyrl-megatron/bin/ray status "--address=$HEAD_IP:$RAY_PORT" >"$qual_dir/ray-status-pre-driver.txt"
 
