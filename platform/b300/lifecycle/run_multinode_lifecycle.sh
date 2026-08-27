@@ -390,6 +390,10 @@ create_container() {
   local scratch=$5
   shift 5
   local role_home=/c/h-head
+  local -a host_gpu_ids=()
+  IFS=, read -r -a host_gpu_ids <<<"$gpu_spec"
+  local cuda_visible
+  cuda_visible=$(seq -s, 0 $(( ${#host_gpu_ids[@]} - 1 )))
   [[ "$role" != driver ]] || role_home=/c/h-driver
   local -a args=(
     docker create
@@ -420,7 +424,7 @@ create_container() {
     --mount "type=bind,src=$payload_dir/skyrl/backends/skyrl_train/weight_sync/broadcast_strategy.py,dst=/workspace/SkyRL/skyrl/backends/skyrl_train/weight_sync/broadcast_strategy.py,readonly"
     --mount "type=bind,src=$payload_dir/skyrl/train/utils/utils.py,dst=/workspace/SkyRL/skyrl/train/utils/utils.py,readonly"
     --env "NVIDIA_VISIBLE_DEVICES=$gpu_spec"
-    --env "CUDA_VISIBLE_DEVICES=$gpu_spec"
+    --env "CUDA_VISIBLE_DEVICES=$cuda_visible"
     --env HF_HUB_OFFLINE=1
     --env TRANSFORMERS_OFFLINE=1
     --env HF_DATASETS_OFFLINE=1
@@ -469,6 +473,10 @@ verify_container_identity "$HEAD_ALIAS" "$head_container_id" "$head_name" || die
 node_exec "$HEAD_ALIAS" docker inspect "$head_container_id" >"$qual_dir/container-prestart-head.json"
 node_exec "$HEAD_ALIAS" docker start "$head_container_id" >"$qual_dir/container-start-head.txt"
 node_exec "$HEAD_ALIAS" bash -lc "for i in \$(seq 1 60); do if timeout 1 bash -c '</dev/tcp/$HEAD_IP/$RAY_PORT' 2>/dev/null; then exit 0; fi; sleep 1; done; exit 1" || die "Ray head did not accept private-IP connections within 60 seconds"
+node_exec "$HEAD_ALIAS" docker exec "$head_container_id" \
+  /opt/venvs/skyrl-megatron/bin/python -c \
+  'import json, os, torch; count=torch.cuda.device_count(); print(json.dumps({"cuda_available":torch.cuda.is_available(),"cuda_device_count":count,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),"devices":[torch.cuda.get_device_name(i) for i in range(count)],"status":"PASS" if count == 1 else "FAIL"},sort_keys=True)); assert count == 1' \
+  >"$qual_dir/head-cuda-visibility.json"
 
 worker_container_id=$(create_container \
   "$WORKER_ALIAS" worker "$worker_name" "$WORKER_GPUS" "$worker_scratch" \
@@ -507,6 +515,10 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 [[ "$worker_ready" == true ]] || die "Ray worker did not register with the exact role resources"
+node_exec "$WORKER_ALIAS" docker exec "$worker_container_id" \
+  /opt/venvs/skyrl-megatron/bin/python -c \
+  'import json, os, torch; count=torch.cuda.device_count(); print(json.dumps({"cuda_available":torch.cuda.is_available(),"cuda_device_count":count,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),"devices":[torch.cuda.get_device_name(i) for i in range(count)],"status":"PASS" if count == 2 else "FAIL"},sort_keys=True)); assert count == 2' \
+  >"$qual_dir/worker-cuda-visibility.json"
 
 node_exec "$HEAD_ALIAS" docker exec "$head_container_id" /opt/venvs/skyrl-megatron/bin/ray status "--address=$HEAD_IP:$RAY_PORT" >"$qual_dir/ray-status-pre-driver.txt"
 
