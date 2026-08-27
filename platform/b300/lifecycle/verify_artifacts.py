@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Iterator
 
@@ -261,12 +262,16 @@ def main() -> None:
     parser.add_argument("--post-containers", type=Path, required=True)
     parser.add_argument("--post-processes", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--expected-inference-receivers", type=int, default=1)
+    parser.add_argument("--inference-log-dir", type=Path)
     parser.add_argument(
         "--output",
         type=Path,
         help="write the verification record outside result-dir for an immutable after-the-fact audit",
     )
     args = parser.parse_args()
+    if args.expected_inference_receivers < 1:
+        parser.error("--expected-inference-receivers must be positive")
 
     checks: dict[str, object] = {}
     outcome = _json(args.result_dir / "lifecycle-outcome.json")
@@ -279,6 +284,21 @@ def main() -> None:
     if eval_start_0["weight_version"] != 1 or eval_start_1["weight_version"] != 2:
         raise RuntimeError(f"unexpected vLLM weight versions: {eval_start_0}, {eval_start_1}")
     checks["weight_versions"] = {"baseline": 1, "post_update": 2}
+
+    train_start = _json(args.result_dir / "event-train-start.json")
+    if args.expected_inference_receivers > 1:
+        server_urls = train_start.get("inference_server_urls")
+        if (
+            train_start.get("inference_server_count") != args.expected_inference_receivers
+            or not isinstance(server_urls, list)
+            or len(set(server_urls)) != args.expected_inference_receivers
+            or any(not url.startswith("http://127.0.0.1:") for url in server_urls)
+        ):
+            raise RuntimeError(f"invalid multi-engine topology evidence: {train_start}")
+    checks["inference_topology"] = {
+        "expected_receivers": args.expected_inference_receivers,
+        "server_urls": train_start.get("inference_server_urls", []),
+    }
 
     metrics = _json(args.result_dir / "metrics-step-1.json")
     logs = metrics["logs"]
@@ -327,6 +347,9 @@ def main() -> None:
     if any(
         record.get("backend") != "nccl"
         or record.get("completed_after_finish_weight_update") is not True
+        or record.get("inference_receiver_ranks", 1) != args.expected_inference_receivers
+        or record.get("inference_server_count", 1) != args.expected_inference_receivers
+        or record.get("world_size", 2) != args.expected_inference_receivers + 1
         or record.get("transfer_index") != index
         or record.get("tensor_count", 0) <= 0
         or record.get("tensor_bytes", 0) <= 0
@@ -336,6 +359,30 @@ def main() -> None:
     if sync_records[0]["tensor_count"] != sync_records[1]["tensor_count"] or sync_records[0]["tensor_bytes"] != sync_records[1]["tensor_bytes"]:
         raise RuntimeError(f"initial/post-update transfer accounting differs: {sync_records}")
     checks["weight_sync_transfers"] = sync_records
+
+    if args.expected_inference_receivers > 1:
+        if args.inference_log_dir is None:
+            raise RuntimeError("multi-engine verification requires --inference-log-dir")
+        router_logs = sorted(args.inference_log_dir.glob("router-*.log"))
+        if len(router_logs) != 1:
+            raise RuntimeError(f"expected exactly one router log, found {router_logs}")
+        router_text = router_logs[0].read_text(encoding="utf-8", errors="replace")
+        routes = re.findall(r"worker='(http://127\.0\.0\.1:\d+)' \(index=(\d+)\)", router_text)
+        route_counts = {
+            index: sum(1 for _, observed_index in routes if observed_index == index)
+            for index in sorted({observed_index for _, observed_index in routes})
+        }
+        expected_indexes = {str(index) for index in range(args.expected_inference_receivers)}
+        if set(route_counts) != expected_indexes or any(count <= 0 for count in route_counts.values()):
+            raise RuntimeError(f"router did not exercise every inference engine: {route_counts}")
+        routed_urls = {url for url, _ in routes}
+        if len(routed_urls) != args.expected_inference_receivers:
+            raise RuntimeError(f"router URL count differs from expected topology: {routed_urls}")
+        checks["router_distribution"] = {
+            "log": str(router_logs[0]),
+            "requests_per_engine_index": route_counts,
+            "worker_urls": sorted(routed_urls),
+        }
 
     checks["parameter_delta"] = _compare_exports(
         args.export_dir / "global_step_0" / "policy",

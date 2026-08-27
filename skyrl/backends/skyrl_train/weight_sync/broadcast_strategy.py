@@ -134,12 +134,17 @@ class BroadcastWeightTransferSender(WeightTransferSender):
             dtype = getattr(torch, str(dtype_name).removeprefix("torch."))
             total_bytes += math.prod(int(size) for size in shape) * torch.empty((), dtype=dtype).element_size()
         self._completed_transfers += 1
+        receiver_ranks = self._init_info.world_size - 1
+        server_count = len(self._inference_client.server_urls)
         record = {
             "backend": "nccl",
             "completed_after_finish_weight_update": True,
+            "inference_receiver_ranks": receiver_ranks,
+            "inference_server_count": server_count,
             "tensor_bytes": total_bytes,
             "tensor_count": len(names),
             "transfer_index": self._completed_transfers,
+            "world_size": self._init_info.world_size,
         }
         path = os.path.join(result_dir, f"weight-sync-transfer-{self._completed_transfers}.json")
         with open(path, "x", encoding="utf-8") as stream:

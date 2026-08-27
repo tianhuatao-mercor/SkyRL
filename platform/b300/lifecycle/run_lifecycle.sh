@@ -21,17 +21,19 @@ die() {
 }
 
 usage() {
-  printf 'Usage: %s --execute --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-<id> [--gpus 0,1]\n' "$0"
+  printf 'Usage: %s --execute --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-<id> [--num-engines 1|2] [--gpus 0,1[,2]]\n' "$0"
 }
 
 execute=false
 dataset_dir=""
 gpu_ids="0,1"
+num_engines=1
 while (($#)); do
   case "$1" in
     --execute) execute=true; shift ;;
     --dataset-dir) dataset_dir=${2:?}; shift 2 ;;
     --gpus) gpu_ids=${2:?}; shift 2 ;;
+    --num-engines) num_engines=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -39,9 +41,15 @@ done
 
 [[ "$execute" == true ]] || die "refusing GPU launch without --execute"
 [[ "$dataset_dir" == "$EXPECTED_DATASET_DIR" ]] || die "dataset must be the exact pinned artifact: $EXPECTED_DATASET_DIR"
-[[ "$gpu_ids" =~ ^[0-7],[0-7]$ ]] || die "--gpus must select exactly two B300 indices"
-IFS=, read -r rollout_gpu policy_gpu <<<"$gpu_ids"
-[[ "$rollout_gpu" != "$policy_gpu" ]] || die "two distinct GPU indices are required"
+[[ "$num_engines" == 1 || "$num_engines" == 2 ]] || die "--num-engines must be 1 or 2"
+[[ "$gpu_ids" =~ ^[0-7](,[0-7])+$ ]] || die "--gpus must be a comma-separated B300 index list"
+IFS=, read -r -a selected_gpus <<<"$gpu_ids"
+(( ${#selected_gpus[@]} == num_engines + 1 )) || die "GPU count must equal num-engines plus one policy GPU"
+declare -A seen_gpus=()
+for gpu in "${selected_gpus[@]}"; do
+  [[ -z ${seen_gpus[$gpu]+x} ]] || die "GPU indices must be distinct"
+  seen_gpus[$gpu]=1
+done
 [[ $(hostname -s) == "ip-172-31-67-119" ]] || die "this bounded gate is pinned to aws-b300-node1"
 [[ -f "$dataset_dir/manifest.json" ]] || die "dataset manifest missing"
 [[ -f "$MODEL_DIR/MODEL_MANIFEST.json" ]] || die "model manifest missing"
@@ -56,7 +64,11 @@ actual_image_id=$(docker image inspect "$EXPECTED_IMAGE_REF" --format '{{.Id}}')
 git -C "$WORKTREE" merge-base --is-ancestor "$EXPECTED_SOURCE_REV" HEAD || die "qualified image revision is not an ancestor of the lifecycle worktree"
 [[ -z $(git -C "$WORKTREE" status --short) ]] || die "lifecycle worktree must be clean before staging the runtime payload"
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-skyrl-lifecycle-nccl-dense-r1"
+run_suffix="skyrl-lifecycle-nccl-dense-r1"
+if (( num_engines > 1 )); then
+  run_suffix="skyrl-lifecycle-nccl-dense-${num_engines}eng-r1"
+fi
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$run_suffix"
 qual_dir="$QUAL_ROOT/$run_id"
 checkpoint_dir="$CHECKPOINT_ROOT/$run_id/checkpoints"
 export_dir="$CHECKPOINT_ROOT/$run_id/exports"
@@ -142,7 +154,7 @@ trap 'exit 143' TERM
 
 snapshot pre
 
-for gpu in "$rollout_gpu" "$policy_gpu"; do
+for gpu in "${selected_gpus[@]}"; do
   used=$(nvidia-smi --id="$gpu" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
   [[ "$used" == "0" ]] || die "GPU $gpu is not idle: ${used} MiB used"
   gpu_uuid=$(nvidia-smi --id="$gpu" --query-gpu=uuid --format=csv,noheader | tr -d ' ')
@@ -318,7 +330,7 @@ cmd=(
   trainer.enable_ray_gpu_monitor=false
   generator.inference_engine.backend=vllm
   generator.inference_engine.run_engines_locally=true
-  generator.inference_engine.num_engines=1
+  generator.inference_engine.num_engines="$num_engines"
   generator.inference_engine.tensor_parallel_size=1
   generator.inference_engine.pipeline_parallel_size=1
   generator.inference_engine.data_parallel_size=1
@@ -444,7 +456,7 @@ snapshot post
 [[ "$start_rc" -eq 0 ]] || die "bounded container start failed or timed out: rc=$start_rc"
 [[ "$container_exit_code" -eq 0 ]] || die "container exit code was $container_exit_code"
 
-for gpu in "$rollout_gpu" "$policy_gpu"; do
+for gpu in "${selected_gpus[@]}"; do
   for _ in $(seq 1 30); do
     used=$(nvidia-smi --id="$gpu" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
     [[ "$used" == "0" ]] && break
@@ -477,6 +489,8 @@ ps -eo comm=,args= | awk '
   --post-containers "$qual_dir/post-containers.txt" \
   --post-processes "$qual_dir/post-processes.txt" \
   --run-id "$run_id" \
+  --expected-inference-receivers "$num_engines" \
+  --inference-log-dir "$infra_log_dir" \
   2> >(tee "$qual_dir/artifact-verification.stderr" >&2) \
   | tee "$qual_dir/artifact-verification.stdout"
 
@@ -484,8 +498,8 @@ ps -eo comm=,args= | awk '
   cd "$CHECKPOINT_ROOT/$run_id"
   find . -type f -print0 | sort -z | xargs -0 sha256sum
 ) >"$qual_dir/checkpoint-files.sha256"
-printf '{"container_exit_code":0,"gpu_ids":"%s","run_id":"%s","scratch_preserved":"%s","status":"PASS"}\n' \
-  "$gpu_ids" "$run_id" "$scratch_dir" >"$qual_dir/launcher-result.json"
+printf '{"container_exit_code":0,"gpu_ids":"%s","num_engines":%d,"run_id":"%s","scratch_preserved":"%s","status":"PASS"}\n' \
+  "$gpu_ids" "$num_engines" "$run_id" "$scratch_dir" >"$qual_dir/launcher-result.json"
 (
   cd "$qual_dir"
   find . -type f ! -name EVIDENCE.sha256 -print0 | sort -z | xargs -0 sha256sum

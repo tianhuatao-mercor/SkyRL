@@ -98,9 +98,15 @@ class LifecycleEvidenceCallback(TrainingCallback):
         # Initial sync is complete when this callback fires. Export the exact
         # trainer weights used for the baseline inference before any update.
         trainer.save_models(checkpoint_step=0)
+        server_urls = list(getattr(trainer.inference_engine_client, "server_urls", []))
         _atomic_json(
             "event-train-start.json",
-            {"global_step": callback_input.global_step, "weight_version": self._version(trainer)},
+            {
+                "global_step": callback_input.global_step,
+                "inference_server_count": len(server_urls),
+                "inference_server_urls": server_urls,
+                "weight_version": self._version(trainer),
+            },
         )
 
     def on_step_end(self, trainer, callback_input, control) -> None:

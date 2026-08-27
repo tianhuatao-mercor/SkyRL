@@ -50,3 +50,19 @@ run and checkpoint checksums before GPU allocation, mounts `/shared` read-only,
 binds vLLM only to loopback, requires exact response token IDs on two replay
 passes, bounds aligned logprob drift to `2e-3`, proves cleanup, and freezes a
 separate evidence directory for the fresh process.
+
+The next scale gate keeps the same bounded dataset and single policy rank but
+uses two independent one-GPU vLLM engines. GPU order is rollout engines first,
+policy last:
+
+```bash
+platform/b300/lifecycle/run_lifecycle.sh \
+  --execute \
+  --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4 \
+  --num-engines 2 \
+  --gpus 0,1,2
+```
+
+In addition to the original lifecycle assertions, the verifier requires a
+three-rank trainer/receiver NCCL group, two distinct loopback server URLs, and
+router evidence that both engine indexes handled requests.
