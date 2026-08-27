@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import os
 import socket
@@ -70,6 +71,74 @@ from skyrl.train.utils.utils import (
 )
 
 _SET_AFFINITY = False
+
+
+def _nvtx_annotations_enabled() -> bool:
+    """Return whether worker-side SkyRL NVTX annotations are enabled."""
+    return os.environ.get("SKYRL_NVTX_ANNOTATIONS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def skyrl_nvtx_range(message: str):
+    """Emit a bounded NVTX range without affecting ordinary training runs.
+
+    Nsight Systems can collect NVTX only when the application emits ranges in
+    the process that owns the CUDA work. SkyRL's controller timers run in a
+    different process from the Ray GPU actors, so these ranges intentionally
+    live in the worker layer.
+    """
+    if not _nvtx_annotations_enabled():
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def pytorch_nvtx_ops():
+    """Ask PyTorch to emit per-operator NVTX ranges for a bounded phase."""
+    if not _nvtx_annotations_enabled():
+        yield
+        return
+
+    # ``--trace=nvtx`` only collects ranges; PyTorch does not emit aten/autograd
+    # ranges unless this profiler mode is explicitly enabled. Keep shapes off to
+    # bound overhead and report size during multi-node diagnostic captures.
+    with torch.autograd.profiler.emit_nvtx(record_shapes=False):
+        yield
+
+
+def skyrl_nvtx_annotate(message: str, *, pytorch_ops: bool = False):
+    """Decorate a sync or async GPU-worker method with NVTX ranges."""
+
+    def decorator(func):
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                with skyrl_nvtx_range(message):
+                    if pytorch_ops:
+                        with pytorch_nvtx_ops():
+                            return await func(*args, **kwargs)
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with skyrl_nvtx_range(message):
+                if pytorch_ops:
+                    with pytorch_nvtx_ops():
+                        return func(*args, **kwargs)
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def _rank_selected_by_env(env_name: str, rank: int) -> bool:
@@ -602,6 +671,7 @@ class Worker(DistributedTorchRayActor):
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         raise NotImplementedError()
 
+    @skyrl_nvtx_annotate("skyrl.checkpoint.save")
     def save_checkpoint(self, ckpt_dir: str, tokenizer=None):
         self.strategy.save_checkpoint(
             model=self.model,
