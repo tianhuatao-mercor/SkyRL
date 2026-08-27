@@ -256,13 +256,52 @@ class TestPackingCollator:
             padded = ((s + 31) // 32) * 32
             assert (padded // 2) % 16 == 0
 
-    def test_eval_path_falls_back_to_super(self):
-        """When batch_size != self.sft_cfg.batch_size (eval), no packing happens."""
-        collator = _make_collator(num_gpus=1, batch_size=4, max_length=64)
+    def test_short_final_batch_below_dp_is_zero_loss_padded(self):
+        """A packed tail with fewer real examples than DP still dispatches."""
+        collator = _make_collator(num_gpus=4, batch_size=8, max_length=64)
         examples = [_make_example(10, 5) for _ in range(2)]
-        # Eval batch with chunk size 2 (!= self.sft_cfg.batch_size=4).
-        batch = collator(examples, batch_size=2)
-        # Falls back: no sub_seq_lengths data field (and not in metadata either).
+        batch = collator(examples, batch_size=8)
+        assert batch.batch_size == 4
+        assert batch.metadata["num_real_examples"] == 2
+        assert batch.metadata["num_padding_examples"] == 2
+        assert batch.metadata["num_padding_tokens"] == 4
+        assert sum(len(lengths) for lengths in batch["sub_seq_lengths"]) == 4
+        # Only the two real examples contribute supervised tokens.
+        assert int((batch["loss_mask"] > 0).sum().item()) == 10
+
+    def test_tail_above_dp_pads_to_next_dp_multiple(self):
+        """Nine separate long sequences at DP=8 can populate sixteen bins."""
+        collator = _make_collator(num_gpus=8, batch_size=16, max_length=64)
+        examples = [_make_example(64, 8) for _ in range(9)]
+        batch = collator(examples, batch_size=16)
+        assert batch.batch_size == 16
+        assert batch.metadata["num_real_examples"] == 9
+        assert batch.metadata["num_padding_examples"] == 7
+        assert batch.metadata["num_padding_tokens"] == 14
+        assert sum(len(lengths) for lengths in batch["sub_seq_lengths"]) == 16
+        assert int(batch["attention_mask"].sum().item()) - batch.metadata["num_padding_tokens"] == 9 * 64
+
+    def test_eval_uses_explicit_default_collator_when_chunk_equals_train_batch(self):
+        """Equal numeric train/eval batch sizes must not accidentally enable FFD."""
+        cfg = SFTConfig(
+            strategy="megatron",
+            max_length=64,
+            batch_size=1,
+            micro_train_batch_size_per_gpu=1,
+            remove_microbatch_padding=True,
+            use_sequence_packing=True,
+            placement=SFTPlacementConfig(num_nodes=1, num_gpus_per_node=1),
+        )
+        cfg.megatron_config.tensor_model_parallel_size = 1
+        cfg.megatron_config.pipeline_model_parallel_size = 1
+        cfg.megatron_config.context_parallel_size = 1
+        trainer = object.__new__(SFTTrainer)
+        trainer.sft_cfg = cfg
+        trainer.tokenizer = MagicMock(pad_token_id=0)
+        trainer.dispatch = MagicMock()
+        trainer.dispatch.dp_size.return_value = 1
+        trainer.collator = trainer._build_collator(trainer.tokenizer)
+        batch = next(iter(trainer.build_eval_dataloader([_make_example(10, 5)])))
         assert batch.get("sub_seq_lengths") is None
         assert (batch.metadata or {}).get("sub_seq_lengths") is None
 

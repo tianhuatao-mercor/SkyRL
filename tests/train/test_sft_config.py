@@ -484,3 +484,49 @@ class TestMultiDatasetValidation:
         cfg = _sft_cfg_from_overrides(["eval_interval=5"])
         with pytest.raises(ValueError, match="requires eval_datasets"):
             validate_sft_cfg(cfg)
+
+
+class TestQwenLongContextSFTPlumbing:
+    def test_cli_fields_map_to_internal_trainer(self):
+        cfg = _sft_cfg_from_overrides(
+            [
+                "strategy=megatron",
+                "language_model_only=true",
+                "fused_lm_head_logprob=true",
+                "fused_lm_head_logprob_backend=torch",
+                "logprobs_chunk_size=1024",
+                "max_ckpts_to_keep=2",
+            ]
+        )
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.policy.language_model_only is True
+        assert skyrl_cfg.trainer.fused_lm_head_logprob is True
+        assert skyrl_cfg.trainer.fused_lm_head_logprob_backend == "torch"
+        assert skyrl_cfg.trainer.logprobs_chunk_size == 1024
+        assert skyrl_cfg.trainer.max_ckpts_to_keep == 2
+
+    def test_fused_lm_head_rejects_fsdp(self):
+        cfg = SFTConfig(strategy="fsdp", fused_lm_head_logprob=True)
+        with pytest.raises(ValueError, match="only supported with the Megatron"):
+            validate_sft_cfg(cfg)
+
+    def test_invalid_fused_backend_rejected(self):
+        cfg = SFTConfig(fused_lm_head_logprob_backend="invalid")
+        with pytest.raises(ValueError, match="must be 'torch' or 'triton'"):
+            validate_sft_cfg(cfg)
+
+    def test_zero_checkpoint_retention_rejected(self):
+        cfg = SFTConfig(max_ckpts_to_keep=0)
+        with pytest.raises(ValueError, match="-1.*positive integer"):
+            validate_sft_cfg(cfg)
+
+    def test_nonpacked_batch_validation_accounts_for_cp(self):
+        cfg = SFTConfig(strategy="megatron", batch_size=2, micro_train_batch_size_per_gpu=1)
+        cfg.placement.num_nodes = 1
+        cfg.placement.num_gpus_per_node = 8
+        cfg.megatron_config.tensor_model_parallel_size = 2
+        cfg.megatron_config.pipeline_model_parallel_size = 1
+        cfg.megatron_config.context_parallel_size = 2
+        trainer = object.__new__(__import__("skyrl.train.sft_trainer", fromlist=["SFTTrainer"]).SFTTrainer)
+        trainer.sft_cfg = cfg
+        trainer._validate_batch_parallelism()

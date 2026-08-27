@@ -926,7 +926,13 @@ class SFTTrainer:
             "padding_side": "left",
         }
 
-        self.is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path)
+        checkpoint_is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path)
+        self.is_vlm = checkpoint_is_vlm and not self.sft_cfg.language_model_only
+        if checkpoint_is_vlm and self.sft_cfg.language_model_only:
+            logger.info(
+                "VLM-family checkpoint detected with language_model_only=True: "
+                "using the text tokenizer and retaining text-only packing settings."
+            )
         if self.is_vlm:
             self.processor = get_processor(self.cfg.trainer.policy.model.path, **tokenizer_kwargs)
             # Sequence packing / microbatch padding removal are unsupported for
@@ -1470,9 +1476,19 @@ class SFTTrainer:
         # and removes the need for a separate `eval_batch_size` knob.
         dp_size = self.dispatch.dp_size("policy")
         eval_chunk_size = self.sft_cfg.micro_train_batch_size_per_gpu * dp_size
+        # Eval packing is selected explicitly: the first correctness run uses
+        # the ordinary un-packed layout even when the eval chunk size happens
+        # to equal the configured training batch size. Do not infer eval mode
+        # from a numeric batch-size comparison inside PackedDataCollator.
+        from skyrl.train.dataset.collators import DefaultCollator
+
+        eval_collator = DefaultCollator(
+            tokenizer=self.tokenizer,
+            micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+        )
         collate_fn = functools.partial(
             collate_sft_examples,
-            collator=self.collator,
+            collator=eval_collator,
             batch_size=eval_chunk_size,
         )
         num_workers = self.sft_cfg.dataloader_num_workers
@@ -1738,7 +1754,8 @@ class SFTTrainer:
         if self.sft_cfg.strategy == "megatron":
             tp = self.sft_cfg.megatron_config.tensor_model_parallel_size
             pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
-            dp_size = total_gpus // (tp * pp)
+            cp = self.sft_cfg.megatron_config.context_parallel_size
+            dp_size = total_gpus // (tp * pp * cp)
         else:
             # FSDP: all GPUs are data-parallel
             dp_size = total_gpus
@@ -2022,14 +2039,18 @@ class SFTTrainer:
                     step_result = self.train_step(batch, self.global_step)
                     all_timings.update(step_result["timings"])
 
-                # Compute throughput using actual (non-padding) tokens. A padded
-                # tail batch appends ``pad_size`` rows (copies of row 0) that are
-                # masked out of the loss; exclude them from the token count so the
-                # throughput metric reflects only real tokens.
+                # Compute throughput using actual (non-padding) tokens. The
+                # ordinary collator may append ``pad_size`` rows copied from row
+                # zero; the packed collator may add minimal zero-loss sequences
+                # inside FFD bins. Exclude both forms so the metric reflects only
+                # source-dataset tokens.
                 batch_padded_seq_len = batch["sequences"].shape[1]
                 pad_size = batch.metadata.get("pad_size", 0) if batch.metadata else 0
                 real_rows = batch["attention_mask"].shape[0] - pad_size
-                actual_num_tokens = batch["attention_mask"][:real_rows].sum().item()
+                packed_padding_tokens = batch.metadata.get("num_padding_tokens", 0) if batch.metadata else 0
+                actual_num_tokens = batch["attention_mask"][:real_rows].sum().item() - packed_padding_tokens
+                if actual_num_tokens < 0:
+                    raise AssertionError("padding-token accounting produced a negative real-token count")
                 self._total_tokens_processed += actual_num_tokens
                 tokens_per_second = actual_num_tokens / all_timings["step"]
 
