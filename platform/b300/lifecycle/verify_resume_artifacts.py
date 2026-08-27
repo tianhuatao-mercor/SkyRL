@@ -143,6 +143,11 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--expected-inference-receivers", type=int, default=2)
     parser.add_argument("--inference-log-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the verification record outside result-dir for an immutable offline audit",
+    )
     args = parser.parse_args()
     if args.expected_inference_receivers < 1:
         parser.error("--expected-inference-receivers must be positive")
@@ -332,14 +337,28 @@ def main() -> None:
     missing_markers = [marker for marker in required_markers if marker not in log_text]
     if missing_markers:
         raise RuntimeError(f"required resume log markers missing: {missing_markers}")
+    allowed_modelopt_warning = (
+        "UserWarning: Failed to import modelopt vllm plugin due to: "
+        "AttributeError('/opt/venvs/skyrl-megatron/lib/python3.12/site-packages/"
+        "tilelang/lib/libcudart_stub.so: undefined symbol: cudaDeviceReset'). "
+        "You may ignore this warning if you do not need this plugin."
+    )
+    allowed_count = log_text.count(allowed_modelopt_warning)
+    if allowed_count > 1:
+        raise RuntimeError(f"unexpected repeated ModelOpt vLLM plugin warning: {allowed_count}")
     fatal_markers = ("CUDA out of memory", "undefined symbol", "NCCL error", "Traceback (most recent call last)")
-    found_fatal = [marker for marker in fatal_markers if marker in log_text]
-    if found_fatal:
-        raise RuntimeError(f"fatal markers found in resume log: {found_fatal}")
+    fatal_lines = [
+        line
+        for line in log_text.splitlines()
+        if any(marker in line for marker in fatal_markers) and allowed_modelopt_warning not in line
+    ]
+    if fatal_lines:
+        raise RuntimeError(f"fatal markers found in resume log: {fatal_lines[:10]}")
+    checks["allowed_warnings"] = {"modelopt_vllm_plugin_cuda_stub": allowed_count}
     checks["log_markers"] = required_markers
 
     result = {"checks": checks, "status": "PASS"}
-    _atomic_json(args.result_dir / "artifact-verification.json", result)
+    _atomic_json(args.output or args.result_dir / "artifact-verification.json", result)
     print(json.dumps(result, sort_keys=True))
 
 

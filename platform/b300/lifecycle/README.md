@@ -90,3 +90,10 @@ The source dataloader state was saved on the final batch while its iterator was
 still marked unfinished. The gate therefore records that state and allows one
 empty restored outer iteration before the next epoch; `max_training_steps=2`
 still limits execution to exactly one new optimizer step.
+
+If the immutable source launch is complete but a captured verifier itself is
+proven wrong, preserve its launcher result and use the read-only audit wrapper:
+
+```bash
+platform/b300/lifecycle/run_resume_audit.sh --execute
+```
