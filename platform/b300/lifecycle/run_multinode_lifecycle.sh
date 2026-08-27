@@ -549,6 +549,7 @@ create_container() {
     --env VLLM_NO_USAGE_STATS=1
     --env VLLM_USE_FLASHINFER_SAMPLER=0
     --env RAY_USAGE_STATS_ENABLED=0
+    --env WANDB_ENTITY=suryamani10-mercor
     --env WANDB_MODE=offline
     --env DO_NOT_TRACK=1
     --env PYTHONDONTWRITEBYTECODE=1
