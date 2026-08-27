@@ -791,6 +791,30 @@ def _format_eval_metrics(eval_metrics: dict) -> str:
     return ", ".join(f"{k}={v:.4f}" for k, v in eval_metrics.items())
 
 
+def _training_sequence_stats(batch: TrainingInputBatch) -> tuple[int, int, int]:
+    """Return batch size, sum(length), and sum(length**2) for FLOP logging.
+
+    Packed batches use true per-trajectory lengths, so quadratic attention is
+    estimated across independent blocks rather than across whole FFD bins.
+    Unlike useful-token TPS, model FLOPs intentionally include zero-loss rows
+    that the model still executes.
+    """
+    sub_seq_lengths = batch.get("sub_seq_lengths")
+    if sub_seq_lengths is not None:
+        lengths = [int(length) for row in sub_seq_lengths for length in row.tolist()]
+        batch_size = int(
+            (batch.metadata or {}).get(
+                "num_real_examples",
+                len(lengths),
+            )
+            + (batch.metadata or {}).get("num_padding_examples", 0)
+        )
+    else:
+        lengths = [int(length) for length in batch["attention_mask"].sum(dim=1).tolist()]
+        batch_size = len(lengths)
+    return batch_size, sum(lengths), sum(length * length for length in lengths)
+
+
 class SFTTrainer:
     """SFT trainer supporting FSDP and Megatron backends.
 
@@ -1824,6 +1848,16 @@ class SFTTrainer:
                 self._total_tokens_processed += actual_num_tokens
                 tokens_per_second = actual_num_tokens / all_timings["step"]
 
+                model_flops = None
+                if self.sft_cfg.strategy == "megatron":
+                    flop_batch_size, seqlen_sum, seqlen_squared_sum = _training_sequence_stats(batch)
+                    model_flops = self.dispatch.estimate_training_flops(
+                        "policy",
+                        batch_size=flop_batch_size,
+                        seqlen_sum=seqlen_sum,
+                        seqlen_squared_sum=seqlen_squared_sum,
+                    )
+
                 log_dict = {
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
@@ -1832,6 +1866,14 @@ class SFTTrainer:
                     "train/actual_num_tokens": actual_num_tokens,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                if model_flops is not None:
+                    tflops = model_flops / all_timings["step"] / 1e12
+                    log_dict.update(
+                        {
+                            "throughput/tflops": tflops,
+                            "throughput/tflops/device": tflops / self._num_training_gpus,
+                        }
+                    )
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
                     log_dict.update(self._ray_gpu_monitor.flush())
@@ -2055,6 +2097,16 @@ class SFTTrainer:
                 tokens_per_second = actual_num_tokens / all_timings["step"]
 
                 # Build log dict
+                model_flops = None
+                if self.sft_cfg.strategy == "megatron":
+                    flop_batch_size, seqlen_sum, seqlen_squared_sum = _training_sequence_stats(batch)
+                    model_flops = self.dispatch.estimate_training_flops(
+                        "policy",
+                        batch_size=flop_batch_size,
+                        seqlen_sum=seqlen_sum,
+                        seqlen_squared_sum=seqlen_squared_sum,
+                    )
+
                 log_dict = {
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
@@ -2064,6 +2116,14 @@ class SFTTrainer:
                     "train/batch_padded_seq_len": batch_padded_seq_len,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                if model_flops is not None:
+                    tflops = model_flops / all_timings["step"] / 1e12
+                    log_dict.update(
+                        {
+                            "throughput/tflops": tflops,
+                            "throughput/tflops/device": tflops / self._num_training_gpus,
+                        }
+                    )
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
                     log_dict.update(self._ray_gpu_monitor.flush())
@@ -2115,9 +2175,13 @@ class SFTTrainer:
                 self.tracker.log(log_dict, step=self.global_step, commit=True)
 
                 if self.global_step % 5 == 0:
+                    throughput_suffix = f", tokens_per_second={tokens_per_second:.0f}"
+                    if model_flops is not None:
+                        throughput_suffix += f", model_tflops_per_gpu=" f"{log_dict['throughput/tflops/device']:.1f}"
                     logger.info(
                         f"Step {self.global_step}: loss={step_result['loss']:.4f}, "
                         f"grad_norm={step_result['grad_norm']}"
+                        f"{throughput_suffix}"
                     )
 
                 if eval_metrics:

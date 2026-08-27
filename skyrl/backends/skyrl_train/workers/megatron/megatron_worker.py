@@ -894,6 +894,39 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             pp_size=mpu.get_pipeline_model_parallel_world_size(),
         )
 
+    def estimate_training_flops(
+        self,
+        *,
+        batch_size: int,
+        seqlen_sum: int,
+        seqlen_squared_sum: int,
+    ) -> float:
+        """Return Megatron Bridge's model-FLOP estimate for one global batch."""
+        from types import SimpleNamespace
+
+        from megatron.bridge.training.utils.flop_utils import (
+            num_floating_point_operations,
+        )
+
+        # The estimator reads the finalized model provider plus a few optional
+        # top-level fields. SkyRL does not use Bridge's ConfigContainer training
+        # loop, so provide the equivalent minimal view without changing runtime
+        # model configuration.
+        bridge_cfg = SimpleNamespace(
+            model=self.provider,
+            peft=getattr(self, "lora_cls", None),
+            dataset=SimpleNamespace(dataset_name=None, packed_sequence_specs=None),
+            train=SimpleNamespace(global_batch_size=batch_size),
+        )
+        return float(
+            num_floating_point_operations(
+                bridge_cfg,
+                batch_size=batch_size,
+                seqlen_sum=seqlen_sum,
+                seqlen_squared_sum=seqlen_squared_sum,
+            )
+        )
+
     def init_model(self, model_path, num_training_steps: int = 1e9):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
