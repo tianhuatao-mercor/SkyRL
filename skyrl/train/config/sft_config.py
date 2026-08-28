@@ -242,6 +242,9 @@ class SFTConfig(BaseConfig):
     run_name: str = "skyrl_sft_run"
     tags: Optional[List[str]] = None
     """Optional list of tags to apply to the W&B run. Has no effect on other backends."""
+    peak_tflops_per_gpu: Optional[float] = None
+    """Optional dense, non-sparsity-assisted device peak used to log model FLOP
+    utilization (MFU). Leave unset when the hardware peak is not known."""
     ckpt_path: str = ""
     ckpt_interval: int = 0  # <= 0 -> no checkpointing
     enable_ray_gpu_monitor: bool = True
@@ -603,6 +606,8 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError(
             f"max_ckpts_to_keep must be -1 (keep all) or a positive integer, got {cfg.max_ckpts_to_keep}."
         )
+    if cfg.peak_tflops_per_gpu is not None and cfg.peak_tflops_per_gpu <= 0:
+        raise ValueError(f"peak_tflops_per_gpu must be > 0, got {cfg.peak_tflops_per_gpu}.")
 
     # Dataloader / sampler config
     if cfg.sampler not in _VALID_SAMPLERS:

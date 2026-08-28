@@ -94,6 +94,64 @@ from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
 )
 
 
+def _hybrid_packed_attention_flops_correction(
+    provider: Any,
+    *,
+    batch_size: int,
+    seqlen_sum: int,
+    seqlen_squared_sum: int,
+) -> float:
+    """Correct Bridge's hybrid-model full-attention FLOPs for packing.
+
+    Megatron Bridge accepts ``seqlen_squared_sum`` but its hybrid-model branch
+    currently calls ``hybrid_flops`` with only the average sequence length.
+    Linear-attention/GDN and projection terms are already exact because
+    ``batch_size * average_length == seqlen_sum``. Only the quadratic causal
+    attention core needs replacing with ``sum(length**2)``.
+    """
+    if not getattr(provider, "is_hybrid_model", False) or batch_size <= 0 or seqlen_sum <= 0:
+        return 0.0
+
+    hybrid_pattern = getattr(provider, "hybrid_layer_pattern", None)
+    if hybrid_pattern:
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            parse_hybrid_pattern,
+        )
+
+        parsed = parse_hybrid_pattern(hybrid_pattern)
+        num_full_attention_layers = sum(layer_type == "*" for layer_type in parsed.main_pattern)
+        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+            num_full_attention_layers += (
+                sum(layer_type == "*" for layer_type in parsed.mtp_pattern) * parsed.mtp_num_depths
+            )
+    else:
+        num_full_attention_layers = round(
+            getattr(provider, "num_layers", 0) * getattr(provider, "hybrid_attention_ratio", 0)
+        )
+
+    if num_full_attention_layers == 0:
+        return 0.0
+
+    kv_channels = getattr(provider, "kv_channels", None)
+    num_attention_heads = getattr(provider, "num_attention_heads", 0)
+    hidden_size = getattr(provider, "hidden_size", 0)
+    query_projection_size = (
+        kv_channels * num_attention_heads if kv_channels is not None else hidden_size
+    )
+    average_squared_sum = seqlen_sum * seqlen_sum / batch_size
+    quadratic_delta = seqlen_squared_sum - average_squared_sum
+    if quadratic_delta < -1e-6:
+        raise ValueError(
+            "seqlen_squared_sum is smaller than seqlen_sum**2 / batch_size; "
+            "the supplied packed-sequence statistics are inconsistent"
+        )
+
+    # Bridge counts causal QK^T and attention*V as
+    # 2 * sequence_length**2 * query_projection_size in the forward pass,
+    # then multiplies forward FLOPs by three for training (forward + backward).
+    return float(6 * num_full_attention_layers * query_projection_size * max(quadratic_delta, 0.0))
+
+
 def _maybe_override_fla_causal_conv_backend() -> Optional[str]:
     """Select an explicit FLA causal-convolution backend for diagnostics.
 
@@ -965,13 +1023,19 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             dataset=SimpleNamespace(dataset_name=None, packed_sequence_specs=None),
             train=SimpleNamespace(global_batch_size=batch_size),
         )
-        return float(
+        bridge_flops = float(
             num_floating_point_operations(
                 bridge_cfg,
                 batch_size=batch_size,
                 seqlen_sum=seqlen_sum,
                 seqlen_squared_sum=seqlen_squared_sum,
             )
+        )
+        return bridge_flops + _hybrid_packed_attention_flops_correction(
+            self.provider,
+            batch_size=batch_size,
+            seqlen_sum=seqlen_sum,
+            seqlen_squared_sum=seqlen_squared_sum,
         )
 
     def init_model(self, model_path, num_training_steps: int = 1e9):

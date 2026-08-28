@@ -815,6 +815,32 @@ def _training_sequence_stats(batch: TrainingInputBatch) -> tuple[int, int, int]:
     return batch_size, sum(lengths), sum(length * length for length in lengths)
 
 
+def _model_throughput_metrics(
+    *,
+    model_flops: float,
+    step_seconds: float,
+    num_gpus: int,
+    peak_tflops_per_gpu: Optional[float],
+) -> dict[str, float]:
+    """Build model-TFLOP and optional hardware-explicit MFU metrics."""
+    tflops = model_flops / step_seconds / 1e12
+    tflops_per_gpu = tflops / num_gpus
+    metrics = {
+        "throughput/tflops": tflops,
+        "throughput/tflops/device": tflops_per_gpu,
+    }
+    if peak_tflops_per_gpu is not None:
+        mfu = tflops_per_gpu / peak_tflops_per_gpu
+        metrics.update(
+            {
+                "throughput/mfu": mfu,
+                "throughput/mfu_percent": 100 * mfu,
+                "throughput/peak_tflops/device": peak_tflops_per_gpu,
+            }
+        )
+    return metrics
+
+
 class SFTTrainer:
     """SFT trainer supporting FSDP and Megatron backends.
 
@@ -1874,12 +1900,13 @@ class SFTTrainer:
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
                 if model_flops is not None:
-                    tflops = model_flops / all_timings["step"] / 1e12
                     log_dict.update(
-                        {
-                            "throughput/tflops": tflops,
-                            "throughput/tflops/device": tflops / self._num_training_gpus,
-                        }
+                        _model_throughput_metrics(
+                            model_flops=model_flops,
+                            step_seconds=all_timings["step"],
+                            num_gpus=self._num_training_gpus,
+                            peak_tflops_per_gpu=self.sft_cfg.peak_tflops_per_gpu,
+                        )
                     )
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
@@ -2156,12 +2183,13 @@ class SFTTrainer:
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
                 if model_flops is not None:
-                    tflops = model_flops / all_timings["step"] / 1e12
                     log_dict.update(
-                        {
-                            "throughput/tflops": tflops,
-                            "throughput/tflops/device": tflops / self._num_training_gpus,
-                        }
+                        _model_throughput_metrics(
+                            model_flops=model_flops,
+                            step_seconds=all_timings["step"],
+                            num_gpus=self._num_training_gpus,
+                            peak_tflops_per_gpu=self.sft_cfg.peak_tflops_per_gpu,
+                        )
                     )
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
@@ -2217,6 +2245,8 @@ class SFTTrainer:
                     throughput_suffix = f", tokens_per_second={tokens_per_second:.0f}"
                     if model_flops is not None:
                         throughput_suffix += f", model_tflops_per_gpu=" f"{log_dict['throughput/tflops/device']:.1f}"
+                        if self.sft_cfg.peak_tflops_per_gpu is not None:
+                            throughput_suffix += f", mfu={log_dict['throughput/mfu_percent']:.1f}%"
                     logger.info(
                         f"Step {self.global_step}: loss={step_result['loss']:.4f}, "
                         f"grad_norm={step_result['grad_norm']}"
