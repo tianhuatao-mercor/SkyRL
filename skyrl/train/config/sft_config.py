@@ -315,6 +315,11 @@ class SFTConfig(BaseConfig):
     ``fixed_bin_balanced`` balances tokens directly across each DP-sized bin
     group to reduce distributed stragglers.
     """
+    sequence_packing_quadratic_equivalent_length: Optional[int] = None
+    """Linear/quadratic FLOP crossover length for
+    ``fixed_bin_flops_balanced``. The packer assigns intact sequences using
+    the additive proxy ``L * value + L**2``.
+    """
     max_tokens_per_microbatch: Optional[int] = None
     """FFD bin capacity (max tokens per bin) when ``use_sequence_packing=True``.
     Each bin row becomes one worker micro-batch, so this is the token budget for
@@ -665,12 +670,24 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
             cfg.remove_microbatch_padding = True
         if cfg.max_length is None:
             raise ValueError("use_sequence_packing=True requires max_length to be set (it is the bin capacity).")
-        valid_packing_strategies = {"first_fit_decreasing", "balanced", "fixed_bin_balanced"}
+        valid_packing_strategies = {
+            "first_fit_decreasing",
+            "balanced",
+            "fixed_bin_balanced",
+            "fixed_bin_flops_balanced",
+        }
         if cfg.sequence_packing_strategy.lower() not in valid_packing_strategies:
             raise ValueError(
                 f"Unknown sequence_packing_strategy={cfg.sequence_packing_strategy!r}; "
                 f"expected one of {sorted(valid_packing_strategies)}."
             )
+        if cfg.sequence_packing_strategy.lower() == "fixed_bin_flops_balanced":
+            value = cfg.sequence_packing_quadratic_equivalent_length
+            if value is None or value <= 0:
+                raise ValueError(
+                    "fixed_bin_flops_balanced requires a positive "
+                    "sequence_packing_quadratic_equivalent_length."
+                )
         # Resolve and validate the FFD bin capacity (asserts it is >= max_length
         # so any single sequence fits in a bin).
         cfg.resolved_bin_capacity()

@@ -32,6 +32,7 @@ class PackingStrategy(enum.Enum):
     FIRST_FIT_DECREASING = "first_fit_decreasing"
     BALANCED = "balanced"
     FIXED_BIN_BALANCED = "fixed_bin_balanced"
+    FIXED_BIN_FLOPS_BALANCED = "fixed_bin_flops_balanced"
 
 
 class SeqPacker(ABC):
@@ -48,15 +49,19 @@ class SeqPacker(ABC):
         bin_capacity: int,
         min_bin_count: Optional[int] = None,
         bin_count_multiple: Optional[int] = None,
+        quadratic_equivalent_length: Optional[int] = None,
     ):
         if min_bin_count is not None and min_bin_count < 0:
             raise ValueError("min_bin_count must be nonnegative")
         if bin_count_multiple is not None and bin_count_multiple < 1:
             raise ValueError("bin_count_multiple must be positive")
+        if quadratic_equivalent_length is not None and quadratic_equivalent_length < 1:
+            raise ValueError("quadratic_equivalent_length must be positive")
 
         self.bin_capacity = bin_capacity
         self.min_bin_count = min_bin_count
         self.bin_count_multiple = bin_count_multiple
+        self.quadratic_equivalent_length = quadratic_equivalent_length
 
     @abstractmethod
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
@@ -268,10 +273,77 @@ class FixedBinBalanced(SeqPacker):
         )
 
 
+class FixedBinFlopsBalanced(SeqPacker):
+    """Balance an additive transformer-work proxy across fixed bins.
+
+    Token-only balancing becomes inaccurate when long-context attention is a
+    material fraction of the update. This variant assigns sequences by
+    descending ``L * quadratic_equivalent_length + L**2`` work to the
+    least-loaded bin that still satisfies the exact token capacity. It
+    changes only sample-to-rank placement; packed attention and loss-boundary
+    semantics remain unchanged.
+    """
+
+    def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
+        self._validate_sequence_lengths(sequence_lengths)
+        if not sequence_lengths:
+            return []
+        if self.quadratic_equivalent_length is None:
+            raise ValueError("fixed_bin_flops_balanced requires quadratic_equivalent_length")
+
+        target_bin_count = max(self.min_bin_count or 1, 1)
+        if self.bin_count_multiple is not None:
+            remainder = target_bin_count % self.bin_count_multiple
+            if remainder:
+                target_bin_count += self.bin_count_multiple - remainder
+        if target_bin_count > len(sequence_lengths):
+            raise ValueError(
+                f"Cannot create {target_bin_count} non-empty bins with only "
+                f"{len(sequence_lengths)} sequences."
+            )
+
+        equivalent_length = self.quadratic_equivalent_length
+        indexed = list(enumerate(sequence_lengths))
+        indexed.sort(
+            key=lambda pair: (pair[1] * equivalent_length + pair[1] * pair[1], pair[1], pair[0]),
+            reverse=True,
+        )
+        increment = self.bin_count_multiple or 1
+
+        while target_bin_count <= len(sequence_lengths):
+            bins: List[List[int]] = [[] for _ in range(target_bin_count)]
+            bin_tokens = [0] * target_bin_count
+            bin_work = [0] * target_bin_count
+            valid = True
+
+            for idx, length in indexed:
+                candidates = sorted(range(target_bin_count), key=lambda i: (bin_work[i], bin_tokens[i], i))
+                bin_idx = next(
+                    (i for i in candidates if bin_tokens[i] + length <= self.bin_capacity),
+                    None,
+                )
+                if bin_idx is None:
+                    valid = False
+                    break
+                bins[bin_idx].append(idx)
+                bin_tokens[bin_idx] += length
+                bin_work[bin_idx] += length * equivalent_length + length * length
+
+            if valid and all(bins):
+                return bins
+            target_bin_count += increment
+
+        raise ValueError(
+            f"Cannot pack {len(sequence_lengths)} sequences into non-empty FLOP-balanced bins "
+            f"with capacity {self.bin_capacity}."
+        )
+
+
 _PACKERS = {
     PackingStrategy.FIRST_FIT_DECREASING: FirstFitDecreasing,
     PackingStrategy.BALANCED: Balanced,
     PackingStrategy.FIXED_BIN_BALANCED: FixedBinBalanced,
+    PackingStrategy.FIXED_BIN_FLOPS_BALANCED: FixedBinFlopsBalanced,
 }
 
 
@@ -280,6 +352,7 @@ def make_seq_packer(
     bin_capacity: int,
     min_bin_count: Optional[int] = None,
     bin_count_multiple: Optional[int] = None,
+    quadratic_equivalent_length: Optional[int] = None,
 ) -> SeqPacker:
     """Factory returning a configured :class:`SeqPacker` instance.
 
@@ -308,4 +381,5 @@ def make_seq_packer(
         bin_capacity=bin_capacity,
         min_bin_count=min_bin_count,
         bin_count_multiple=bin_count_multiple,
+        quadratic_equivalent_length=quadratic_equivalent_length,
     )

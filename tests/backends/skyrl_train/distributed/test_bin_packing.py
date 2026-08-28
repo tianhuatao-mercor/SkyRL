@@ -142,6 +142,22 @@ class TestMakeSeqPackerFactory:
         packer = make_seq_packer("fixed_bin_balanced", bin_capacity=100, min_bin_count=2)
         assert isinstance(packer, FixedBinBalanced)
 
+    def test_fixed_bin_flops_balanced(self):
+        packer = make_seq_packer(
+            "fixed_bin_flops_balanced",
+            bin_capacity=120,
+            min_bin_count=2,
+            quadratic_equivalent_length=100,
+        )
+        bins = packer.pack([100, 80, 30, 20])
+        assert sorted(index for bin_indices in bins for index in bin_indices) == [0, 1, 2, 3]
+        assert all(sum([100, 80, 30, 20][index] for index in bin_indices) <= 120 for bin_indices in bins)
+
+    def test_fixed_bin_flops_balanced_requires_equivalent_length(self):
+        packer = make_seq_packer("fixed_bin_flops_balanced", bin_capacity=100, min_bin_count=2)
+        with pytest.raises(ValueError, match="requires quadratic_equivalent_length"):
+            packer.pack([60, 40])
+
     def test_unknown_algorithm(self):
         with pytest.raises(ValueError, match="Unknown packing algorithm"):
             make_seq_packer("nonexistent", bin_capacity=100)

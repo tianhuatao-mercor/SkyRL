@@ -91,12 +91,14 @@ class PackedDataCollator:
         batch_size: int,
         micro_train_batch_size_per_gpu: int,
         packing_strategy: str = "first_fit_decreasing",
+        packing_quadratic_equivalent_length: int | None = None,
         fp8_enabled: bool = False,
     ):
         if max_tokens_per_microbatch is None:
             raise ValueError("PackedDataCollator requires max_tokens_per_microbatch to be set explicitly.")
         self.max_tokens_per_microbatch = max_tokens_per_microbatch
         self.packing_strategy = packing_strategy
+        self.packing_quadratic_equivalent_length = packing_quadratic_equivalent_length
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.cp_size = cp_size
@@ -195,6 +197,7 @@ class PackedDataCollator:
             bin_capacity=bin_capacity,
             min_bin_count=bin_count_multiple,
             bin_count_multiple=bin_count_multiple,
+            quadratic_equivalent_length=self.packing_quadratic_equivalent_length,
         )
         bins: List[List[int]] = packer.pack(seq_lengths)
 
