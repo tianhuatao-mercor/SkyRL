@@ -1,3 +1,4 @@
+import functools
 import os
 import shutil
 from collections import defaultdict
@@ -89,6 +90,48 @@ import skyrl.backends.skyrl_train.workers.megatron.model_bridges as _  # noqa: F
 from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
     maybe_force_qwen35_text_bridge,
 )
+
+
+def _maybe_override_fla_causal_conv_backend() -> Optional[str]:
+    """Select an explicit FLA causal-convolution backend for diagnostics.
+
+    Megatron imports FLA's ``causal_conv1d`` into the Gated DeltaNet module and
+    calls it without a backend argument, which selects Triton. On variable-size
+    packed batches that path can repeatedly autotune and compile shape-specific
+    kernels. ``SKYRL_FLA_CAUSAL_CONV_BACKEND`` allows a bounded comparison with
+    FLA's installed ``cuda`` or mixed backend without modifying the immutable
+    Megatron/FLA packages in the runtime image.
+    """
+    backend = os.environ.get("SKYRL_FLA_CAUSAL_CONV_BACKEND", "").strip().lower()
+    if not backend:
+        return None
+    if backend not in {"triton", "mix", "cuda"}:
+        raise ValueError(
+            "SKYRL_FLA_CAUSAL_CONV_BACKEND must be one of triton, mix, or cuda; "
+            f"got {backend!r}"
+        )
+
+    from megatron.core.ssm import gated_delta_net
+
+    current = gated_delta_net.causal_conv1d
+    installed_backend = getattr(current, "_skyrl_fla_causal_conv_backend", None)
+    if installed_backend == backend:
+        return backend
+    if installed_backend is not None:
+        raise RuntimeError(
+            "FLA causal-convolution backend was already overridden in this process: "
+            f"{installed_backend}"
+        )
+
+    @functools.wraps(current)
+    def _causal_conv1d_with_backend(*args, **kwargs):
+        kwargs["backend"] = backend
+        return current(*args, **kwargs)
+
+    _causal_conv1d_with_backend._skyrl_fla_causal_conv_backend = backend
+    gated_delta_net.causal_conv1d = _causal_conv1d_with_backend
+    logger.info(f"Using FLA causal_conv1d backend={backend!r} from SKYRL_FLA_CAUSAL_CONV_BACKEND")
+    return backend
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -601,6 +644,7 @@ class MegatronWorker:
         # TE patch to allow FA2 for head_dim 256 on SM103 (B300)
         # Delete along with the patch module once the TE pin includes NVIDIA/TransformerEngine#3360.
         patch_fa2_head_dim_allowlist()
+        _maybe_override_fla_causal_conv_backend()
 
         if lora_config is not None:
             self.configure_lora(lora_config, lora_type)
