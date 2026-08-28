@@ -1,0 +1,13 @@
+{
+  "kernel_name": "l2norm_bwd_kernel",
+  "triton_version": "3.6.0",
+  "default_config": {
+    "kwargs": {
+      "BT": 8
+    },
+    "num_warps": 4,
+    "num_stages": 3,
+    "num_ctas": 1,
+    "maxnreg": null
+  }
+}
