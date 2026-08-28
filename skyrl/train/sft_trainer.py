@@ -843,11 +843,16 @@ class SFTTrainer:
         self._total_steps: int = 0
         self._steps_per_epoch: int = 0
         self._current_epoch: int = 0
+        self._profile_active: bool = False
 
     @property
     def _torch_profiler_enabled(self) -> bool:
-        """Whether to dispatch policy profiler RPCs."""
-        return self.cfg.trainer.policy.torch_profiler_config.enable
+        """Whether to dispatch policy profiling/memory-recording RPCs."""
+        return (
+            self.cfg.trainer.policy.torch_profiler_config.enable
+            or self.cfg.trainer.policy.record_memory
+            or bool(os.environ.get("SKYRL_NSYS_PROFILE_RANKS", "").strip())
+        )
 
     def _build_collator(self, tokenizer):
         """Select the batch collator from the configured packing mode.
@@ -1721,7 +1726,7 @@ class SFTTrainer:
         metrics = output.metrics
 
         # One profiler step per SFT global step.
-        if self._torch_profiler_enabled:
+        if self._profile_active:
             self.dispatch.profile_step("policy")
 
         loss_val = metrics.get("final_loss", metrics.get("loss", float("nan")))
@@ -1813,6 +1818,7 @@ class SFTTrainer:
             self._ray_gpu_monitor.start()
         if self._torch_profiler_enabled:
             self.dispatch.start_profile("policy")
+            self._profile_active = True
         try:
             for step in range(num_steps):
                 all_timings: dict[str, float] = {}
@@ -1844,8 +1850,9 @@ class SFTTrainer:
                     f"tokens_per_second={tokens_per_second:.0f}"
                 )
         finally:
-            if self._torch_profiler_enabled:
+            if self._profile_active:
                 self.dispatch.stop_profile("policy")
+                self._profile_active = False
 
         logger.info("Dummy SFT training complete!")
 
@@ -2002,10 +2009,35 @@ class SFTTrainer:
             f"SFT async batch collation (double-buffering): {'ENABLED' if collate_ahead_enabled else 'disabled'}"
         )
 
+        profile_start_step = int(os.environ.get("SKYRL_PROFILE_START_STEP", str(self.global_step)))
+        profile_end_step = int(os.environ.get("SKYRL_PROFILE_END_STEP", str(num_steps)))
+        if self._torch_profiler_enabled and not (
+            self.global_step <= profile_start_step <= profile_end_step <= num_steps
+        ):
+            raise ValueError(
+                "invalid profiling window: expected "
+                f"{self.global_step} <= start <= end <= {num_steps}, got "
+                f"start={profile_start_step}, end={profile_end_step}"
+            )
+        profile_completed = False
+        self._profile_active = False
         if self._torch_profiler_enabled:
-            self.dispatch.start_profile("policy")
+            logger.info(
+                f"Profiling window is global steps {profile_start_step}-{profile_end_step}; "
+                f"steps {self.global_step}-{profile_start_step - 1} are uncaptured warmup"
+            )
         try:
             while self.global_step <= num_steps:
+                if (
+                    self._torch_profiler_enabled
+                    and not self._profile_active
+                    and not profile_completed
+                    and self.global_step == profile_start_step
+                ):
+                    self.dispatch.start_profile("policy")
+                    self._profile_active = True
+                    logger.info(f"Started profiling at global step {self.global_step}")
+
                 all_timings: dict[str, float] = {}
 
                 with Timer("step", all_timings):
@@ -2039,6 +2071,12 @@ class SFTTrainer:
                     # Training step
                     step_result = self.train_step(batch, self.global_step)
                     all_timings.update(step_result["timings"])
+
+                if self._profile_active and self.global_step == profile_end_step:
+                    self.dispatch.stop_profile("policy")
+                    self._profile_active = False
+                    profile_completed = True
+                    logger.info(f"Stopped profiling after global step {self.global_step}")
 
                 # Compute throughput using actual (non-padding) tokens. The
                 # ordinary collator may append ``pad_size`` rows copied from row
@@ -2139,8 +2177,9 @@ class SFTTrainer:
             if async_collator is not None:
                 async_collator.shutdown()
             self._checkpoint_dataloader_state = None
-            if self._torch_profiler_enabled:
+            if self._profile_active:
                 self.dispatch.stop_profile("policy")
+                self._profile_active = False
         self.global_step = min(self.global_step, num_steps)
 
         # Close the final epoch. The loop always exits with exactly one epoch

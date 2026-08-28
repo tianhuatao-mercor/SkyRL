@@ -66,6 +66,8 @@ from skyrl.backends.skyrl_train.workers.worker import (
     CriticWorkerBase,
     PolicyWorkerBase,
     RefWorkerBase,
+    skyrl_nvtx_annotate,
+    skyrl_nvtx_range,
 )
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
@@ -852,6 +854,7 @@ class MegatronWorker:
 
         return padded
 
+    @skyrl_nvtx_annotate("skyrl.hf_export.save")
     def save_hf_model(self, export_dir: str, tokenizer):
         # Save model in HuggingFace safetensors format
         hf_export = self.megatron_config.hf_export_config
@@ -1152,6 +1155,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
+    @skyrl_nvtx_annotate("skyrl.sft.forward_backward", pytorch_ops=True)
     def forward_backward(
         self,
         data: TrainingInputBatch,
@@ -1284,15 +1288,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 f"seq_len={seq_len} tokens={real_tokens}"
             )
 
-        metrics_list = self.model.forward_backward_mini_batch(
-            micro_batches=micro_buffer,
-            seq_len=seq_len,
-            micro_batch_size=micro_bsz,
-            temperature=self.cfg.algorithm.temperature,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-            return_per_token_outputs=return_per_token_outputs,
-        )
+        with skyrl_nvtx_range("skyrl.sft.forward_backward.compute"):
+            metrics_list = self.model.forward_backward_mini_batch(
+                micro_batches=micro_buffer,
+                seq_len=seq_len,
+                micro_batch_size=micro_bsz,
+                temperature=self.cfg.algorithm.temperature,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
+            )
 
         if self.empty_cuda_cache:
             torch.cuda.empty_cache()
@@ -1315,9 +1320,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # Reduce across microbatches and all-reduce metrics across DP ranks
         # (metrics should be identical within DP groups, i.e., across TP/PP/SP ranks)
         # NOTE: Sum loss metrics because scaling is already applied before the worker reduction.
-        status = reduce_metrics(all_metrics, sum_loss_metrics=True)
-        if self.optimizer is not None:
-            status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
+        with skyrl_nvtx_range("skyrl.sft.forward_backward.reduce_metrics"):
+            status = reduce_metrics(all_metrics, sum_loss_metrics=True)
+            if self.optimizer is not None:
+                status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
 
         # Token-based batching diagnostics: total microbatches this rank ran and how many
         # were purely-padding (added to equalize the microbatch count across DP ranks).
@@ -1327,8 +1333,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             status["num_microbatches"] = float(len(micro_buffer))
             status["num_padding_microbatches"] = float(num_padding_microbatches)
 
-        group = mpu.get_data_parallel_group(with_context_parallel=False)
-        status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=True)
+        with skyrl_nvtx_range("skyrl.sft.forward_backward.all_reduce_metrics"):
+            group = mpu.get_data_parallel_group(with_context_parallel=False)
+            status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=True)
 
         # Collect MoE aux metrics averaged across microbatches (all-reduced across ranks
         # inside get_moe_metrics) aggregating after per-microbatch scalar metrics.
@@ -1349,6 +1356,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
+    @skyrl_nvtx_annotate("skyrl.sft.optimizer", pytorch_ops=True)
     def optim_step(self) -> Optional[float]:
         """
         Perform optimizer step.
@@ -1372,9 +1380,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # whole accumulated window. Deferred out of forward_backward because the reduce
         # is not idempotent -- running it per call corrupts gradients once a window
         # spans more than one call.
-        self.model.run_pending_grad_sync()
+        with skyrl_nvtx_range("skyrl.sft.optimizer.gradient_sync"):
+            self.model.run_pending_grad_sync()
 
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        with skyrl_nvtx_range("skyrl.sft.optimizer.update"):
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Clear the DDP grad buffers for the next window. `optimizer.zero_grad()` inside
         # `optimizer_step` only drops `param.grad` / the fp32 main-param grads -- the
@@ -1382,8 +1392,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # the gradients just applied would be accumulated into again by the next window.
         # Also re-arms Megatron's per-iteration bookkeeping (bucket-group grad-ready
         # counters, `grad_added_to_main_grad`).
-        for chunk in self.actor_module:
-            chunk.zero_grad_buffer()
+        with skyrl_nvtx_range("skyrl.sft.optimizer.zero_grad"):
+            for chunk in self.actor_module:
+                chunk.zero_grad_buffer()
 
         # Reset counter for next accumulation cycle
         self._micro_batches_accumulated = 0
@@ -1502,6 +1513,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.distributed.barrier()
 
+    @skyrl_nvtx_annotate("skyrl.weight_sync.broadcast")
     async def broadcast_to_inference_engines(
         self,
         inference_engine_client: "InferenceEngineInterface",

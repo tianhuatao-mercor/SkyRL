@@ -1,7 +1,9 @@
 import asyncio
+import functools
 import logging
 import os
 import socket
+import subprocess
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
@@ -70,6 +72,79 @@ from skyrl.train.utils.utils import (
 
 _SET_AFFINITY = False
 
+
+def _nvtx_annotations_enabled() -> bool:
+    """Return whether worker-side SkyRL NVTX annotations are enabled."""
+    return os.environ.get("SKYRL_NVTX_ANNOTATIONS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def skyrl_nvtx_range(message: str):
+    """Emit a bounded NVTX range from the process that owns the CUDA work."""
+    if not _nvtx_annotations_enabled():
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def pytorch_nvtx_ops():
+    """Ask PyTorch to emit per-operator NVTX ranges for a bounded phase."""
+    if not _nvtx_annotations_enabled():
+        yield
+        return
+
+    with torch.autograd.profiler.emit_nvtx(record_shapes=False):
+        yield
+
+
+def skyrl_nvtx_annotate(message: str, *, pytorch_ops: bool = False):
+    """Decorate a sync or async GPU-worker method with NVTX ranges."""
+
+    def decorator(func):
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                with skyrl_nvtx_range(message):
+                    if pytorch_ops:
+                        with pytorch_nvtx_ops():
+                            return await func(*args, **kwargs)
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with skyrl_nvtx_range(message):
+                if pytorch_ops:
+                    with pytorch_nvtx_ops():
+                        return func(*args, **kwargs)
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def _rank_selected_by_env(env_name: str, rank: int) -> bool:
+    """Return whether ``rank`` is selected by a comma-separated env value."""
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        return False
+    if value.lower() == "all":
+        return True
+    try:
+        return rank in {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be 'all' or comma-separated integer ranks, got {value!r}") from exc
+
+
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
         RemoteInferenceClient,
@@ -102,9 +177,14 @@ class DistributedTorchRayActor:
         os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0]) if ray_noset_visible_devices() else "0"
         self.sequence_parallel_size: int = sequence_parallel_size
 
-        self.record_memory = record_memory
-        if record_memory:
-            torch.cuda.memory._record_memory_history()
+        memory_rank_filter = os.environ.get("SKYRL_MEMORY_SNAPSHOT_RANKS", "").strip()
+        self.record_memory = record_memory and (
+            not memory_rank_filter or _rank_selected_by_env("SKYRL_MEMORY_SNAPSHOT_RANKS", rank)
+        )
+        # Defer allocator history until the controller opens the requested
+        # profiling window; model loading and warmup updates stay out of it.
+        self._memory_history_started = False
+        self._nsys_profile_started = False
 
         # Redirect worker output to log file (infra logs shouldn't pollute driver stdout)
         from skyrl.train.utils.ray_logging import redirect_actor_output_to_file
@@ -360,6 +440,36 @@ class Worker(DistributedTorchRayActor):
 
     def start_profile(self) -> None:
         """Arm the profiler before the training loop (no-op when disabled)."""
+        if getattr(self, "record_memory", False) and not getattr(self, "_memory_history_started", False):
+            max_entries = int(os.environ.get("SKYRL_MEMORY_HISTORY_MAX_ENTRIES", "200000"))
+            torch.cuda.memory._record_memory_history(max_entries=max_entries)
+            self._memory_history_started = True
+            logger.info(f"[MemorySnapshot] recording rank {self._rank} with max_entries={max_entries}")
+
+        if _rank_selected_by_env("SKYRL_NSYS_PROFILE_RANKS", getattr(self, "_rank", -1)) and not getattr(
+            self, "_nsys_profile_started", False
+        ):
+            nsys_path = os.environ["SKYRL_NSYS_PATH"]
+            session = os.environ["SKYRL_NSYS_SESSION"]
+            output = os.environ["SKYRL_NSYS_OUTPUT"]
+            result = subprocess.run(
+                [
+                    nsys_path,
+                    "start",
+                    f"--session={session}",
+                    "--sample=none",
+                    "--cpuctxsw=none",
+                    f"--output={output}",
+                    "--force-overwrite=true",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self._nsys_profile_started = True
+            logger.info(f"[NsightSystems] started session {session} on rank {self._rank}: {result.stdout.strip()}")
+
         if self.profiler is not None:
             self.profiler.start()
 
@@ -372,6 +482,22 @@ class Worker(DistributedTorchRayActor):
         """Stop the profiler after the training loop, flushing any open window."""
         if self.profiler is not None:
             self.profiler.stop()
+        if getattr(self, "_memory_history_started", False):
+            torch.cuda.memory._record_memory_history(enabled=None)
+            self._memory_history_started = False
+            logger.info(f"[MemorySnapshot] stopped recording rank {self._rank}")
+        if getattr(self, "_nsys_profile_started", False):
+            nsys_path = os.environ["SKYRL_NSYS_PATH"]
+            session = os.environ["SKYRL_NSYS_SESSION"]
+            result = subprocess.run(
+                [nsys_path, "stop", f"--session={session}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            self._nsys_profile_started = False
+            logger.info(f"[NsightSystems] stopped session {session} on rank {self._rank}: {result.stdout.strip()}")
 
     def dump_profiler_summary(self):
         """Return this rank's last-window kernel summary, or None."""
@@ -434,7 +560,7 @@ class Worker(DistributedTorchRayActor):
         .. note::
             This function should be called on all the ranks in the worker group simultaneously.
         """
-        if not self.record_memory:
+        if not self.record_memory or not getattr(self, "_memory_history_started", False):
             return
 
         # Track snapshot count for unique filenames
@@ -443,10 +569,14 @@ class Worker(DistributedTorchRayActor):
         self._snapshot_count += 1
 
         rank = torch.distributed.get_rank()
-        save_path = os.path.join(self.cfg.ckpt_path, "memory_snapshots")
-        if self._local_rank == 0 and not io.exists(save_path):
-            io.makedirs(save_path, exist_ok=True)
-        torch.distributed.barrier()
+        save_path = os.environ.get("SKYRL_MEMORY_SNAPSHOT_DIR", "").strip()
+        if not save_path:
+            if not self.cfg.ckpt_path:
+                raise ValueError("memory snapshot recording requires ckpt_path or SKYRL_MEMORY_SNAPSHOT_DIR")
+            save_path = os.path.join(self.cfg.ckpt_path, "memory_snapshots")
+        # Only a bounded subset of ranks records allocator history. Avoid a
+        # world barrier because non-recording ranks intentionally return above.
+        io.makedirs(save_path, exist_ok=True)
 
         tag_str = f"_{tag}" if tag else ""
         file_name = f"rank_{rank}{tag_str}_{self._snapshot_count}.pickle"
@@ -529,6 +659,7 @@ class Worker(DistributedTorchRayActor):
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         raise NotImplementedError()
 
+    @skyrl_nvtx_annotate("skyrl.checkpoint.save")
     def save_checkpoint(self, ckpt_dir: str, tokenizer=None):
         self.strategy.save_checkpoint(
             model=self.model,
@@ -835,7 +966,8 @@ class PolicyWorkerBase(Worker):
         self.scheduler: LRScheduler = None
         self.optimizer: Optimizer = None
         self.strategy: DistributedStrategy = None
-        self.record_memory: bool = False
+        # ``DistributedTorchRayActor`` owns ``record_memory`` and applies the
+        # optional rank filter. Do not reset it after the base constructor.
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
 
