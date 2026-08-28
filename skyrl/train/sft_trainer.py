@@ -872,6 +872,7 @@ class SFTTrainer:
             return PackedDataCollator(
                 tokenizer=tokenizer,
                 max_tokens_per_microbatch=self.sft_cfg.resolved_bin_capacity(),
+                packing_strategy=self.sft_cfg.sequence_packing_strategy,
                 tp_size=self.sft_cfg.megatron_config.tensor_model_parallel_size,
                 pp_size=self.sft_cfg.megatron_config.pipeline_model_parallel_size,
                 cp_size=self.sft_cfg.megatron_config.context_parallel_size,

@@ -305,6 +305,13 @@ class SFTConfig(BaseConfig):
     ``DefaultCollator``. Each bin row becomes one row in the dispatched batch
     and one worker micro-batch.
     """
+    sequence_packing_strategy: str = "first_fit_decreasing"
+    """Controller-level packing algorithm.
+
+    ``first_fit_decreasing`` preserves the historical behavior.
+    ``fixed_bin_balanced`` balances tokens directly across each DP-sized bin
+    group to reduce distributed stragglers.
+    """
     max_tokens_per_microbatch: Optional[int] = None
     """FFD bin capacity (max tokens per bin) when ``use_sequence_packing=True``.
     Each bin row becomes one worker micro-batch, so this is the token budget for
@@ -653,6 +660,12 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
             cfg.remove_microbatch_padding = True
         if cfg.max_length is None:
             raise ValueError("use_sequence_packing=True requires max_length to be set (it is the bin capacity).")
+        valid_packing_strategies = {"first_fit_decreasing", "balanced", "fixed_bin_balanced"}
+        if cfg.sequence_packing_strategy.lower() not in valid_packing_strategies:
+            raise ValueError(
+                f"Unknown sequence_packing_strategy={cfg.sequence_packing_strategy!r}; "
+                f"expected one of {sorted(valid_packing_strategies)}."
+            )
         # Resolve and validate the FFD bin capacity (asserts it is >= max_length
         # so any single sequence fits in a bin).
         cfg.resolved_bin_capacity()

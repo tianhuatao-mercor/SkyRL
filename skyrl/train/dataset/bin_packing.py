@@ -31,6 +31,7 @@ class PackingStrategy(enum.Enum):
 
     FIRST_FIT_DECREASING = "first_fit_decreasing"
     BALANCED = "balanced"
+    FIXED_BIN_BALANCED = "fixed_bin_balanced"
 
 
 class SeqPacker(ABC):
@@ -211,9 +212,66 @@ class Balanced(SeqPacker):
         return bins
 
 
+class FixedBinBalanced(SeqPacker):
+    """Balance tokens directly across a fixed DP-sized bin group.
+
+    ``FirstFitDecreasing`` minimizes the natural bin count and only then grows
+    that result to satisfy ``min_bin_count``. Moving individual sequences while
+    growing the result can leave the DP ranks with very different token loads.
+    This strategy instead seeds the requested number of bins and applies a
+    deterministic longest-processing-time assignment to the least-loaded bin.
+    If that count cannot satisfy ``bin_capacity``, it grows by
+    ``bin_count_multiple`` and retries.
+    """
+
+    def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
+        self._validate_sequence_lengths(sequence_lengths)
+        if not sequence_lengths:
+            return []
+
+        target_bin_count = max(self.min_bin_count or 1, 1)
+        if self.bin_count_multiple is not None:
+            remainder = target_bin_count % self.bin_count_multiple
+            if remainder:
+                target_bin_count += self.bin_count_multiple - remainder
+        if target_bin_count > len(sequence_lengths):
+            raise ValueError(
+                f"Cannot create {target_bin_count} non-empty bins with only "
+                f"{len(sequence_lengths)} sequences."
+            )
+
+        indexed = list(enumerate(sequence_lengths))
+        indexed.sort(key=lambda pair: pair[1], reverse=True)
+        increment = self.bin_count_multiple or 1
+
+        while target_bin_count <= len(sequence_lengths):
+            bins: List[List[int]] = [[] for _ in range(target_bin_count)]
+            bin_tokens_heap: List[Tuple[int, int]] = [(0, i) for i in range(target_bin_count)]
+            heapq.heapify(bin_tokens_heap)
+            valid = True
+
+            for idx, length in indexed:
+                bin_tokens, bin_idx = heapq.heappop(bin_tokens_heap)
+                if bin_tokens + length > self.bin_capacity:
+                    valid = False
+                    break
+                bins[bin_idx].append(idx)
+                heapq.heappush(bin_tokens_heap, (bin_tokens + length, bin_idx))
+
+            if valid and all(bins):
+                return bins
+            target_bin_count += increment
+
+        raise ValueError(
+            f"Cannot pack {len(sequence_lengths)} sequences into non-empty bins "
+            f"with capacity {self.bin_capacity}."
+        )
+
+
 _PACKERS = {
     PackingStrategy.FIRST_FIT_DECREASING: FirstFitDecreasing,
     PackingStrategy.BALANCED: Balanced,
+    PackingStrategy.FIXED_BIN_BALANCED: FixedBinBalanced,
 }
 
 

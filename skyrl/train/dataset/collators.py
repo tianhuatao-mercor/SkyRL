@@ -64,7 +64,7 @@ class DefaultCollator:
 
 
 class PackedDataCollator:
-    """Pack examples into bin rows via FFD and return a :class:`TrainingInputBatch`.
+    """Pack examples into bin rows and return a :class:`TrainingInputBatch`.
 
     Used only for training; eval selects :class:`DefaultCollator` explicitly.
     Flow:
@@ -90,11 +90,13 @@ class PackedDataCollator:
         dp_size: int,
         batch_size: int,
         micro_train_batch_size_per_gpu: int,
+        packing_strategy: str = "first_fit_decreasing",
         fp8_enabled: bool = False,
     ):
         if max_tokens_per_microbatch is None:
             raise ValueError("PackedDataCollator requires max_tokens_per_microbatch to be set explicitly.")
         self.max_tokens_per_microbatch = max_tokens_per_microbatch
+        self.packing_strategy = packing_strategy
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.cp_size = cp_size
@@ -189,7 +191,7 @@ class PackedDataCollator:
         # ``num_microbatches``) identical across ranks.
         bin_count_multiple = dp_size
         packer = make_seq_packer(
-            "first_fit_decreasing",
+            self.packing_strategy,
             bin_capacity=bin_capacity,
             min_bin_count=bin_count_multiple,
             bin_count_multiple=bin_count_multiple,
@@ -251,9 +253,13 @@ class PackedDataCollator:
 
         n_samples = len(examples)
         logger.info(
-            f"sequence packing | packed {n_real_samples} real + {n_samples - n_real_samples} padding "
+            f"sequence packing ({self.packing_strategy}) | packed {n_real_samples} real + "
+            f"{n_samples - n_real_samples} padding "
             f"samples into {num_bins} bins "
-            f"(~{num_bins // dp_size}/DP rank, bin_capacity={bin_capacity} tokens)"
+            f"(~{num_bins // dp_size}/DP rank, bin_capacity={bin_capacity} tokens, "
+            f"bin_tokens_min={min(bin_packed_lengths)}, "
+            f"bin_tokens_mean={sum(bin_packed_lengths) / len(bin_packed_lengths):.1f}, "
+            f"bin_tokens_max={max(bin_packed_lengths)})"
         )
 
         # Fill NumPy buffers by slice, then convert once.
