@@ -234,7 +234,10 @@ class MegatronModelWrapper:
             elif callable(no_sync_func):
                 config.no_sync_func = self._wrap_deferred_no_sync(no_sync_func)
             else:
-                raise RuntimeError("Megatron overlap_grad_reduce requires a callable no_sync function")
+                # Megatron leaves this unset by default and its schedule substitutes
+                # nullcontext lazily. Install the context explicitly so SkyRL can own
+                # the reduction boundary even when no DDP no_sync function was wired.
+                config.no_sync_func = self._deferred_overlap_no_sync
             # Pipeline schedules may explicitly call grad_sync_func instead of relying
             # on parameter hooks. Suppress that second dispatch path for the same reason.
             config.grad_sync_func = None
@@ -261,6 +264,16 @@ class MegatronModelWrapper:
     def _set_overlap_last_microbatch(self, value: bool) -> None:
         for bucket_group in self._overlap_bucket_groups():
             bucket_group.is_last_microbatch = value
+
+    @contextmanager
+    def _deferred_overlap_no_sync(self):
+        self._set_overlap_last_microbatch(False)
+        try:
+            yield
+        finally:
+            # The last backward runs after Megatron exits this context. Keep hooks
+            # accumulation-only until run_pending_grad_sync owns the boundary.
+            self._set_overlap_last_microbatch(False)
 
     def _wrap_deferred_no_sync(self, no_sync_func: Callable) -> Callable:
         @contextmanager

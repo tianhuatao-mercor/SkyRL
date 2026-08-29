@@ -114,8 +114,6 @@ class TestDeferredGradSync:
         return bucket
 
     def test_constructor_installs_optimizer_boundary_ownership(self):
-        from contextlib import contextmanager
-
         from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
             MegatronModelWrapper,
         )
@@ -128,16 +126,8 @@ class TestDeferredGradSync:
             expert_parallel_bucket_groups=[],
         )
 
-        @contextmanager
-        def megatron_no_sync():
-            overlap.is_last_microbatch = False
-            try:
-                yield
-            finally:
-                overlap.is_last_microbatch = True
-
         model_config = SimpleNamespace(
-            no_sync_func=megatron_no_sync,
+            no_sync_func=None,
             grad_sync_func=MagicMock(),
             finalize_model_grads_func=None,
             grad_scale_func=None,
@@ -160,6 +150,7 @@ class TestDeferredGradSync:
         assert model_config.grad_sync_func is None
         assert model_config.finalize_model_grads_func == wrapper._defer_finalize_model_grads
         assert model_config.grad_scale_func == optimizer.scale_loss
+        overlap.is_last_microbatch = True
         with model_config.no_sync_func():
             assert overlap.is_last_microbatch is False
         assert overlap.is_last_microbatch is False
