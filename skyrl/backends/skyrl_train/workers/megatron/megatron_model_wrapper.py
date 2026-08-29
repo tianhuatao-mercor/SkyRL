@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -214,6 +215,30 @@ class MegatronModelWrapper:
         self._pending_grad_sync: Optional[dict] = None
 
         config = get_model_config(self.actor_module[0])
+        self._owns_deferred_overlap_grad_sync = actor_optimizer is not None and any(
+            getattr(getattr(chunk, "ddp_config", None), "overlap_grad_reduce", False) is True
+            for chunk in self.actor_module
+        )
+        if self._owns_deferred_overlap_grad_sync:
+            # Megatron normally exits no_sync before the last microbatch, allowing
+            # parameter hooks to dispatch overlapped reductions. SkyRL cannot do that:
+            # a logical optimizer window may span several forward_backward calls, and
+            # dynamic token packing can change the hook pattern between updates. Keep
+            # every schedule backward in no-sync mode and make optim_step the sole
+            # owner of reduction dispatch.
+            no_sync_func = config.no_sync_func
+            if isinstance(no_sync_func, list):
+                if not all(callable(func) for func in no_sync_func):
+                    raise RuntimeError("Megatron overlap_grad_reduce requires callable no_sync functions")
+                config.no_sync_func = [self._wrap_deferred_no_sync(func) for func in no_sync_func]
+            elif callable(no_sync_func):
+                config.no_sync_func = self._wrap_deferred_no_sync(no_sync_func)
+            else:
+                raise RuntimeError("Megatron overlap_grad_reduce requires a callable no_sync function")
+            # Pipeline schedules may explicitly call grad_sync_func instead of relying
+            # on parameter hooks. Suppress that second dispatch path for the same reason.
+            config.grad_sync_func = None
+
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the built-in finalize_model_grads function to all reduce gradients across
         # parallelism dimensions -- but deferred to optim_step rather than run per
@@ -224,6 +249,31 @@ class MegatronModelWrapper:
         # scaling, and any explicit loss_scale configuration).
         if actor_optimizer is not None:
             config.grad_scale_func = actor_optimizer.scale_loss
+
+    def _overlap_bucket_groups(self):
+        for model_chunk in self.actor_module:
+            bucket_groups = getattr(model_chunk, "bucket_groups", [])
+            expert_bucket_groups = getattr(model_chunk, "expert_parallel_bucket_groups", [])
+            for bucket_group in [*bucket_groups, *expert_bucket_groups]:
+                if getattr(bucket_group.ddp_config, "overlap_grad_reduce", False):
+                    yield bucket_group
+
+    def _set_overlap_last_microbatch(self, value: bool) -> None:
+        for bucket_group in self._overlap_bucket_groups():
+            bucket_group.is_last_microbatch = value
+
+    def _wrap_deferred_no_sync(self, no_sync_func: Callable) -> Callable:
+        @contextmanager
+        def deferred_no_sync():
+            try:
+                with no_sync_func():
+                    yield
+            finally:
+                # Megatron's context manager restores True on exit. Keep it False
+                # through the schedule's final backward so hooks only accumulate.
+                self._set_overlap_last_microbatch(False)
+
+        return deferred_no_sync
 
     def _defer_finalize_model_grads(self, model, num_tokens=None, **kwargs) -> None:
         """Record Megatron's end-of-schedule grad sync instead of running it.
@@ -257,26 +307,24 @@ class MegatronModelWrapper:
         whose ``forward_backward`` got no microbatches never reaches the schedule's
         finalize hook, and skipping the reduce here would hang the ranks that do run it.
 
-        With overlapped gradient reduction, Megatron normally dispatches a bucket from
-        its final parameter-ready hook. That hook is not guaranteed to run after SkyRL
-        defers ``finalize_model_grads`` across several ``forward_backward`` calls (and
-        it cannot run on a rank with no local microbatch). Before finalization, dispatch
-        only the unfinished bucket groups that still lack a communication handle. This
-        preserves normal overlap where it happened and provides a synchronous-boundary
-        fallback where it did not; every rank still finalizes exactly once.
+        When overlap is configured, SkyRL deliberately suppresses Megatron's
+        hook-driven dispatch throughout the accumulation window. Dispatch every bucket
+        here, at the one boundary that knows the window is complete. This avoids
+        Megatron's first-batch "golden" hook-count assumption, which is invalid for
+        dynamic packed batches, while retaining the checkpoint-compatible bucket layout.
         """
         pending = self._pending_grad_sync
         self._pending_grad_sync = None
-        for model_chunk in self.actor_module:
-            bucket_groups = getattr(model_chunk, "bucket_groups", [])
-            expert_bucket_groups = getattr(model_chunk, "expert_parallel_bucket_groups", [])
-            for bucket_group in [*bucket_groups, *expert_bucket_groups]:
-                if (
-                    getattr(bucket_group.ddp_config, "overlap_grad_reduce", False)
-                    and not bucket_group.grad_reduce_finished
-                    and bucket_group.grad_reduce_handle is None
-                ):
-                    bucket_group.start_grad_sync()
+        if self._owns_deferred_overlap_grad_sync:
+            bucket_groups = list(self._overlap_bucket_groups())
+            for bucket_group in bucket_groups:
+                if bucket_group.grad_reduce_finished or bucket_group.grad_reduce_handle is not None:
+                    raise RuntimeError(
+                        "Megatron dispatched gradient reduction before SkyRL's optimizer boundary"
+                    )
+                bucket_group.is_last_microbatch = True
+            for bucket_group in bucket_groups:
+                bucket_group.start_grad_sync()
         finalize_model_grads(self.actor_module, pending["num_tokens"] if pending else None)
 
     def train(self):
