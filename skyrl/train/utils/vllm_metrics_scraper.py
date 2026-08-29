@@ -161,7 +161,14 @@ def discover_ray_metrics_urls() -> List[str]:
             continue
         ip = node.get("NodeManagerAddress")
         port = node.get("MetricsExportPort")
-        if not ip or not port:
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            continue
+        # Ray reports -1 when its optional metrics agent is unavailable. Do
+        # not turn that sentinel (or any malformed node metadata) into an
+        # invalid HTTP URL.
+        if not ip or not 1 <= port <= 65535:
             continue
         urls.append(f"http://{ip}:{port}/metrics")
     return urls
@@ -226,7 +233,10 @@ class VLLMMetricsScraper:
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.text
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+        except Exception as e:
+            # Metrics are observational. In particular, AnyIO may wrap a bad
+            # endpoint in ExceptionGroup rather than httpx.RequestError; no
+            # scrape failure may terminate training.
             logger.debug(f"VLLMMetricsScraper: failed to scrape {url}: {e}")
             return ""
 

@@ -667,6 +667,9 @@ def test_discover_ray_metrics_urls_filters_dead_and_missing(monkeypatch):
         {"Alive": False, "NodeManagerAddress": "10.0.0.2", "MetricsExportPort": 51002},
         {"Alive": True, "NodeManagerAddress": "10.0.0.3", "MetricsExportPort": None},
         {"Alive": True, "NodeManagerAddress": "10.0.0.4", "MetricsExportPort": 51004},
+        {"Alive": True, "NodeManagerAddress": "10.0.0.5", "MetricsExportPort": -1},
+        {"Alive": True, "NodeManagerAddress": "10.0.0.6", "MetricsExportPort": 65536},
+        {"Alive": True, "NodeManagerAddress": "10.0.0.7", "MetricsExportPort": "invalid"},
     ]
     monkeypatch.setattr(
         "skyrl.train.utils.vllm_metrics_scraper.ray.nodes",
@@ -677,3 +680,14 @@ def test_discover_ray_metrics_urls_filters_dead_and_missing(monkeypatch):
         "http://10.0.0.1:51001/metrics",
         "http://10.0.0.4:51004/metrics",
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_one_treats_unexpected_transport_failure_as_observational():
+    scraper = VLLMMetricsScraper(urls=["http://invalid/metrics"])
+
+    class BrokenClient:
+        async def get(self, _url):
+            raise ExceptionGroup("connect failed", [OverflowError("invalid port")])
+
+    assert await scraper._fetch_one(BrokenClient(), scraper._urls[0]) == ""
