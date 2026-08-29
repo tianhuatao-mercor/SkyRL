@@ -306,6 +306,8 @@ async def test_generation_task_group_failure_wakes_blocked_buffer_consumer():
 async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
     """A failed provider call returns its reserved generation capacity before propagating."""
 
+    progress_events = []
+
     class OnePromptDataloader:
         def __init__(self):
             self.returned = False
@@ -330,6 +332,11 @@ async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
         "get_sampling_params_for_backend",
         lambda *_args, **_kwargs: {},
     )
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "emit_progress_event",
+        lambda event, **payload: progress_events.append((event, payload)),
+    )
 
     staleness_manager = _AsyncStalenessManager(
         max_concurrent_generation_groups=1,
@@ -340,7 +347,9 @@ async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
         async_train_dataloader=OnePromptDataloader(),
         cfg=SimpleNamespace(
             generator=SimpleNamespace(
-                n_samples_per_prompt=1,
+                # The mocked helper deliberately returns one UID below. Progress must still report
+                # the configured trajectory group size rather than coupling itself to helper output.
+                n_samples_per_prompt=4,
                 inference_engine=SimpleNamespace(backend="test"),
                 sampling_params=object(),
             ),
@@ -358,6 +367,16 @@ async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
     assert staleness_manager._stat.running == 0
     assert staleness_manager._stat.accepted == 0
     assert staleness_manager._compute_capacity_unlocked() == 1
+    assert progress_events == [
+        (
+            "group_scheduled",
+            {"global_step": 1, "group_uid": "uid-1", "group_size": 4},
+        ),
+        (
+            "group_failed",
+            {"global_step": 1, "group_uid": "uid-1"},
+        ),
+    ]
 
 
 # --------------------------------------------------------------------------------------
