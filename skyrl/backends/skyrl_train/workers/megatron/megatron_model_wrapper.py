@@ -256,9 +256,27 @@ class MegatronModelWrapper:
         Always runs the collective, even when this rank recorded nothing: a DP rank
         whose ``forward_backward`` got no microbatches never reaches the schedule's
         finalize hook, and skipping the reduce here would hang the ranks that do run it.
+
+        With overlapped gradient reduction, Megatron normally dispatches a bucket from
+        its final parameter-ready hook. That hook is not guaranteed to run after SkyRL
+        defers ``finalize_model_grads`` across several ``forward_backward`` calls (and
+        it cannot run on a rank with no local microbatch). Before finalization, dispatch
+        only the unfinished bucket groups that still lack a communication handle. This
+        preserves normal overlap where it happened and provides a synchronous-boundary
+        fallback where it did not; every rank still finalizes exactly once.
         """
         pending = self._pending_grad_sync
         self._pending_grad_sync = None
+        for model_chunk in self.actor_module:
+            bucket_groups = getattr(model_chunk, "bucket_groups", [])
+            expert_bucket_groups = getattr(model_chunk, "expert_parallel_bucket_groups", [])
+            for bucket_group in [*bucket_groups, *expert_bucket_groups]:
+                if (
+                    getattr(bucket_group.ddp_config, "overlap_grad_reduce", False)
+                    and not bucket_group.grad_reduce_finished
+                    and bucket_group.grad_reduce_handle is None
+                ):
+                    bucket_group.start_grad_sync()
         finalize_model_grads(self.actor_module, pending["num_tokens"] if pending else None)
 
     def train(self):

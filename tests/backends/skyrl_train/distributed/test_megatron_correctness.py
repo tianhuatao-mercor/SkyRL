@@ -101,6 +101,69 @@ class TestGradScaleFunc:
         assert mock_config_obj.grad_scale_func is None
 
 
+@pytest.mark.skipif(not _has_megatron, reason="megatron-core not installed")
+class TestDeferredGradSync:
+    """Verify the deferred finalizer dispatches only missing overlap handles."""
+
+    @staticmethod
+    def _bucket(*, overlap=True, finished=False, handle=None):
+        bucket = MagicMock()
+        bucket.ddp_config = SimpleNamespace(overlap_grad_reduce=overlap)
+        bucket.grad_reduce_finished = finished
+        bucket.grad_reduce_handle = handle
+        return bucket
+
+    def test_dispatches_missing_regular_and_expert_buckets_before_finalize(self):
+        from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
+            MegatronModelWrapper,
+        )
+
+        missing = self._bucket()
+        expert_missing = self._bucket()
+        already_dispatched = self._bucket(handle=object())
+        already_finished = self._bucket(finished=True)
+        non_overlap = self._bucket(overlap=False)
+        model_chunk = SimpleNamespace(
+            bucket_groups=[missing, already_dispatched, already_finished, non_overlap],
+            expert_parallel_bucket_groups=[expert_missing],
+        )
+        wrapper = MegatronModelWrapper.__new__(MegatronModelWrapper)
+        wrapper.actor_module = [model_chunk]
+        wrapper._pending_grad_sync = {"num_tokens": 123}
+
+        with patch(
+            "skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper.finalize_model_grads"
+        ) as finalize:
+            wrapper.run_pending_grad_sync()
+
+        missing.start_grad_sync.assert_called_once_with()
+        expert_missing.start_grad_sync.assert_called_once_with()
+        already_dispatched.start_grad_sync.assert_not_called()
+        already_finished.start_grad_sync.assert_not_called()
+        non_overlap.start_grad_sync.assert_not_called()
+        finalize.assert_called_once_with([model_chunk], 123)
+        assert wrapper._pending_grad_sync is None
+
+    def test_rank_without_pending_schedule_still_dispatches_and_finalizes(self):
+        from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
+            MegatronModelWrapper,
+        )
+
+        missing = self._bucket()
+        model_chunk = SimpleNamespace(bucket_groups=[missing], expert_parallel_bucket_groups=[])
+        wrapper = MegatronModelWrapper.__new__(MegatronModelWrapper)
+        wrapper.actor_module = [model_chunk]
+        wrapper._pending_grad_sync = None
+
+        with patch(
+            "skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper.finalize_model_grads"
+        ) as finalize:
+            wrapper.run_pending_grad_sync()
+
+        missing.start_grad_sync.assert_called_once_with()
+        finalize.assert_called_once_with([model_chunk], None)
+
+
 # ---------------------------------------------------------------------------
 # C4: Seed variation by PP rank
 # ---------------------------------------------------------------------------
