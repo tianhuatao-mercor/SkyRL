@@ -191,10 +191,17 @@ class VLLMServerActor(ServerActorProtocol):
         # same port. VLLM_PORT makes each actor scan inside its own disjoint
         # internal window instead.
         if distributed_executor_backend == "uni":
-            os.environ["VLLM_PORT"] = str(compute_uniproc_internal_port(start_port))
+            uniproc_port = compute_uniproc_internal_port(start_port)
+            os.environ["VLLM_PORT"] = str(uniproc_port)
+            # The B300 compatibility overlay for vLLM 0.26 intentionally reads
+            # ParallelConfig.master_port instead of probing a released socket.
+            # Assign the same per-actor port so both stock and overlaid
+            # UniProcExecutor implementations use the disjoint window.
+            self._cli_args.master_port = uniproc_port
             logger.info(
                 "Assigned vLLM UniProc internal port window: "
-                f"VLLM_PORT={os.environ['VLLM_PORT']} server_idx={server_idx}"
+                f"VLLM_PORT={uniproc_port} master_port={uniproc_port} "
+                f"server_idx={server_idx}"
             )
 
         # Configure the distributed executor backend
