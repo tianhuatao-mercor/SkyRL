@@ -95,6 +95,75 @@ from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
 )
 
 
+def _install_moe_a2a_split_diagnostics() -> None:
+    """Enrich otherwise opaque NCCL all-to-all split-size failures.
+
+    Megatron's dispatcher normally reports only that the split sizes do not
+    match the input tensor.  For an explicitly enabled diagnostic run, retain
+    the zero-overhead happy path and inspect dispatcher state only after that
+    exact failure has already occurred.
+    """
+
+    if os.environ.get("SKYRL_DEBUG_MOE_A2A_SPLITS") != "1":
+        return
+
+    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+
+    original = MoEAlltoAllTokenDispatcher.token_dispatch
+    if getattr(original, "_skyrl_split_diagnostics", False):
+        return
+
+    def token_dispatch_with_diagnostics(self, permutated_local_input_tokens, permuted_probs):
+        try:
+            return original(self, permutated_local_input_tokens, permuted_probs)
+        except RuntimeError as exc:
+            if "Split sizes doesn't match total dim 0 size" not in str(exc):
+                raise
+
+            def _host_list(value):
+                if value is None:
+                    return None
+                if torch.is_tensor(value):
+                    return value.detach().cpu().tolist()
+                return list(value)
+
+            input_splits = _host_list(self.input_splits)
+            output_splits = _host_list(self.output_splits)
+            routing_map = getattr(self, "routing_map", None)
+            num_out_tokens = getattr(self, "num_out_tokens", None)
+            if torch.is_tensor(num_out_tokens):
+                num_out_tokens = int(num_out_tokens.detach().cpu().item())
+            details = {
+                "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else None,
+                "hidden_shape": tuple(getattr(self, "hidden_shape", ())),
+                "permuted_tokens": int(permutated_local_input_tokens.shape[0]),
+                "permuted_probs": int(permuted_probs.shape[0]),
+                "routing_rows": int(routing_map.shape[0]) if routing_map is not None else None,
+                "routing_assignments": (
+                    int(routing_map.sum().detach().cpu().item()) if routing_map is not None else None
+                ),
+                "num_out_tokens": num_out_tokens,
+                "input_splits": input_splits,
+                "input_split_total": sum(input_splits) if input_splits is not None else None,
+                "output_splits": output_splits,
+                "output_split_total": sum(output_splits) if output_splits is not None else None,
+                "ep_size": getattr(self, "ep_size", None),
+                "tp_size": getattr(self, "tp_size", None),
+                "topk": getattr(self.config, "moe_router_topk", None),
+                "permute_fusion": getattr(self.config, "moe_permute_fusion", None),
+                "router_fusion": getattr(self.config, "moe_router_fusion", None),
+                "shared_expert_overlap": getattr(self.config, "moe_shared_expert_overlap", None),
+                "use_nccl_stream": getattr(self, "use_nccl_stream", None),
+            }
+            raise RuntimeError(f"SkyRL MoE A2A split invariant failed: {details}") from exc
+
+    token_dispatch_with_diagnostics._skyrl_split_diagnostics = True
+    MoEAlltoAllTokenDispatcher.token_dispatch = token_dispatch_with_diagnostics
+
+
+_install_moe_a2a_split_diagnostics()
+
+
 def _hybrid_packed_attention_flops_correction(
     provider: Any,
     *,
