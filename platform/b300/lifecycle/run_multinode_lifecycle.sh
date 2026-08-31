@@ -433,7 +433,7 @@ cmd=(
   trainer.num_logger_eval_samples=2
   trainer.print_example_interval=1
   trainer.logger=console
-  trainer.project_name=b300-skyrl-lifecycle
+  trainer.project_name=skyrl-dev
   trainer.run_name="$run_id"
   trainer.enable_ray_gpu_monitor=false
   generator.inference_engine.backend=vllm
@@ -549,6 +549,7 @@ create_container() {
     --env VLLM_NO_USAGE_STATS=1
     --env VLLM_USE_FLASHINFER_SAMPLER=0
     --env RAY_USAGE_STATS_ENABLED=0
+    --env WANDB_ENTITY=suryamani10-mercor
     --env WANDB_MODE=offline
     --env DO_NOT_TRACK=1
     --env PYTHONDONTWRITEBYTECODE=1
