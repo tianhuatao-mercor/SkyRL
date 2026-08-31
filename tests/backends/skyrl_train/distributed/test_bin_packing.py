@@ -7,6 +7,7 @@ Run with:
 import pytest
 
 from skyrl.train.dataset.bin_packing import (
+    FixedBinBalanced,
     FirstFitDecreasing,
     PackingStrategy,
     make_seq_packer,
@@ -97,6 +98,33 @@ class TestFirstFitDecreasing:
             FirstFitDecreasing(bin_capacity=100, min_bin_count=5).pack([10, 20])
 
 
+class TestFixedBinBalanced:
+    def test_balances_directly_into_requested_bin_count(self):
+        lengths = [90, 80, 70, 60, 50, 40, 30, 20]
+        bins = FixedBinBalanced(bin_capacity=120, min_bin_count=4, bin_count_multiple=4).pack(lengths)
+        loads = [sum(lengths[i] for i in bin_indices) for bin_indices in bins]
+        assert loads == [110, 110, 110, 110]
+
+    def test_grows_by_multiple_when_requested_count_is_infeasible(self):
+        lengths = [60, 60, 60, 60, 40, 40, 40, 40]
+        bins = FixedBinBalanced(bin_capacity=100, min_bin_count=2, bin_count_multiple=2).pack(lengths)
+        loads = [sum(lengths[i] for i in bin_indices) for bin_indices in bins]
+        assert len(bins) == 4
+        assert loads == [100, 100, 100, 100]
+
+    def test_deterministic_and_preserves_all_indices(self):
+        lengths = [93, 17, 64, 28, 51, 42, 39, 11]
+        kwargs = {"bin_capacity": 120, "min_bin_count": 4, "bin_count_multiple": 4}
+        bins = FixedBinBalanced(**kwargs).pack(lengths)
+        assert bins == FixedBinBalanced(**kwargs).pack(lengths)
+        assert sorted(i for bin_indices in bins for i in bin_indices) == list(range(len(lengths)))
+        assert all(sum(lengths[i] for i in bin_indices) <= 120 for bin_indices in bins)
+
+    def test_rejects_more_bins_than_sequences(self):
+        with pytest.raises(ValueError, match="Cannot create"):
+            FixedBinBalanced(bin_capacity=100, min_bin_count=4).pack([10, 20, 30])
+
+
 class TestMakeSeqPackerFactory:
     def test_enum_value(self):
         packer = make_seq_packer(PackingStrategy.FIRST_FIT_DECREASING, bin_capacity=100)
@@ -109,6 +137,10 @@ class TestMakeSeqPackerFactory:
     def test_string_case_insensitive(self):
         packer = make_seq_packer("FIRST_FIT_DECREASING", bin_capacity=100)
         assert isinstance(packer, FirstFitDecreasing)
+
+    def test_fixed_bin_balanced(self):
+        packer = make_seq_packer("fixed_bin_balanced", bin_capacity=100, min_bin_count=2)
+        assert isinstance(packer, FixedBinBalanced)
 
     def test_unknown_algorithm(self):
         with pytest.raises(ValueError, match="Unknown packing algorithm"):

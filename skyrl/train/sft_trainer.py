@@ -791,6 +791,56 @@ def _format_eval_metrics(eval_metrics: dict) -> str:
     return ", ".join(f"{k}={v:.4f}" for k, v in eval_metrics.items())
 
 
+def _training_sequence_stats(batch: TrainingInputBatch) -> tuple[int, int, int]:
+    """Return batch size, sum(length), and sum(length**2) for FLOP logging.
+
+    Packed batches use true per-trajectory lengths, so quadratic attention is
+    estimated across independent blocks rather than across whole FFD bins.
+    Unlike useful-token TPS, model FLOPs intentionally include zero-loss rows
+    that the model still executes.
+    """
+    sub_seq_lengths = batch.get("sub_seq_lengths")
+    if sub_seq_lengths is not None:
+        lengths = [int(length) for row in sub_seq_lengths for length in row.tolist()]
+        batch_size = int(
+            (batch.metadata or {}).get(
+                "num_real_examples",
+                len(lengths),
+            )
+            + (batch.metadata or {}).get("num_padding_examples", 0)
+        )
+    else:
+        lengths = [int(length) for length in batch["attention_mask"].sum(dim=1).tolist()]
+        batch_size = len(lengths)
+    return batch_size, sum(lengths), sum(length * length for length in lengths)
+
+
+def _model_throughput_metrics(
+    *,
+    model_flops: float,
+    step_seconds: float,
+    num_gpus: int,
+    peak_tflops_per_gpu: Optional[float],
+) -> dict[str, float]:
+    """Build model-TFLOP and optional hardware-explicit MFU metrics."""
+    tflops = model_flops / step_seconds / 1e12
+    tflops_per_gpu = tflops / num_gpus
+    metrics = {
+        "throughput/tflops": tflops,
+        "throughput/tflops/device": tflops_per_gpu,
+    }
+    if peak_tflops_per_gpu is not None:
+        mfu = tflops_per_gpu / peak_tflops_per_gpu
+        metrics.update(
+            {
+                "throughput/mfu": mfu,
+                "throughput/mfu_percent": 100 * mfu,
+                "throughput/peak_tflops/device": peak_tflops_per_gpu,
+            }
+        )
+    return metrics
+
+
 class SFTTrainer:
     """SFT trainer supporting FSDP and Megatron backends.
 
@@ -843,11 +893,16 @@ class SFTTrainer:
         self._total_steps: int = 0
         self._steps_per_epoch: int = 0
         self._current_epoch: int = 0
+        self._profile_active: bool = False
 
     @property
     def _torch_profiler_enabled(self) -> bool:
-        """Whether to dispatch policy profiler RPCs."""
-        return self.cfg.trainer.policy.torch_profiler_config.enable
+        """Whether to dispatch policy profiling/memory-recording RPCs."""
+        return (
+            self.cfg.trainer.policy.torch_profiler_config.enable
+            or self.cfg.trainer.policy.record_memory
+            or bool(os.environ.get("SKYRL_NSYS_PROFILE_RANKS", "").strip())
+        )
 
     def _build_collator(self, tokenizer):
         """Select the batch collator from the configured packing mode.
@@ -872,6 +927,7 @@ class SFTTrainer:
             return PackedDataCollator(
                 tokenizer=tokenizer,
                 max_tokens_per_microbatch=self.sft_cfg.resolved_bin_capacity(),
+                packing_strategy=self.sft_cfg.sequence_packing_strategy,
                 tp_size=self.sft_cfg.megatron_config.tensor_model_parallel_size,
                 pp_size=self.sft_cfg.megatron_config.pipeline_model_parallel_size,
                 cp_size=self.sft_cfg.megatron_config.context_parallel_size,
@@ -926,7 +982,13 @@ class SFTTrainer:
             "padding_side": "left",
         }
 
-        self.is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path)
+        checkpoint_is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path)
+        self.is_vlm = checkpoint_is_vlm and not self.sft_cfg.language_model_only
+        if checkpoint_is_vlm and self.sft_cfg.language_model_only:
+            logger.info(
+                "VLM-family checkpoint detected with language_model_only=True: "
+                "using the text tokenizer and retaining text-only packing settings."
+            )
         if self.is_vlm:
             self.processor = get_processor(self.cfg.trainer.policy.model.path, **tokenizer_kwargs)
             # Sequence packing / microbatch padding removal are unsupported for
@@ -1470,9 +1532,19 @@ class SFTTrainer:
         # and removes the need for a separate `eval_batch_size` knob.
         dp_size = self.dispatch.dp_size("policy")
         eval_chunk_size = self.sft_cfg.micro_train_batch_size_per_gpu * dp_size
+        # Eval packing is selected explicitly: the first correctness run uses
+        # the ordinary un-packed layout even when the eval chunk size happens
+        # to equal the configured training batch size. Do not infer eval mode
+        # from a numeric batch-size comparison inside PackedDataCollator.
+        from skyrl.train.dataset.collators import DefaultCollator
+
+        eval_collator = DefaultCollator(
+            tokenizer=self.tokenizer,
+            micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+        )
         collate_fn = functools.partial(
             collate_sft_examples,
-            collator=self.collator,
+            collator=eval_collator,
             batch_size=eval_chunk_size,
         )
         num_workers = self.sft_cfg.dataloader_num_workers
@@ -1704,7 +1776,7 @@ class SFTTrainer:
         metrics = output.metrics
 
         # One profiler step per SFT global step.
-        if self._torch_profiler_enabled:
+        if self._profile_active:
             self.dispatch.profile_step("policy")
 
         loss_val = metrics.get("final_loss", metrics.get("loss", float("nan")))
@@ -1738,7 +1810,8 @@ class SFTTrainer:
         if self.sft_cfg.strategy == "megatron":
             tp = self.sft_cfg.megatron_config.tensor_model_parallel_size
             pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
-            dp_size = total_gpus // (tp * pp)
+            cp = self.sft_cfg.megatron_config.context_parallel_size
+            dp_size = total_gpus // (tp * pp * cp)
         else:
             # FSDP: all GPUs are data-parallel
             dp_size = total_gpus
@@ -1795,6 +1868,7 @@ class SFTTrainer:
             self._ray_gpu_monitor.start()
         if self._torch_profiler_enabled:
             self.dispatch.start_profile("policy")
+            self._profile_active = True
         try:
             for step in range(num_steps):
                 all_timings: dict[str, float] = {}
@@ -1807,6 +1881,16 @@ class SFTTrainer:
                 self._total_tokens_processed += actual_num_tokens
                 tokens_per_second = actual_num_tokens / all_timings["step"]
 
+                model_flops = None
+                if self.sft_cfg.strategy == "megatron":
+                    flop_batch_size, seqlen_sum, seqlen_squared_sum = _training_sequence_stats(batch)
+                    model_flops = self.dispatch.estimate_training_flops(
+                        "policy",
+                        batch_size=flop_batch_size,
+                        seqlen_sum=seqlen_sum,
+                        seqlen_squared_sum=seqlen_squared_sum,
+                    )
+
                 log_dict = {
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
@@ -1815,6 +1899,15 @@ class SFTTrainer:
                     "train/actual_num_tokens": actual_num_tokens,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                if model_flops is not None:
+                    log_dict.update(
+                        _model_throughput_metrics(
+                            model_flops=model_flops,
+                            step_seconds=all_timings["step"],
+                            num_gpus=self._num_training_gpus,
+                            peak_tflops_per_gpu=self.sft_cfg.peak_tflops_per_gpu,
+                        )
+                    )
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
                     log_dict.update(self._ray_gpu_monitor.flush())
@@ -1826,8 +1919,9 @@ class SFTTrainer:
                     f"tokens_per_second={tokens_per_second:.0f}"
                 )
         finally:
-            if self._torch_profiler_enabled:
+            if self._profile_active:
                 self.dispatch.stop_profile("policy")
+                self._profile_active = False
 
         logger.info("Dummy SFT training complete!")
 
@@ -1984,10 +2078,35 @@ class SFTTrainer:
             f"SFT async batch collation (double-buffering): {'ENABLED' if collate_ahead_enabled else 'disabled'}"
         )
 
+        profile_start_step = int(os.environ.get("SKYRL_PROFILE_START_STEP", str(self.global_step)))
+        profile_end_step = int(os.environ.get("SKYRL_PROFILE_END_STEP", str(num_steps)))
+        if self._torch_profiler_enabled and not (
+            self.global_step <= profile_start_step <= profile_end_step <= num_steps
+        ):
+            raise ValueError(
+                "invalid profiling window: expected "
+                f"{self.global_step} <= start <= end <= {num_steps}, got "
+                f"start={profile_start_step}, end={profile_end_step}"
+            )
+        profile_completed = False
+        self._profile_active = False
         if self._torch_profiler_enabled:
-            self.dispatch.start_profile("policy")
+            logger.info(
+                f"Profiling window is global steps {profile_start_step}-{profile_end_step}; "
+                f"steps {self.global_step}-{profile_start_step - 1} are uncaptured warmup"
+            )
         try:
             while self.global_step <= num_steps:
+                if (
+                    self._torch_profiler_enabled
+                    and not self._profile_active
+                    and not profile_completed
+                    and self.global_step == profile_start_step
+                ):
+                    self.dispatch.start_profile("policy")
+                    self._profile_active = True
+                    logger.info(f"Started profiling at global step {self.global_step}")
+
                 all_timings: dict[str, float] = {}
 
                 with Timer("step", all_timings):
@@ -2022,18 +2141,38 @@ class SFTTrainer:
                     step_result = self.train_step(batch, self.global_step)
                     all_timings.update(step_result["timings"])
 
-                # Compute throughput using actual (non-padding) tokens. A padded
-                # tail batch appends ``pad_size`` rows (copies of row 0) that are
-                # masked out of the loss; exclude them from the token count so the
-                # throughput metric reflects only real tokens.
+                if self._profile_active and self.global_step == profile_end_step:
+                    self.dispatch.stop_profile("policy")
+                    self._profile_active = False
+                    profile_completed = True
+                    logger.info(f"Stopped profiling after global step {self.global_step}")
+
+                # Compute throughput using actual (non-padding) tokens. The
+                # ordinary collator may append ``pad_size`` rows copied from row
+                # zero; the packed collator may add minimal zero-loss sequences
+                # inside FFD bins. Exclude both forms so the metric reflects only
+                # source-dataset tokens.
                 batch_padded_seq_len = batch["sequences"].shape[1]
                 pad_size = batch.metadata.get("pad_size", 0) if batch.metadata else 0
                 real_rows = batch["attention_mask"].shape[0] - pad_size
-                actual_num_tokens = batch["attention_mask"][:real_rows].sum().item()
+                packed_padding_tokens = batch.metadata.get("num_padding_tokens", 0) if batch.metadata else 0
+                actual_num_tokens = batch["attention_mask"][:real_rows].sum().item() - packed_padding_tokens
+                if actual_num_tokens < 0:
+                    raise AssertionError("padding-token accounting produced a negative real-token count")
                 self._total_tokens_processed += actual_num_tokens
                 tokens_per_second = actual_num_tokens / all_timings["step"]
 
                 # Build log dict
+                model_flops = None
+                if self.sft_cfg.strategy == "megatron":
+                    flop_batch_size, seqlen_sum, seqlen_squared_sum = _training_sequence_stats(batch)
+                    model_flops = self.dispatch.estimate_training_flops(
+                        "policy",
+                        batch_size=flop_batch_size,
+                        seqlen_sum=seqlen_sum,
+                        seqlen_squared_sum=seqlen_squared_sum,
+                    )
+
                 log_dict = {
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
@@ -2043,6 +2182,15 @@ class SFTTrainer:
                     "train/batch_padded_seq_len": batch_padded_seq_len,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                if model_flops is not None:
+                    log_dict.update(
+                        _model_throughput_metrics(
+                            model_flops=model_flops,
+                            step_seconds=all_timings["step"],
+                            num_gpus=self._num_training_gpus,
+                            peak_tflops_per_gpu=self.sft_cfg.peak_tflops_per_gpu,
+                        )
+                    )
                 log_dict.update({f"timing/{k}": v for k, v in all_timings.items()})
                 if self._ray_gpu_monitor is not None:
                     log_dict.update(self._ray_gpu_monitor.flush())
@@ -2094,9 +2242,15 @@ class SFTTrainer:
                 self.tracker.log(log_dict, step=self.global_step, commit=True)
 
                 if self.global_step % 5 == 0:
+                    throughput_suffix = f", tokens_per_second={tokens_per_second:.0f}"
+                    if model_flops is not None:
+                        throughput_suffix += f", model_tflops_per_gpu=" f"{log_dict['throughput/tflops/device']:.1f}"
+                        if self.sft_cfg.peak_tflops_per_gpu is not None:
+                            throughput_suffix += f", mfu={log_dict['throughput/mfu_percent']:.1f}%"
                     logger.info(
                         f"Step {self.global_step}: loss={step_result['loss']:.4f}, "
                         f"grad_norm={step_result['grad_norm']}"
+                        f"{throughput_suffix}"
                     )
 
                 if eval_metrics:
@@ -2117,8 +2271,9 @@ class SFTTrainer:
             if async_collator is not None:
                 async_collator.shutdown()
             self._checkpoint_dataloader_state = None
-            if self._torch_profiler_enabled:
+            if self._profile_active:
                 self.dispatch.stop_profile("policy")
+                self._profile_active = False
         self.global_step = min(self.global_step, num_steps)
 
         # Close the final epoch. The loop always exits with exactly one epoch

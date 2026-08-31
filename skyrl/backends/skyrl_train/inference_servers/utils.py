@@ -229,14 +229,14 @@ def build_router_args(
     """
     from vllm_router.router_args import RouterArgs
 
-    from skyrl.backends.skyrl_train.inference_servers.common import get_open_port
+    from skyrl.backends.skyrl_train.inference_servers.common import get_inference_bind_host, get_open_port
 
     is_pd = prefill_urls is not None and decode_urls is not None
 
     port = get_open_port()
 
     kwargs: Dict[str, Any] = dict(
-        host="0.0.0.0",
+        host=get_inference_bind_host(),
         port=port,
         policy="consistent_hash",
     )

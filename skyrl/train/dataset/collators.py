@@ -8,9 +8,7 @@ Two callables cover the two SFT data paths:
   (Megatron-only): once per training step it packs sequences into bins of
   capacity ``max_tokens_per_microbatch``, rounds the bin count up to a multiple
   of ``dp_size`` (so every DP rank gets the same number of micro-batches), and
-  emits one row per bin. On the eval path (when the batch size differs from the
-  configured training ``batch_size``) it falls back to the un-packed
-  :class:`DefaultCollator` behavior.
+  emits one row per bin. Eval selects :class:`DefaultCollator` explicitly.
 
 Both reuse the shared :func:`skyrl.train.sft_trainer.collate_sft_batch` free
 function for the un-packed layout.
@@ -66,9 +64,9 @@ class DefaultCollator:
 
 
 class PackedDataCollator:
-    """Pack examples into bin rows via FFD and return a :class:`TrainingInputBatch`.
+    """Pack examples into bin rows and return a :class:`TrainingInputBatch`.
 
-    Activates on the training-step batch (``batch_size == self.batch_size``).
+    Used only for training; eval selects :class:`DefaultCollator` explicitly.
     Flow:
 
     1. Compute per-example sequence lengths.
@@ -80,9 +78,6 @@ class PackedDataCollator:
     4. Build the per-bin packed row tensors and the per-row ``sub_seq_lengths``
        data field (a :class:`TensorList`).
 
-    On the eval path (``batch_size != self.batch_size``) it delegates to a
-    :class:`DefaultCollator` so eval always uses the un-packed layout; packing
-    only fires on the training-step batch.
     """
 
     def __init__(
@@ -95,18 +90,19 @@ class PackedDataCollator:
         dp_size: int,
         batch_size: int,
         micro_train_batch_size_per_gpu: int,
+        packing_strategy: str = "first_fit_decreasing",
         fp8_enabled: bool = False,
     ):
         if max_tokens_per_microbatch is None:
             raise ValueError("PackedDataCollator requires max_tokens_per_microbatch to be set explicitly.")
         self.max_tokens_per_microbatch = max_tokens_per_microbatch
+        self.packing_strategy = packing_strategy
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.batch_size = batch_size
         self.fp8_enabled = fp8_enabled
-        self._default_collator = DefaultCollator(tokenizer, micro_train_batch_size_per_gpu)
         self._tokenizer = tokenizer
 
     @property
@@ -115,18 +111,9 @@ class PackedDataCollator:
 
     @tokenizer.setter
     def tokenizer(self, value):
-        # The eval fall-through reuses the inner DefaultCollator, so keep both
-        # tokenizers in sync.
         self._tokenizer = value
-        self._default_collator.tokenizer = value
 
     def __call__(self, examples: list, batch_size: int) -> TrainingInputBatch:
-        # When eval calls the collator with a chunk of the eval set, fall back
-        # to the un-packed collate path. Packing only fires on the
-        # training-step batch (== self.batch_size).
-        if batch_size != self.batch_size:
-            return self._default_collator(examples, batch_size=batch_size)
-
         bin_capacity = self.max_tokens_per_microbatch
 
         tp_size = self.tp_size
@@ -152,6 +139,29 @@ class PackedDataCollator:
         # ------------------------------------------------------------------
         # 1. Sequence lengths and full-sequence loss masks
         # ------------------------------------------------------------------
+        # A final training batch may contain a number of real examples that is
+        # not divisible by DP. FFD rounds its output bin count up to a DP
+        # multiple and cannot create more non-empty bins than input sequences.
+        # Add minimal, zero-loss text rows to the next DP multiple so every
+        # rounded bin can remain non-empty. This matters both below one full DP
+        # group and above it (for example 9 long examples at DP=8 need 16 bins).
+        # These rows have no supervised tokens and therefore do not affect loss
+        # or gradients.
+        n_real_samples = len(examples)
+        num_padding_examples = (-n_real_samples) % self.dp_size if n_real_samples else 0
+        if num_padding_examples:
+            examples = list(examples)
+            pad_token_id = self.tokenizer.pad_token_id
+            for _ in range(num_padding_examples):
+                examples.append(
+                    {
+                        "input_ids": [pad_token_id, pad_token_id],
+                        "attention_mask": [1, 1],
+                        "num_actions": 1,
+                        "loss_mask": [0],
+                    }
+                )
+
         # Build one mask per token so packed rows can shift loss by one position.
         seq_lengths: List[int] = []
         full_input_ids: List[np.ndarray] = []
@@ -181,7 +191,7 @@ class PackedDataCollator:
         # ``num_microbatches``) identical across ranks.
         bin_count_multiple = dp_size
         packer = make_seq_packer(
-            "first_fit_decreasing",
+            self.packing_strategy,
             bin_capacity=bin_capacity,
             min_bin_count=bin_count_multiple,
             bin_count_multiple=bin_count_multiple,
@@ -243,8 +253,13 @@ class PackedDataCollator:
 
         n_samples = len(examples)
         logger.info(
-            f"sequence packing | packed {n_samples} samples into {num_bins} bins "
-            f"(~{num_bins // dp_size}/DP rank, bin_capacity={bin_capacity} tokens)"
+            f"sequence packing ({self.packing_strategy}) | packed {n_real_samples} real + "
+            f"{n_samples - n_real_samples} padding "
+            f"samples into {num_bins} bins "
+            f"(~{num_bins // dp_size}/DP rank, bin_capacity={bin_capacity} tokens, "
+            f"bin_tokens_min={min(bin_packed_lengths)}, "
+            f"bin_tokens_mean={sum(bin_packed_lengths) / len(bin_packed_lengths):.1f}, "
+            f"bin_tokens_max={max(bin_packed_lengths)})"
         )
 
         # Fill NumPy buffers by slice, then convert once.
@@ -313,5 +328,8 @@ class PackedDataCollator:
         )
         batch.metadata = {
             "response_length": max_packed_len - 1,
+            "num_real_examples": n_real_samples,
+            "num_padding_examples": n_samples - n_real_samples,
+            "num_padding_tokens": 2 * (n_samples - n_real_samples),
         }
         return batch

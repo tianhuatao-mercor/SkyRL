@@ -1,0 +1,48 @@
+{
+  "contract_id": "aws-b300-20260826-two-node-one-policy-two-rollout",
+  "qualification": {
+    "owner_label": "skyrl-lifecycle"
+  },
+  "ray": {
+    "driver_resource": "b300_lifecycle_driver",
+    "port": 6387,
+    "rollout_resource": "b300_lifecycle_rollout"
+  },
+  "roles": {
+    "head": {
+      "expected_host_gpu_count": 8,
+      "host_gpu_ids": [
+        2
+      ],
+      "hostname": "ip-172-31-67-119",
+      "minimum_efa_devices": 16,
+      "private_ip": "172.31.67.119",
+      "ray_cpu_slots": 32,
+      "ssh_alias": "aws-b300-node1"
+    },
+    "rollout": {
+      "expected_host_gpu_count": 8,
+      "host_gpu_ids": [
+        0,
+        1
+      ],
+      "hostname": "ip-172-31-67-174",
+      "minimum_efa_devices": 16,
+      "private_ip": "172.31.67.174",
+      "ray_cpu_slots": 32,
+      "ssh_alias": "aws-b300-node2"
+    }
+  },
+  "runtime": {
+    "image_id": "sha256:e98a7978ad815edbd55d460f0f45ec059dcc2df4584e5c8da9c6183b99b2940c",
+    "image_ref": "skyrl-megatron-b300-cu128-canary:7c528991c4f9-r1",
+    "lock_sha256": "0f3a2126b68747e7d4b854574e9e418c0c4a8f6c9f605865600b04e5d0a2a537",
+    "source_revision": "7c528991c4f9d470dd9295e10589d99dc3e05053"
+  },
+  "schema_version": 1,
+  "shared_filesystem": {
+    "fstype": "nfs4",
+    "mountpoint": "/shared",
+    "source": "fs-06dadd94256dacb2d.fsx.us-west-2.amazonaws.com:/fsx"
+  }
+}

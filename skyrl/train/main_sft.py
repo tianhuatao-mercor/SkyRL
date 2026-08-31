@@ -42,7 +42,6 @@ def sft_entrypoint(cfg: SFTConfig, skyrl_cfg: SkyRLTrainConfig):
     try:
         trainer.setup()
         trainer.train()
-        trainer.shutdown()
     except Exception as e:
         # OOMs (and other crashes) raised inside actor init / training surface
         # here. Route them through the tracker so wandb users see them as an
@@ -52,6 +51,10 @@ def sft_entrypoint(cfg: SFTConfig, skyrl_cfg: SkyRLTrainConfig):
         else:
             logger.error(f"SFT setup failed before tracker was initialized:\n{e}")
         raise
+    finally:
+        # Always stop GPU monitoring and finalize the tracking backend. In
+        # particular, failures must not leave a W&B run or monitor thread open.
+        trainer.shutdown()
 
 
 def main():
@@ -69,7 +72,12 @@ def main():
     validate_sft_cfg(cfg)
     skyrl_cfg = build_skyrl_config_for_sft(cfg)
     initialize_ray(skyrl_cfg)
-    ray.get(sft_entrypoint.remote(cfg, skyrl_cfg))
+    try:
+        ray.get(sft_entrypoint.remote(cfg, skyrl_cfg))
+    finally:
+        # This disconnects the head process from Ray on both success and
+        # failure. Cluster-process teardown remains the launcher's ownership.
+        ray.shutdown()
 
 
 if __name__ == "__main__":

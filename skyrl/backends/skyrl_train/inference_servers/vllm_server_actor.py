@@ -33,7 +33,8 @@ from skyrl.backends.skyrl_train.inference_servers.common import (
     ServerInfo,
     compute_dp_master_port,
     find_and_reserve_port,
-    get_node_ip,
+    get_inference_advertise_host,
+    get_inference_bind_host,
 )
 from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     CLAMPED_LOGPROB,
@@ -141,7 +142,7 @@ class VLLMServerActor(ServerActorProtocol):
         redirect_actor_output_to_file()
 
         self._cli_args = vllm_cli_args
-        self._ip = get_node_ip()
+        self._ip = get_inference_advertise_host()
         self._port, self._port_reservation = find_and_reserve_port(start_port)
         self._server_idx = server_idx
         self._num_gpus_per_server = self.compute_num_gpus_per_server(vllm_cli_args)
@@ -166,7 +167,7 @@ class VLLMServerActor(ServerActorProtocol):
         self._cli_args.distributed_executor_backend = distributed_executor_backend
 
         # Update args with our assigned host/port
-        self._cli_args.host = "0.0.0.0"
+        self._cli_args.host = get_inference_bind_host()
         self._cli_args.port = self._port
 
         # PD disaggregation: setup NIXL side channel for KV transfer

@@ -150,6 +150,21 @@ class SFTConfig(BaseConfig):
 
     # ---- SFT-specific flat fields ----
     strategy: str = "megatron"  # "megatron" or "fsdp"
+    language_model_only: bool = False
+    """Train only the language backbone of a multimodal checkpoint.
+
+    This routes Qwen3.x VLM-family checkpoints through SkyRL's native text
+    Megatron bridge and keeps text-only padding removal / sequence packing
+    enabled instead of initializing the unused vision tower.
+    """
+    logprobs_chunk_size: Optional[int] = 1024
+    """Sequence chunk size for log-prob/loss computation. ``None`` disables
+    chunking for Megatron; FSDP requires a positive integer."""
+    fused_lm_head_logprob: bool = False
+    """Megatron-only fused LM-head loss path that avoids materializing the
+    full token-by-vocabulary logits tensor."""
+    fused_lm_head_logprob_backend: str = "torch"
+    """Fused LM-head backend: ``"torch"`` or ``"triton"``."""
     dataset_name: Optional[str] = None
     """Deprecated: use ``train_datasets`` instead. Translated to ``train_datasets=[dataset_name]``
     with a DeprecationWarning. Cannot be combined with ``train_datasets``."""
@@ -227,6 +242,9 @@ class SFTConfig(BaseConfig):
     run_name: str = "skyrl_sft_run"
     tags: Optional[List[str]] = None
     """Optional list of tags to apply to the W&B run. Has no effect on other backends."""
+    peak_tflops_per_gpu: Optional[float] = None
+    """Optional dense, non-sparsity-assisted device peak used to log model FLOP
+    utilization (MFU). Leave unset when the hardware peak is not known."""
     ckpt_path: str = ""
     ckpt_interval: int = 0  # <= 0 -> no checkpointing
     enable_ray_gpu_monitor: bool = True
@@ -289,6 +307,13 @@ class SFTConfig(BaseConfig):
     enabled, ``SFTTrainer`` uses ``PackedDataCollator`` instead of
     ``DefaultCollator``. Each bin row becomes one row in the dispatched batch
     and one worker micro-batch.
+    """
+    sequence_packing_strategy: str = "first_fit_decreasing"
+    """Controller-level packing algorithm.
+
+    ``first_fit_decreasing`` preserves the historical behavior.
+    ``fixed_bin_balanced`` balances tokens directly across each DP-sized bin
+    group to reduce distributed stragglers.
     """
     max_tokens_per_microbatch: Optional[int] = None
     """FFD bin capacity (max tokens per bin) when ``use_sequence_packing=True``.
@@ -545,6 +570,21 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         cfg.strategy = "fsdp"
     if cfg.strategy not in _VALID_STRATEGIES:
         raise ValueError(f"Unknown strategy '{cfg.strategy}'. Must be one of {_VALID_STRATEGIES}.")
+    if cfg.logprobs_chunk_size is not None and (
+        not isinstance(cfg.logprobs_chunk_size, int) or cfg.logprobs_chunk_size <= 0
+    ):
+        raise ValueError(
+            f"logprobs_chunk_size must be a positive integer or None, got {cfg.logprobs_chunk_size!r}."
+        )
+    if cfg.logprobs_chunk_size is None and cfg.strategy != "megatron":
+        raise ValueError("logprobs_chunk_size=None is only supported with the Megatron backend.")
+    if cfg.fused_lm_head_logprob and cfg.strategy != "megatron":
+        raise ValueError("fused_lm_head_logprob=True is only supported with the Megatron backend.")
+    if cfg.fused_lm_head_logprob_backend not in ("torch", "triton"):
+        raise ValueError(
+            "fused_lm_head_logprob_backend must be 'torch' or 'triton', "
+            f"got {cfg.fused_lm_head_logprob_backend!r}."
+        )
     if cfg.micro_train_batch_size_per_gpu <= 0:
         raise ValueError(f"micro_train_batch_size_per_gpu must be > 0, got {cfg.micro_train_batch_size_per_gpu}")
     if cfg.batch_size <= 0:
@@ -562,6 +602,12 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError(f"dummy_run_max_steps must be > 0, got {cfg.dummy_run_max_steps}")
     if cfg.max_training_steps is not None and cfg.max_training_steps <= 0:
         raise ValueError(f"max_training_steps must be > 0, got {cfg.max_training_steps}")
+    if cfg.max_ckpts_to_keep == 0 or cfg.max_ckpts_to_keep < -1:
+        raise ValueError(
+            f"max_ckpts_to_keep must be -1 (keep all) or a positive integer, got {cfg.max_ckpts_to_keep}."
+        )
+    if cfg.peak_tflops_per_gpu is not None and cfg.peak_tflops_per_gpu <= 0:
+        raise ValueError(f"peak_tflops_per_gpu must be > 0, got {cfg.peak_tflops_per_gpu}.")
 
     # Dataloader / sampler config
     if cfg.sampler not in _VALID_SAMPLERS:
@@ -619,6 +665,12 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
             cfg.remove_microbatch_padding = True
         if cfg.max_length is None:
             raise ValueError("use_sequence_packing=True requires max_length to be set (it is the bin capacity).")
+        valid_packing_strategies = {"first_fit_decreasing", "balanced", "fixed_bin_balanced"}
+        if cfg.sequence_packing_strategy.lower() not in valid_packing_strategies:
+            raise ValueError(
+                f"Unknown sequence_packing_strategy={cfg.sequence_packing_strategy!r}; "
+                f"expected one of {sorted(valid_packing_strategies)}."
+            )
         # Resolve and validate the FFD bin capacity (asserts it is >= max_length
         # so any single sequence fits in a bin).
         cfg.resolved_bin_capacity()
@@ -655,6 +707,7 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
 
     cfg.trainer.policy.sequence_parallel_size = sft_cfg.sequence_parallel_size
     cfg.trainer.policy.model_config_kwargs = sft_cfg.model_config_kwargs
+    cfg.trainer.policy.language_model_only = sft_cfg.language_model_only
     cfg.trainer.policy.use_torch_compile = sft_cfg.use_torch_compile
     cfg.trainer.policy.record_memory = sft_cfg.record_memory
     cfg.trainer.policy.torch_profiler_config = sft_cfg.torch_profiler_config
@@ -669,6 +722,9 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     # to simplify user configuration
     cfg.trainer.micro_forward_batch_size_per_gpu = sft_cfg.micro_train_batch_size_per_gpu
     cfg.trainer.remove_microbatch_padding = sft_cfg.remove_microbatch_padding
+    cfg.trainer.logprobs_chunk_size = sft_cfg.logprobs_chunk_size
+    cfg.trainer.fused_lm_head_logprob = sft_cfg.fused_lm_head_logprob
+    cfg.trainer.fused_lm_head_logprob_backend = sft_cfg.fused_lm_head_logprob_backend
     # When sequence packing is on, each row in the dispatched batch is one bin
     # and one worker micro-batch, so the worker-side
     # ``micro_train_batch_size_per_gpu`` is 1 (the bin token budget is carried
@@ -681,6 +737,7 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     cfg.trainer.project_name = sft_cfg.project_name
     cfg.trainer.run_name = sft_cfg.run_name
     cfg.trainer.tags = sft_cfg.tags
+    cfg.trainer.max_ckpts_to_keep = sft_cfg.max_ckpts_to_keep
     if sft_cfg.ckpt_path:
         cfg.trainer.ckpt_path = sft_cfg.ckpt_path
         cfg.trainer.ckpt_interval = sft_cfg.ckpt_interval

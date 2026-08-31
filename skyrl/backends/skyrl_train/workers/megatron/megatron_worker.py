@@ -1,3 +1,4 @@
+import functools
 import os
 import shutil
 from collections import defaultdict
@@ -65,6 +66,8 @@ from skyrl.backends.skyrl_train.workers.worker import (
     CriticWorkerBase,
     PolicyWorkerBase,
     RefWorkerBase,
+    skyrl_nvtx_annotate,
+    skyrl_nvtx_range,
 )
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
@@ -89,6 +92,106 @@ import skyrl.backends.skyrl_train.workers.megatron.model_bridges as _  # noqa: F
 from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
     maybe_force_qwen35_text_bridge,
 )
+
+
+def _hybrid_packed_attention_flops_correction(
+    provider: Any,
+    *,
+    batch_size: int,
+    seqlen_sum: int,
+    seqlen_squared_sum: int,
+) -> float:
+    """Correct Bridge's hybrid-model full-attention FLOPs for packing.
+
+    Megatron Bridge accepts ``seqlen_squared_sum`` but its hybrid-model branch
+    currently calls ``hybrid_flops`` with only the average sequence length.
+    Linear-attention/GDN and projection terms are already exact because
+    ``batch_size * average_length == seqlen_sum``. Only the quadratic causal
+    attention core needs replacing with ``sum(length**2)``.
+    """
+    if not getattr(provider, "is_hybrid_model", False) or batch_size <= 0 or seqlen_sum <= 0:
+        return 0.0
+
+    hybrid_pattern = getattr(provider, "hybrid_layer_pattern", None)
+    if hybrid_pattern:
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            parse_hybrid_pattern,
+        )
+
+        parsed = parse_hybrid_pattern(hybrid_pattern)
+        num_full_attention_layers = sum(layer_type == "*" for layer_type in parsed.main_pattern)
+        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+            num_full_attention_layers += (
+                sum(layer_type == "*" for layer_type in parsed.mtp_pattern) * parsed.mtp_num_depths
+            )
+    else:
+        num_full_attention_layers = round(
+            getattr(provider, "num_layers", 0) * getattr(provider, "hybrid_attention_ratio", 0)
+        )
+
+    if num_full_attention_layers == 0:
+        return 0.0
+
+    kv_channels = getattr(provider, "kv_channels", None)
+    num_attention_heads = getattr(provider, "num_attention_heads", 0)
+    hidden_size = getattr(provider, "hidden_size", 0)
+    query_projection_size = (
+        kv_channels * num_attention_heads if kv_channels is not None else hidden_size
+    )
+    average_squared_sum = seqlen_sum * seqlen_sum / batch_size
+    quadratic_delta = seqlen_squared_sum - average_squared_sum
+    if quadratic_delta < -1e-6:
+        raise ValueError(
+            "seqlen_squared_sum is smaller than seqlen_sum**2 / batch_size; "
+            "the supplied packed-sequence statistics are inconsistent"
+        )
+
+    # Bridge counts causal QK^T and attention*V as
+    # 2 * sequence_length**2 * query_projection_size in the forward pass,
+    # then multiplies forward FLOPs by three for training (forward + backward).
+    return float(6 * num_full_attention_layers * query_projection_size * max(quadratic_delta, 0.0))
+
+
+def _maybe_override_fla_causal_conv_backend() -> Optional[str]:
+    """Select an explicit FLA causal-convolution backend for diagnostics.
+
+    Megatron imports FLA's ``causal_conv1d`` into the Gated DeltaNet module and
+    calls it without a backend argument, which selects Triton. On variable-size
+    packed batches that path can repeatedly autotune and compile shape-specific
+    kernels. ``SKYRL_FLA_CAUSAL_CONV_BACKEND`` allows a bounded comparison with
+    FLA's installed ``cuda`` or mixed backend without modifying the immutable
+    Megatron/FLA packages in the runtime image.
+    """
+    backend = os.environ.get("SKYRL_FLA_CAUSAL_CONV_BACKEND", "").strip().lower()
+    if not backend:
+        return None
+    if backend not in {"triton", "mix", "cuda"}:
+        raise ValueError(
+            "SKYRL_FLA_CAUSAL_CONV_BACKEND must be one of triton, mix, or cuda; "
+            f"got {backend!r}"
+        )
+
+    from megatron.core.ssm import gated_delta_net
+
+    current = gated_delta_net.causal_conv1d
+    installed_backend = getattr(current, "_skyrl_fla_causal_conv_backend", None)
+    if installed_backend == backend:
+        return backend
+    if installed_backend is not None:
+        raise RuntimeError(
+            "FLA causal-convolution backend was already overridden in this process: "
+            f"{installed_backend}"
+        )
+
+    @functools.wraps(current)
+    def _causal_conv1d_with_backend(*args, **kwargs):
+        kwargs["backend"] = backend
+        return current(*args, **kwargs)
+
+    _causal_conv1d_with_backend._skyrl_fla_causal_conv_backend = backend
+    gated_delta_net.causal_conv1d = _causal_conv1d_with_backend
+    logger.info(f"Using FLA causal_conv1d backend={backend!r} from SKYRL_FLA_CAUSAL_CONV_BACKEND")
+    return backend
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -601,6 +704,7 @@ class MegatronWorker:
         # TE patch to allow FA2 for head_dim 256 on SM103 (B300)
         # Delete along with the patch module once the TE pin includes NVIDIA/TransformerEngine#3360.
         patch_fa2_head_dim_allowlist()
+        _maybe_override_fla_causal_conv_backend()
 
         if lora_config is not None:
             self.configure_lora(lora_config, lora_type)
@@ -808,6 +912,7 @@ class MegatronWorker:
 
         return padded
 
+    @skyrl_nvtx_annotate("skyrl.hf_export.save")
     def save_hf_model(self, export_dir: str, tokenizer):
         # Save model in HuggingFace safetensors format
         hf_export = self.megatron_config.hf_export_config
@@ -892,6 +997,45 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             world_size=self._world_size,
             dp_size=mpu.get_data_parallel_world_size(),
             pp_size=mpu.get_pipeline_model_parallel_world_size(),
+        )
+
+    def estimate_training_flops(
+        self,
+        *,
+        batch_size: int,
+        seqlen_sum: int,
+        seqlen_squared_sum: int,
+    ) -> float:
+        """Return Megatron Bridge's model-FLOP estimate for one global batch."""
+        from types import SimpleNamespace
+
+        from megatron.bridge.training.utils.flop_utils import (
+            num_floating_point_operations,
+        )
+
+        # The estimator reads the finalized model provider plus a few optional
+        # top-level fields. SkyRL does not use Bridge's ConfigContainer training
+        # loop, so provide the equivalent minimal view without changing runtime
+        # model configuration.
+        bridge_cfg = SimpleNamespace(
+            model=self.provider,
+            peft=getattr(self, "lora_cls", None),
+            dataset=SimpleNamespace(dataset_name=None, packed_sequence_specs=None),
+            train=SimpleNamespace(global_batch_size=batch_size),
+        )
+        bridge_flops = float(
+            num_floating_point_operations(
+                bridge_cfg,
+                batch_size=batch_size,
+                seqlen_sum=seqlen_sum,
+                seqlen_squared_sum=seqlen_squared_sum,
+            )
+        )
+        return bridge_flops + _hybrid_packed_attention_flops_correction(
+            self.provider,
+            batch_size=batch_size,
+            seqlen_sum=seqlen_sum,
+            seqlen_squared_sum=seqlen_squared_sum,
         )
 
     def init_model(self, model_path, num_training_steps: int = 1e9):
@@ -1108,6 +1252,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
+    @skyrl_nvtx_annotate("skyrl.sft.forward_backward", pytorch_ops=True)
     def forward_backward(
         self,
         data: TrainingInputBatch,
@@ -1240,15 +1385,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 f"seq_len={seq_len} tokens={real_tokens}"
             )
 
-        metrics_list = self.model.forward_backward_mini_batch(
-            micro_batches=micro_buffer,
-            seq_len=seq_len,
-            micro_batch_size=micro_bsz,
-            temperature=self.cfg.algorithm.temperature,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-            return_per_token_outputs=return_per_token_outputs,
-        )
+        with skyrl_nvtx_range("skyrl.sft.forward_backward.compute"):
+            metrics_list = self.model.forward_backward_mini_batch(
+                micro_batches=micro_buffer,
+                seq_len=seq_len,
+                micro_batch_size=micro_bsz,
+                temperature=self.cfg.algorithm.temperature,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
+            )
 
         if self.empty_cuda_cache:
             torch.cuda.empty_cache()
@@ -1271,9 +1417,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # Reduce across microbatches and all-reduce metrics across DP ranks
         # (metrics should be identical within DP groups, i.e., across TP/PP/SP ranks)
         # NOTE: Sum loss metrics because scaling is already applied before the worker reduction.
-        status = reduce_metrics(all_metrics, sum_loss_metrics=True)
-        if self.optimizer is not None:
-            status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
+        with skyrl_nvtx_range("skyrl.sft.forward_backward.reduce_metrics"):
+            status = reduce_metrics(all_metrics, sum_loss_metrics=True)
+            if self.optimizer is not None:
+                status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
 
         # Token-based batching diagnostics: total microbatches this rank ran and how many
         # were purely-padding (added to equalize the microbatch count across DP ranks).
@@ -1283,8 +1430,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             status["num_microbatches"] = float(len(micro_buffer))
             status["num_padding_microbatches"] = float(num_padding_microbatches)
 
-        group = mpu.get_data_parallel_group(with_context_parallel=False)
-        status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=True)
+        with skyrl_nvtx_range("skyrl.sft.forward_backward.all_reduce_metrics"):
+            group = mpu.get_data_parallel_group(with_context_parallel=False)
+            status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=True)
 
         # Collect MoE aux metrics averaged across microbatches (all-reduced across ranks
         # inside get_moe_metrics) aggregating after per-microbatch scalar metrics.
@@ -1305,6 +1453,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
+    @skyrl_nvtx_annotate("skyrl.sft.optimizer", pytorch_ops=True)
     def optim_step(self) -> Optional[float]:
         """
         Perform optimizer step.
@@ -1328,9 +1477,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # whole accumulated window. Deferred out of forward_backward because the reduce
         # is not idempotent -- running it per call corrupts gradients once a window
         # spans more than one call.
-        self.model.run_pending_grad_sync()
+        with skyrl_nvtx_range("skyrl.sft.optimizer.gradient_sync"):
+            self.model.run_pending_grad_sync()
 
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        with skyrl_nvtx_range("skyrl.sft.optimizer.update"):
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Clear the DDP grad buffers for the next window. `optimizer.zero_grad()` inside
         # `optimizer_step` only drops `param.grad` / the fp32 main-param grads -- the
@@ -1338,8 +1489,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # the gradients just applied would be accumulated into again by the next window.
         # Also re-arms Megatron's per-iteration bookkeeping (bucket-group grad-ready
         # counters, `grad_added_to_main_grad`).
-        for chunk in self.actor_module:
-            chunk.zero_grad_buffer()
+        with skyrl_nvtx_range("skyrl.sft.optimizer.zero_grad"):
+            for chunk in self.actor_module:
+                chunk.zero_grad_buffer()
 
         # Reset counter for next accumulation cycle
         self._micro_batches_accumulated = 0
@@ -1458,6 +1610,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.distributed.barrier()
 
+    @skyrl_nvtx_annotate("skyrl.weight_sync.broadcast")
     async def broadcast_to_inference_engines(
         self,
         inference_engine_client: "InferenceEngineInterface",
