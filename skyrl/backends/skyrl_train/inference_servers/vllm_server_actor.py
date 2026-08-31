@@ -32,6 +32,7 @@ from vllm.utils.system_utils import set_ulimit
 from skyrl.backends.skyrl_train.inference_servers.common import (
     ServerInfo,
     compute_dp_master_port,
+    compute_uniproc_internal_port,
     find_and_reserve_port,
     get_inference_advertise_host,
     get_inference_bind_host,
@@ -185,6 +186,16 @@ class VLLMServerActor(ServerActorProtocol):
         # TODO: delete once vllm#50969 lands -- see the removal checklist on
         # `compute_dp_master_port` in inference_servers/common.py.
         os.environ["VLLM_DP_MASTER_PORT"] = str(compute_dp_master_port(start_port))
+        # UniProcExecutor probes and releases a kernel-assigned TCPStore port
+        # before binding it. Concurrent TP=1 engines can therefore select the
+        # same port. VLLM_PORT makes each actor scan inside its own disjoint
+        # internal window instead.
+        if distributed_executor_backend == "uni":
+            os.environ["VLLM_PORT"] = str(compute_uniproc_internal_port(start_port))
+            logger.info(
+                "Assigned vLLM UniProc internal port window: "
+                f"VLLM_PORT={os.environ['VLLM_PORT']} server_idx={server_idx}"
+            )
 
         # Configure the distributed executor backend
         self._cli_args.distributed_executor_backend = distributed_executor_backend
@@ -533,6 +544,17 @@ def _seed_dp_master_port(http_port: int) -> None:
     os.environ.setdefault("VLLM_DP_MASTER_PORT", str(compute_dp_master_port(http_port)))
 
 
+def _seed_uniproc_internal_port(http_port: int, distributed_executor_backend: str) -> None:
+    """Seed a private vLLM internal-port window for standalone UniProc use.
+
+    Ray actors set this from their assigned ``start_port`` in ``__init__``;
+    ``setdefault`` preserves that value here. The standalone path has no
+    sibling SkyRL actor, but the same rule keeps its sockets away from HTTP.
+    """
+    if distributed_executor_backend == "uni":
+        os.environ.setdefault("VLLM_PORT", str(compute_uniproc_internal_port(http_port)))
+
+
 async def _build_and_serve_vllm_server(
     cli_args: Namespace,
     *,
@@ -545,6 +567,7 @@ async def _build_and_serve_vllm_server(
     standalone ``python -m`` entrypoint below.
     """
     _seed_dp_master_port(cli_args.port)
+    _seed_uniproc_internal_port(cli_args.port, cli_args.distributed_executor_backend)
 
     sock_addr = (cli_args.host, cli_args.port)
     # One uvicorn per port (no api_server_count fan-out), matching vLLM's own

@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 # inside its window.
 SERVER_PORT_STRIDE = 100
 
+# vLLM's UniProcExecutor discovers its torch.distributed TCPStore port with a
+# probe-then-close call to get_open_port(). Concurrent TP=1 engines can all be
+# handed the same kernel-assigned port before any of them binds TCPStore. Give
+# each actor a private deterministic internal-port window through VLLM_PORT.
+UNIPROC_PORT_WINDOW_OFFSET = 16
+UNIPROC_PORT_WINDOW = 32
+
 # vLLM's `RayExecutorV2` picks the engine's worker `torch.distributed` TCPStore
 # port by probing `[VLLM_DP_MASTER_PORT + 100, VLLM_DP_MASTER_PORT + 100 + 32)`
 # and taking the first port whose bind succeeds -- see
@@ -37,6 +44,10 @@ DP_TCPSTORE_WINDOW_OFFSET = 64
 assert DP_TCPSTORE_WINDOW_OFFSET + DP_TCPSTORE_WINDOW <= SERVER_PORT_STRIDE, (
     "The TCPStore probe window must fit inside one server actor's port window, "
     "otherwise adjacent actors probe overlapping ranges."
+)
+assert UNIPROC_PORT_WINDOW_OFFSET > 0, "The UniProc window must clear the HTTP port"
+assert UNIPROC_PORT_WINDOW_OFFSET + UNIPROC_PORT_WINDOW <= DP_TCPSTORE_WINDOW_OFFSET, (
+    "The UniProc internal-port window must not overlap the Ray/DP TCPStore window"
 )
 
 
@@ -190,6 +201,16 @@ def compute_dp_master_port(start_port: int) -> int:
     that path vLLM overwrites the master port itself. Recheck if that changes.
     """
     return start_port + DP_TCPSTORE_WINDOW_OFFSET - DP_TCPSTORE_PROBE_OFFSET
+
+
+def compute_uniproc_internal_port(start_port: int) -> int:
+    """Return the start of a vLLM UniProc engine's private port window.
+
+    vLLM uses ``VLLM_PORT`` as the starting point when it allocates internal
+    sockets. Deriving it from SkyRL's per-actor ``start_port`` prevents the
+    probe/bind race between concurrent TP=1 engines on the same host.
+    """
+    return start_port + UNIPROC_PORT_WINDOW_OFFSET
 
 
 def dp_tcpstore_probe_window(dp_master_port: int) -> range:

@@ -8,7 +8,9 @@ import pytest
 from skyrl.backends.skyrl_train.inference_servers.common import (
     DP_TCPSTORE_WINDOW,
     SERVER_PORT_STRIDE,
+    UNIPROC_PORT_WINDOW,
     compute_dp_master_port,
+    compute_uniproc_internal_port,
     dp_tcpstore_probe_window,
     find_and_reserve_port,
     get_inference_advertise_host,
@@ -207,3 +209,33 @@ class TestDPMasterPort:
         decode = self._server_start_ports(2, base=8000 + 2 * SERVER_PORT_STRIDE)
         bases = [compute_dp_master_port(p) for p in prefill + decode]
         assert len(set(bases)) == len(bases), f"Duplicate master port across groups: {bases}"
+
+
+class TestUniProcInternalPort:
+    """Regression coverage for concurrent TP=1 vLLM engine port allocation."""
+
+    def _server_start_ports(self, count: int, base: int = 8000) -> list[int]:
+        return [base + i * SERVER_PORT_STRIDE for i in range(count)]
+
+    def test_windows_are_disjoint_across_servers(self):
+        windows = [
+            range(compute_uniproc_internal_port(p), compute_uniproc_internal_port(p) + UNIPROC_PORT_WINDOW)
+            for p in self._server_start_ports(32)
+        ]
+        seen: set[int] = set()
+        for window in windows:
+            ports = set(window)
+            assert not (ports & seen), f"Overlapping UniProc window: {window}"
+            seen |= ports
+
+    def test_window_clears_http_and_dp_tcpstore_ports(self):
+        for start_port in self._server_start_ports(32):
+            window = set(
+                range(
+                    compute_uniproc_internal_port(start_port),
+                    compute_uniproc_internal_port(start_port) + UNIPROC_PORT_WINDOW,
+                )
+            )
+            assert start_port not in window
+            assert not (window & set(dp_tcpstore_probe_window(compute_dp_master_port(start_port))))
+            assert max(window) < start_port + SERVER_PORT_STRIDE
