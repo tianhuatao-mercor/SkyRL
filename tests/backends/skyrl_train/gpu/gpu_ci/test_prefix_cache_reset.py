@@ -50,6 +50,7 @@ def _make_worker(worker_cls, handles_prefix_cache_reset: bool):
 def _patch_collectives(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *a, **k: 0)
     monkeypatch.setattr(torch.distributed, "barrier", lambda *a, **k: None)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
 
@@ -121,3 +122,65 @@ async def test_no_reset_when_prefix_caching_disabled(strategy, monkeypatch):
 
     client.reset_prefix_cache.assert_not_awaited()
     assert worker._weight_transfer_sender.send_chunks.await_args.kwargs["reset_prefix_cache"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["fsdp", pytest.param("megatron", marks=pytest.mark.megatron)])
+async def test_async_clear_resets_running_requests_when_prefix_caching_disabled(strategy, monkeypatch):
+    """Per-request KV state exists independently of automatic prefix caching."""
+    worker_cls = get_worker_cls(strategy)
+
+    _patch_collectives(monkeypatch)
+    worker = _make_worker(worker_cls, handles_prefix_cache_reset=False)
+    worker.cfg.fully_async.enabled = True
+    worker.cfg.fully_async.clear_kv_cache_on_weight_sync = True
+    client = AsyncMock()
+    ie_cfg = SimpleNamespace(enable_prefix_caching=False, model_dtype="bfloat16")
+
+    await worker.broadcast_to_inference_engines(client, ie_cfg)
+
+    client.reset_prefix_cache.assert_awaited_once_with(reset_running_requests=True)
+    assert worker._weight_transfer_sender.send_chunks.await_args.kwargs["reset_prefix_cache"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["fsdp", pytest.param("megatron", marks=pytest.mark.megatron)])
+async def test_rank_zero_reset_failure_is_raised_before_barrier(strategy, monkeypatch):
+    worker_cls = get_worker_cls(strategy)
+
+    _patch_collectives(monkeypatch)
+    barrier = MagicMock()
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    worker = _make_worker(worker_cls, handles_prefix_cache_reset=False)
+    client = AsyncMock()
+    client.reset_prefix_cache.side_effect = RuntimeError("HTTP 200 success=false")
+
+    with pytest.raises(RuntimeError, match="prefix-cache reset failed on rank zero"):
+        await worker.broadcast_to_inference_engines(client, _ie_cfg())
+
+    barrier.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["fsdp", pytest.param("megatron", marks=pytest.mark.megatron)])
+async def test_nonzero_rank_receives_rank_zero_reset_failure(strategy, monkeypatch):
+    worker_cls = get_worker_cls(strategy)
+
+    _patch_collectives(monkeypatch)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *a, **k: 1)
+    barrier = MagicMock()
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+
+    def _receive_failure(error_box, src):
+        assert src == 0
+        error_box[0] = "RuntimeError: HTTP 200 success=false"
+
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", _receive_failure)
+    worker = _make_worker(worker_cls, handles_prefix_cache_reset=False)
+    client = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="prefix-cache reset failed on rank zero"):
+        await worker.broadcast_to_inference_engines(client, _ie_cfg())
+
+    client.reset_prefix_cache.assert_not_called()
+    barrier.assert_not_called()

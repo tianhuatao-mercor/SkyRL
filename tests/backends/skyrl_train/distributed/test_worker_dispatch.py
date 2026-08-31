@@ -23,6 +23,7 @@ def _fft_dispatch_cfg(weight_sync_backend: str = "nccl") -> SimpleNamespace:
     return SimpleNamespace(
         trainer=SimpleNamespace(
             strategy="fsdp",
+            fully_async=SimpleNamespace(enabled=False, clear_kv_cache_on_weight_sync=False),
             policy=SimpleNamespace(
                 model=SimpleNamespace(lora=SimpleNamespace(rank=0)),
                 megatron_config=SimpleNamespace(lora_config=SimpleNamespace(merge_lora=False)),
@@ -127,8 +128,8 @@ class TestSaveWeights:
         assert call_order == ["pause", "broadcast", "resume"]
 
     @pytest.mark.asyncio
-    async def test_non_colocated_resumes_on_broadcast_failure(self):
-        """resume_generation must be called even if broadcast raises."""
+    async def test_non_colocated_stays_paused_on_broadcast_failure(self):
+        """A partial weight update must fail closed rather than serve requests."""
         from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
 
         dispatch = WorkerDispatch.__new__(WorkerDispatch)
@@ -144,7 +145,33 @@ class TestSaveWeights:
             await dispatch.save_weights_for_sampler()
 
         dispatch._inference_engine_client.pause_generation.assert_awaited_once()
-        dispatch._inference_engine_client.resume_generation.assert_awaited_once()
+        dispatch._inference_engine_client.resume_generation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_async_offload_stays_paused_on_broadcast_failure(self):
+        """Discarded cache storage must never be resumed after a failed sync."""
+        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+        cfg = _fft_dispatch_cfg()
+        cfg.trainer.fully_async.enabled = True
+        cfg.trainer.fully_async.clear_kv_cache_on_weight_sync = True
+        cfg.generator.inference_engine.offload_kv_for_weight_sync = True
+
+        dispatch = WorkerDispatch.__new__(WorkerDispatch)
+        dispatch.colocate_all = False
+        dispatch.cfg = cfg
+        dispatch._inference_engine_client = AsyncMock()
+        dispatch._broadcast_to_inference_engines = MagicMock(side_effect=RuntimeError("reset failed"))
+        dispatch._prepare_for_weight_sync = MagicMock()
+        dispatch._finish_weight_sync = MagicMock()
+        dispatch.ensure_active_adapter = MagicMock()
+
+        with pytest.raises(RuntimeError, match="reset failed"):
+            await dispatch.save_weights_for_sampler()
+
+        dispatch._inference_engine_client.pause_generation.assert_awaited_once()
+        dispatch._inference_engine_client.sleep_for_weight_sync.assert_awaited_once_with(offload_kv=False)
+        dispatch._inference_engine_client.resume_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_non_colocated_inplace_lora_skips_pause_and_resume(self):

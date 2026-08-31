@@ -50,6 +50,28 @@ from skyrl.env_vars import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_native_reset_prefix_cache_route(app) -> None:
+    """Fail at server startup if the pinned vLLM cache contract has drifted."""
+    routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/reset_prefix_cache"
+        and "POST" in (getattr(route, "methods", None) or set())
+    ]
+    if len(routes) != 1:
+        raise RuntimeError("Expected exactly one native POST /reset_prefix_cache route, " f"found {len(routes)}")
+
+    query_parameters = {
+        parameter.name for parameter in getattr(getattr(routes[0], "dependant", None), "query_params", [])
+    }
+    required_parameters = {"reset_running_requests", "reset_external"}
+    if not required_parameters.issubset(query_parameters):
+        raise RuntimeError(
+            "vLLM /reset_prefix_cache contract is incompatible: expected query "
+            f"parameters {sorted(required_parameters)}, found {sorted(query_parameters)}"
+        )
+
+
 class VLLMServerActor(ServerActorProtocol):
     """
     Ray actor that runs a vLLM OpenAI-compatible API server.
@@ -60,10 +82,11 @@ class VLLMServerActor(ServerActorProtocol):
     called from anywhere (other actors, driver, external processes).
 
     Custom endpoints added for SkyRL:
-    - /reset_prefix_cache: Reset prefix cache
+    - /fetch_weights: Fetch and apply checkpoint-delta payloads
 
-    Weight sync uses vLLM native endpoints (/init_weight_transfer_engine,
-    /update_weights, /get_world_size) from the RLHF router when VLLM_SERVER_DEV_MODE=1.
+    Weight sync and cache reset use vLLM native development endpoints
+    (/init_weight_transfer_engine, /update_weights, /get_world_size,
+    /reset_prefix_cache) when VLLM_SERVER_DEV_MODE=1.
     """
 
     @staticmethod
@@ -348,17 +371,6 @@ class VLLMServerActor(ServerActorProtocol):
         # adds /fetch_weights because checkpoint-delta pulls and applies
         # payloads before the paused /update_weights reload.
 
-        @app.post("/reset_prefix_cache")
-        async def _reset_prefix_cache(request: Request):
-            """Reset the prefix cache, optionally resetting in-flight requests too."""
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-            reset_running_requests = data.get("reset_running_requests", False)
-            await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
-            return {"status": "ok"}
-
         @app.post("/fetch_weights")
         async def _fetch_weights(request: Request):
             """Fetch/apply checkpoint-delta payloads before the paused reload phase."""
@@ -558,6 +570,7 @@ async def _build_and_serve_vllm_server(
 
     # Add custom SkyRL endpoints
     VLLMServerActor._add_custom_endpoints(app, engine, cli_args)
+    _validate_native_reset_prefix_cache_route(app)
 
     await init_app_state(engine, app.state, cli_args)
 

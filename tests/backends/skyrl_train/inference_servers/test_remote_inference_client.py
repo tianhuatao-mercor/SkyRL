@@ -255,8 +255,16 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         return {"status": "awake", "server_id": server_id, "tags": tags}
 
     @app.post("/reset_prefix_cache")
-    async def reset_prefix_cache(request: Request):
-        return {"status": "cache_reset", "server_id": server_id, "body": await request.json()}
+    async def reset_prefix_cache(
+        reset_running_requests: bool = Query(False),
+        reset_external: bool = Query(False),
+    ):
+        return {
+            "success": True,
+            "server_id": server_id,
+            "reset_running_requests": reset_running_requests,
+            "reset_external": reset_external,
+        }
 
     @app.post("/init_weight_transfer_engine")
     async def init_weight_transfer_engine(request: Request):
@@ -639,12 +647,29 @@ class TestControlPlane:
 
     @pytest.mark.asyncio
     async def test_reset_prefix_cache(self, client):
-        """Test reset_prefix_cache fans out to all servers with the request body."""
+        """Test reset_prefix_cache uses vLLM's query-parameter contract."""
         result = await client.reset_prefix_cache(reset_running_requests=True)
         assert set(result) == set(client.server_urls)
         for response in result.values():
-            assert response["body"]["status"] == "cache_reset"
-            assert response["body"]["body"] == {"reset_running_requests": True}
+            assert response["body"]["success"] is True
+            assert response["body"]["reset_running_requests"] is True
+            assert response["body"]["reset_external"] is True
+
+    @pytest.mark.asyncio
+    async def test_reset_prefix_cache_rejects_http_200_failure(self, client, monkeypatch):
+        """A vLLM cache reset can fail in a successful HTTP response."""
+
+        async def failed_reset(*args, **kwargs):
+            del args, kwargs
+            return {
+                client.server_urls[0]: {"status": 200, "body": {"success": False}},
+                client.server_urls[1]: {"status": 200, "body": {"success": True}},
+            }
+
+        monkeypatch.setattr(client, "_call_all_servers", failed_reset)
+
+        with pytest.raises(RuntimeError, match="1/2 inference servers"):
+            await client.reset_prefix_cache(reset_running_requests=True)
 
 
 class TestWeightSync:
