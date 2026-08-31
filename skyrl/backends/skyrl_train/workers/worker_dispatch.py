@@ -699,8 +699,14 @@ class WorkerDispatch:
                         self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
                         self._finish_weight_sync()
                         await self._inference_engine_client.wake_for_weight_sync(tags=["kv_cache"])
-                    finally:
-                        await self._inference_engine_client.resume_generation()
+                    except Exception:
+                        # The allocator or weights may now be only partially
+                        # restored. Resuming frozen requests would turn a sync
+                        # failure into silent bad samples; leave generation
+                        # paused and let job teardown fail closed.
+                        logger.exception("Weight sync failed; leaving inference generation paused")
+                        raise
+                    await self._inference_engine_client.resume_generation()
                 else:
                     # Synchronous trainer: generation is complete at sync time, so there
                     # are no in-flight requests to preserve. A plain sleep (discards KV,
@@ -725,8 +731,13 @@ class WorkerDispatch:
                     try:
                         self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
                         self._finish_weight_sync()
-                    finally:
-                        await self._inference_engine_client.resume_generation()
+                    except Exception:
+                        # A failed broadcast can leave a replica with partially
+                        # updated weights. Keep it paused instead of serving from
+                        # an indeterminate model state.
+                        logger.exception("Weight sync failed; leaving inference generation paused")
+                        raise
+                    await self._inference_engine_client.resume_generation()
 
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights
         # (see `GeneratorConfig.use_cache_salt`).

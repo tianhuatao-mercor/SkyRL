@@ -1105,7 +1105,33 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Returns:
             Dict mapping server_url to response.
         """
-        return await self._call_all_servers("/reset_prefix_cache", {"reset_running_requests": reset_running_requests})
+        # vLLM's native cache endpoint declares ``reset_running_requests`` as a
+        # FastAPI Query parameter. Sending it in the JSON body silently leaves
+        # the native default (False) in effect. In particular, a busy engine
+        # then returns HTTP 200 with ``{"success": false}``, so checking only
+        # the HTTP status is insufficient and can leave running requests bound
+        # to cache storage that a weight-sync sleep has already discarded.
+        results = await self._call_all_servers(
+            "/reset_prefix_cache",
+            params={
+                "reset_running_requests": str(reset_running_requests).lower(),
+                # A weight publication invalidates connector-managed cache in
+                # exactly the same way as local KV/recurrent state. This is a
+                # no-op without an external KV connector and prevents a future
+                # NIXL/PD deployment from reusing old-weight external blocks.
+                "reset_external": "true",
+            },
+        )
+
+        failed = {
+            server_url: response.get("body")
+            for server_url, response in results.items()
+            if not isinstance(response.get("body"), dict) or response["body"].get("success") is not True
+        }
+        if failed:
+            raise RuntimeError(f"Prefix-cache reset failed on {len(failed)}/{len(results)} inference servers: {failed}")
+
+        return results
 
     # ---------------------------
     # Weight Sync (control plane - fan-out)

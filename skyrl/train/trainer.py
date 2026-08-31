@@ -1,7 +1,9 @@
 import math
 import os
 import shutil
+import threading
 from collections import defaultdict
+from concurrent.futures import Future
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -80,6 +82,7 @@ from skyrl.train.utils.callbacks import (
     TrainingCallback,
     TrainingControl,
 )
+from skyrl.train.utils.progress_events import emit_progress_event
 from skyrl.train.utils.ray_gpu_monitor import RayGpuMonitor
 from skyrl.train.utils.tracking import Tracking
 from skyrl.train.utils.trainer_utils import (
@@ -187,6 +190,84 @@ class RayPPOTrainer:
         """Build a CallbackInput and dispatch the given event to all callbacks."""
         cb_input = self._build_callback_input(**fields)
         getattr(self._callback_handler, event_name)(self, cb_input, self._training_control)
+
+    def _report_trainer_status(
+        self,
+        status: str,
+        *,
+        detail: Optional[str] = None,
+        model_name: Optional[str] = None,
+        model_role: Optional[str] = None,
+        update_epoch: Optional[int] = None,
+        update_epochs_total: Optional[int] = None,
+        mini_batch: Optional[int] = None,
+        mini_batches_total: Optional[int] = None,
+        progress_granularity: Optional[str] = None,
+        policy_version: Optional[int] = None,
+    ) -> None:
+        """Publish one authoritative, coarse trainer-status transition.
+
+        The JSONL event is the low-overhead transport used by the standalone
+        dashboard. The callback dispatch lets in-process observers consume the
+        same semantic transition without scraping logs. Neither path reaches
+        inside a provider's forward/backward schedule.
+        """
+
+        if model_name is None:
+            model_name = getattr(
+                getattr(getattr(self.cfg.trainer, "policy", None), "model", None),
+                "path",
+                None,
+            )
+        callback_fields = {
+            "status": status,
+            "status_detail": detail,
+            "model_name": model_name,
+            "model_role": model_role,
+            "update_epoch": update_epoch,
+            "update_epochs_total": update_epochs_total,
+            "mini_batch": mini_batch,
+            "mini_batches_total": mini_batches_total,
+            "progress_granularity": progress_granularity,
+            "policy_version": policy_version,
+        }
+        # Omit nulls from the append-only transport so consumers can retain
+        # stable run metadata such as model identity and policy version. The
+        # callback snapshot still receives explicit None values.
+        event_fields = {key: value for key, value in callback_fields.items() if value is not None}
+        emit_progress_event(
+            "trainer_status_changed",
+            global_step=self.global_step,
+            total_steps=self.total_training_steps,
+            **event_fields,
+        )
+        if not self._callback_handler.callbacks:
+            return
+
+        callback_loop = getattr(self, "_trainer_status_callback_loop", None)
+        callback_thread_id = getattr(self, "_trainer_status_callback_thread_id", None)
+        if (
+            callback_loop is not None
+            and callback_loop.is_running()
+            and threading.get_ident() != callback_thread_id
+        ):
+            # Fully-async provider work runs in ``asyncio.to_thread`` so rollout
+            # tasks can continue. Marshal public callbacks back to the owner
+            # event-loop thread and preserve synchronous ordering/errors.
+            completion: Future[None] = Future()
+
+            def dispatch() -> None:
+                try:
+                    self._fire("on_status_change", **callback_fields)
+                except BaseException as exc:
+                    completion.set_exception(exc)
+                else:
+                    completion.set_result(None)
+
+            callback_loop.call_soon_threadsafe(dispatch)
+            completion.result()
+            return
+        self._fire("on_status_change", **callback_fields)
 
     @property
     def has_critic(self) -> bool:
@@ -1603,16 +1684,43 @@ class RayPPOTrainer:
 
         # Pre-stage all per-DP mini-batch chunks in the object store so that
         # serialization is fully off the critical path during training.
+        self._report_trainer_status(
+            "preparing_training_data",
+            detail=f"staging {model} optimizer mini-batches",
+            model_role=model,
+            mini_batches_total=len(boundaries),
+            progress_granularity="optimizer_minibatch",
+        )
         all_chunk_refs = self.dispatch.stage_data(model, data, boundaries)
 
         # Training loop over epochs and mini-batches
-        for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
-            for chunk_refs in all_chunk_refs:
+        update_epochs_total = self.cfg.trainer.update_epochs_per_batch
+        mini_batches_total = len(all_chunk_refs)
+        for update_epoch_idx in range(update_epochs_total):
+            for mini_batch_idx, chunk_refs in enumerate(all_chunk_refs):
+                status_fields = {
+                    "model_role": model,
+                    "update_epoch": update_epoch_idx + 1,
+                    "update_epochs_total": update_epochs_total,
+                    "mini_batch": mini_batch_idx + 1,
+                    "mini_batches_total": mini_batches_total,
+                    "progress_granularity": "optimizer_minibatch",
+                }
+                self._report_trainer_status(
+                    "forward_backward",
+                    detail="provider schedule in flight; internal microbatch progress unavailable",
+                    **status_fields,
+                )
                 status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
                 for k, v in status.metrics.items():
                     all_metrics[k].append(v)
 
                 # Optimizer step after each mini batch
+                self._report_trainer_status(
+                    "optimizer_step",
+                    detail=f"updating {model} parameters",
+                    **status_fields,
+                )
                 grad_norm = self.dispatch.optim_step(model)
                 if grad_norm is not None:
                     all_metrics["grad_norm"].append(grad_norm)

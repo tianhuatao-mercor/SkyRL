@@ -8,7 +8,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Type
 
 import ray
 import torch
@@ -970,6 +970,36 @@ class PolicyWorkerBase(Worker):
         # optional rank filter. Do not reset it after the base constructor.
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
+
+    async def _await_rank_zero_control_plane(
+        self,
+        operation: str,
+        rank_zero_awaitable: Optional[Awaitable[Any]],
+    ) -> None:
+        """Await a rank-zero request and propagate its result to every rank.
+
+        A rank-zero-only HTTP failure must not let rank zero leave a collective
+        while its peers enter the following barrier. Broadcast a serializable
+        error first so every training rank either continues or fails together.
+        """
+        rank = torch.distributed.get_rank()
+        rank_zero_error: Optional[Exception] = None
+        if rank == 0:
+            if rank_zero_awaitable is None:
+                rank_zero_error = RuntimeError(f"rank zero did not create the {operation} request")
+            else:
+                try:
+                    await rank_zero_awaitable
+                except Exception as exc:
+                    rank_zero_error = exc
+
+        error_box: List[Optional[str]] = [None]
+        if rank == 0 and rank_zero_error is not None:
+            error_box[0] = f"{type(rank_zero_error).__name__}: {rank_zero_error}"
+        torch.distributed.broadcast_object_list(error_box, src=0)
+
+        if error_box[0] is not None:
+            raise RuntimeError(f"{operation} failed on rank zero: {error_box[0]}") from rank_zero_error
 
     def forward_backward(
         self,

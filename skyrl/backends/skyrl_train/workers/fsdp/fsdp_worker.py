@@ -274,9 +274,12 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
         cache_reset_task = None
         sender_handles_prefix_cache_reset = self._weight_transfer_sender.handles_prefix_cache_reset
-        # Clear prefix cache for synchronous training or for async training if `clear_kv_cache_on_weight_sync` is set
-        reset_prefix_cache: bool = use_prefix_cache and (
-            not self.cfg.fully_async.enabled or self.cfg.fully_async.clear_kv_cache_on_weight_sync
+        # Synchronous training only needs to invalidate reusable prefix blocks.
+        # Fully-async clearing must additionally preempt every in-flight request
+        # so its per-request KV state is recomputed under the new weights, even
+        # when automatic prefix caching itself is disabled.
+        reset_prefix_cache: bool = (use_prefix_cache and not self.cfg.fully_async.enabled) or (
+            self.cfg.fully_async.enabled and self.cfg.fully_async.clear_kv_cache_on_weight_sync
         )
         send_chunks_kwargs = {"reset_prefix_cache": reset_prefix_cache}
 
@@ -315,8 +318,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                     **send_chunks_kwargs,
                 )
 
-        if cache_reset_task is not None:
-            await cache_reset_task
+        if reset_prefix_cache and not sender_handles_prefix_cache_reset:
+            await self._await_rank_zero_control_plane("prefix-cache reset", cache_reset_task)
         torch.cuda.empty_cache()
         torch.distributed.barrier()
 
