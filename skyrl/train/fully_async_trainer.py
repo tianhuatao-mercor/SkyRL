@@ -15,6 +15,7 @@ import asyncio
 import copy
 import inspect
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Set, Tuple
@@ -420,11 +421,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # Initialize base trainer
         super().__init__(*args, **kwargs)
 
-        # Callbacks aren't wired into FullyAsyncRayPPOTrainer.train() yet — fail
-        # fast
-        if self._callback_handler.callbacks:
-            raise NotImplementedError("Callbacks are not yet supported by FullyAsyncRayPPOTrainer. ")
-
         # Some async-specific validations
         assert (
             self.cfg.trainer.fully_async.enabled
@@ -468,9 +464,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             max_staleness_steps=self.max_staleness_steps,
         )
 
-    def add_callback(self, callback):
-        raise NotImplementedError("Callbacks are not yet supported by FullyAsyncRayPPOTrainer. ")
-
     def _build_train_dataloader_and_compute_training_steps(self):
         """
         Overrides to build dataloader for fully async training. See `_AsyncDataloader` for more details.
@@ -485,6 +478,40 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         logger.info(f"Total training steps: {self.total_training_steps}")
 
     async def train(self):
+        """Run the fully-async loop with whole-lifecycle status protection."""
+
+        self._trainer_status_callback_loop = asyncio.get_running_loop()
+        self._trainer_status_callback_thread_id = threading.get_ident()
+        try:
+            await self._train_impl()
+        except BaseException as exc:
+            emit_progress_event(
+                "training_run_failed",
+                global_step=getattr(self, "global_step", 0),
+                total_steps=getattr(self, "total_training_steps", None),
+                error_type=type(exc).__name__,
+            )
+            # Status callbacks are user code. A failure callback must not mask
+            # the exception that actually stopped paid work.
+            try:
+                self._report_trainer_status(
+                    "failed",
+                    detail=f"{type(exc).__name__}: training aborted",
+                    policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                )
+            except BaseException:
+                logger.exception("Trainer status callback failed while reporting a run failure")
+            if self._ray_gpu_monitor is not None and getattr(self._ray_gpu_monitor, "_running", False):
+                try:
+                    self._ray_gpu_monitor.stop()
+                except BaseException:
+                    logger.exception("Ray GPU monitor cleanup failed while reporting a run failure")
+            raise
+        finally:
+            self._trainer_status_callback_loop = None
+            self._trainer_status_callback_thread_id = None
+
+    async def _train_impl(self):
         """
         Main fully async training loop for PPO
         """
@@ -540,6 +567,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             group_size=self.cfg.generator.n_samples_per_prompt,
             resumed=self.global_step > 0,
         )
+        start_epoch = resumed_start_epoch if resumed_start_epoch is not None else 0
+        self._current_epoch = start_epoch
+        self._training_control.reset()
+        self._report_trainer_status(
+            "initializing",
+            detail="initializing weight synchronization state",
+        )
 
         # Initialize weight sync state
         emit_progress_event("weight_sync_state_init_started", global_step=self.global_step)
@@ -548,10 +582,23 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         emit_progress_event("weight_sync_state_init_finished", global_step=self.global_step)
 
         # sync weights to inference engines
+        self._report_trainer_status(
+            "syncing_weights",
+            detail="publishing initial policy weights to rollout engines",
+            policy_version=getattr(self.inference_engine_client, "weight_version", None),
+        )
         emit_progress_event("weight_sync_started", global_step=self.global_step, initial=True)
         with Timer("sync_weights_to_inference_engines"):
             await self.dispatch.save_weights_for_sampler()
         emit_progress_event("weight_sync_finished", global_step=self.global_step, initial=True)
+        self._report_trainer_status(
+            "idle",
+            detail="initial policy weights are ready",
+            policy_version=getattr(self.inference_engine_client, "weight_version", None),
+        )
+        # Match RayPPOTrainer's callback contract: training starts only after
+        # checkpoint restoration and the initial sampler weight publication.
+        self._fire("on_train_start")
 
         # Per-step GPU utilization to the tracker. The base loop starts, flushes, and stops the
         # monitor itself. The async loop overrides train() and must wire it here.
@@ -560,8 +607,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # Eval before training
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train and self.global_step == 0:
+            self._report_trainer_status("evaluating", detail="step-0 evaluation")
+            self._fire("on_eval_start")
             with self._phase_gauge.timed_phase("eval", self.all_timings):
                 eval_metrics = await self.eval()
+                self._fire("on_eval_end", metrics=eval_metrics)
+                self._fire("on_log", logs=eval_metrics)
                 self.tracker.log(eval_metrics, step=self.global_step, commit=True)
 
         # main training loop
@@ -570,7 +621,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             initial=self.global_step,
             desc="Training Step Progress",
         )
-        start_epoch = resumed_start_epoch if resumed_start_epoch is not None else 0
         self.global_step += 1  # start training at global_step 1
         stop_training = False
         generation_supervisor: Optional[asyncio.Task[None]] = None
@@ -578,6 +628,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         try:
             for epoch in range(start_epoch, self.cfg.trainer.epochs):
                 self.epoch = epoch
+                self._current_epoch = epoch
+                self._fire("on_epoch_start")
                 # 0. Per-epoch prologue. Note that we do not do any cross-epoch asynchrony here.
 
                 # Buffer of completed generation, size bounded by capacity - consumed = B * (max_staleness_steps + 1)
@@ -595,6 +647,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 # already reflects this epoch's trained steps. The range below is just an upper bound.
                 trained_steps_this_epoch = self.async_train_dataloader.num_trained() // self.mini_batch_size
                 for _step_idx in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
+                    self._report_trainer_status(
+                        "waiting_for_rollouts",
+                        detail=f"collecting {self.mini_batch_size} accepted groups",
+                        policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                    )
                     emit_progress_event(
                         "training_step_started",
                         global_step=self.global_step,
@@ -644,11 +701,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 last_completed_step,
                                 last_checkpoint_step,
                             ):
+                                self._report_trainer_status(
+                                    "checkpointing",
+                                    detail=f"persisting global step {last_completed_step}",
+                                    policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                                )
                                 with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                                    await asyncio.to_thread(
+                                    checkpoint_path = await asyncio.to_thread(
                                         self.save_checkpoints,
                                         checkpoint_step=last_completed_step,
                                     )
+                                self._fire("on_save", ckpt_path=checkpoint_path)
                                 last_checkpoint_step = last_completed_step
                             if self.cfg.trainer.hf_save_interval > 0 and last_completed_step > 0:
                                 with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
@@ -671,6 +734,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             )
 
                         # 2. Post-process the generated groups, aggregating to a single GeneratorOutput, and convert to training format.
+                        self._report_trainer_status(
+                            "preparing_batch",
+                            detail=f"converting {len(cur_generation_group_mini_batch)} rollout groups",
+                            policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                        )
                         with self._phase_gauge.timed_phase("convert_to_training_input", self.all_timings):
                             training_input = await asyncio.to_thread(
                                 self.convert_generation_group_mini_batch_to_training_input,
@@ -678,6 +746,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 cur_dropped_groups,
                             )
                         await self._raise_generation_task_group_error(generation_supervisor)
+                        self._fire("on_step_start", batch=training_input)
 
                         # 3. Run training and update consumed UIDs.
                         with self._phase_gauge.timed_phase("run_training", self.all_timings):
@@ -686,12 +755,26 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 [g.uid for g in cur_generation_group_mini_batch]
                             )
                             last_completed_step = self.global_step
+                        self._fire("on_step_end", batch=training_input, metrics=status)
+                        force_save = self._training_control.should_save
+                        force_eval = self._training_control.should_evaluate
+                        self._training_control.reset()
 
                         # 4. After training: pause generation, sync weights, resume.
+                        self._report_trainer_status(
+                            "syncing_weights",
+                            detail="pausing rollout engines and publishing updated policy weights",
+                            policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                        )
                         emit_progress_event("weight_sync_started", global_step=self.global_step, initial=False)
                         with self._phase_gauge.timed_phase("sync_weights", self.all_timings):
                             await self.dispatch.save_weights_for_sampler()
                         emit_progress_event("weight_sync_finished", global_step=self.global_step, initial=False)
+                        self._report_trainer_status(
+                            "idle",
+                            detail="updated policy weights are available to rollout engines",
+                            policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                        )
 
                     # A training step completed: count it for this epoch's bookkeeping.
                     trained_steps_this_epoch += 1
@@ -717,28 +800,41 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                     # 6. Eval. At interval and at the last step.
                     # NOTE(Charlie): eval does not overlap with training, but overlaps with generation.
-                    if self.cfg.trainer.eval_interval > 0 and (
+                    interval_eval = self.cfg.trainer.eval_interval > 0 and (
                         self.global_step % self.cfg.trainer.eval_interval == 0
                         or self.global_step == self.total_training_steps
-                    ):
+                    )
+                    if force_eval or interval_eval:
+                        self._report_trainer_status("evaluating", detail="evaluation rollout and grading")
+                        self._fire("on_eval_start")
                         with self._phase_gauge.timed_phase("eval", self.all_timings):
                             eval_metrics = await self.eval()
                             self.all_metrics.update(eval_metrics)
+                        self._fire("on_eval_end", metrics=eval_metrics)
 
                     # Log metrics for this step after evaluation
+                    self._fire("on_log", logs=self.all_metrics)
                     self.tracker.log(self.all_metrics, step=self.global_step, commit=False)
                     self.all_metrics = {}
 
                     # 7. Checkpointing. At interval and at the last step of each epoch.
                     is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
-                    if self.cfg.trainer.ckpt_interval > 0:
-                        if is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
-                            with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                                await asyncio.to_thread(
-                                    self.save_checkpoints,
-                                    checkpoint_step=last_completed_step,
-                                )
-                            last_checkpoint_step = last_completed_step
+                    interval_checkpoint = self.cfg.trainer.ckpt_interval > 0 and (
+                        is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
+                    )
+                    if force_save or interval_checkpoint:
+                        self._report_trainer_status(
+                            "checkpointing",
+                            detail=f"persisting global step {last_completed_step}",
+                            policy_version=getattr(self.inference_engine_client, "weight_version", None),
+                        )
+                        with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
+                            checkpoint_path = await asyncio.to_thread(
+                                self.save_checkpoints,
+                                checkpoint_step=last_completed_step,
+                            )
+                        self._fire("on_save", ckpt_path=checkpoint_path)
+                        last_checkpoint_step = last_completed_step
                     if self.cfg.trainer.hf_save_interval > 0:
                         if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
                             with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
@@ -780,6 +876,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     )
 
                 if stop_training:
+                    self._fire("on_epoch_end")
                     break
 
                 # 9. Per-epoch epilogue.
@@ -800,14 +897,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 await self._staleness_manager.validate_state_at_epoch_end(self.global_step)
 
                 # End of an epoch.
-        except BaseException as exc:
-            emit_progress_event(
-                "training_run_failed",
-                global_step=self.global_step,
-                total_steps=self.total_training_steps,
-                error_type=type(exc).__name__,
-            )
-            raise
+                self._fire("on_epoch_end")
         finally:
             # Also clean up workers when conversion, training, evaluation, or checkpointing raises.
             # Suppress the supervisor result here so it cannot mask the exception already propagating;
@@ -834,12 +924,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             last_completed_step,
             last_checkpoint_step,
         ):
+            self._report_trainer_status(
+                "checkpointing",
+                detail=f"persisting final global step {last_completed_step}",
+                policy_version=getattr(self.inference_engine_client, "weight_version", None),
+            )
             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                await asyncio.to_thread(
+                checkpoint_path = await asyncio.to_thread(
                     self.save_checkpoints,
                     checkpoint_step=last_completed_step,
                 )
                 logger.info("Saved final checkpoint.")
+            self._fire("on_save", ckpt_path=checkpoint_path)
         if self.cfg.trainer.hf_save_interval > 0 and last_completed_step > 0:
             with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
                 await asyncio.to_thread(
@@ -856,12 +952,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         if self._vllm_metrics_scraper is not None:
             await self._vllm_metrics_scraper.aclose()
+        self._report_trainer_status("finalizing", detail="closing callbacks and experiment tracker")
+        self._fire("on_train_end")
         self.tracker.finish()
         emit_progress_event(
             "training_run_finished",
             global_step=last_completed_step,
             total_steps=self.total_training_steps,
             stopped_early=stop_training,
+        )
+        self._report_trainer_status(
+            "completed",
+            detail="training loop and final persistence completed",
+            policy_version=getattr(self.inference_engine_client, "weight_version", None),
         )
         logger.info("Training done!")
 
@@ -1085,6 +1188,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         emit_progress_event("training_compute_started", global_step=self.global_step)
         # TODO(Charlie): share this code with the one-step-off async trainer.
         # inference and calculate values, log probs, rewards, kl divergence
+        self._report_trainer_status(
+            "recomputing_logprobs",
+            detail="forward pass for rollout logprobs, values, and rewards",
+        )
         with Timer("fwd_logprobs_values_reward", self.all_timings):
             training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)
 
@@ -1094,6 +1201,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 training_input = self.apply_reward_kl_penalty(training_input)
 
         # calculate advantages and returns / along with tensorboard logging
+        self._report_trainer_status(
+            "computing_advantages",
+            detail="computing returns and group-relative advantages",
+        )
         with Timer("compute_advantages_and_returns", self.all_timings):
             training_input = self.compute_advantages_and_returns(training_input)
             # remove some unwanted keys

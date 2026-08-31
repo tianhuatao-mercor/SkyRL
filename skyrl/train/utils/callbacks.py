@@ -59,6 +59,20 @@ class CallbackInput:
     # on_save only
     ckpt_path: Optional[str] = None
 
+    # on_status_change only. These fields intentionally describe the outer
+    # trainer schedule. ``mini_batch`` is a SkyRL optimizer mini-batch, not a
+    # Megatron-internal microbatch.
+    status: Optional[str] = None
+    status_detail: Optional[str] = None
+    model_name: Optional[str] = None
+    model_role: Optional[str] = None
+    update_epoch: Optional[int] = None
+    update_epochs_total: Optional[int] = None
+    mini_batch: Optional[int] = None
+    mini_batches_total: Optional[int] = None
+    progress_granularity: Optional[str] = None
+    policy_version: Optional[int] = None
+
 
 @dataclass
 class TrainingControl:
@@ -113,6 +127,14 @@ class TrainingCallback:
     def on_log(self, trainer, callback_input: CallbackInput, control: TrainingControl) -> None:
         """Fires before metrics are committed to the tracker. Mutate ``callback_input.logs`` to add fields."""
 
+    def on_status_change(self, trainer, callback_input: CallbackInput, control: TrainingControl) -> None:
+        """Fires when the trainer enters a coarse-grained execution phase.
+
+        Status callbacks are observational. ``mini_batch`` progress, when
+        populated, refers to SkyRL optimizer mini-batches; Megatron-internal
+        microbatch progress requires backend schedule instrumentation.
+        """
+
 
 class CallbackHandler(TrainingCallback):
     """Fan-out dispatcher. Itself a ``TrainingCallback`` (composite pattern).
@@ -160,3 +182,6 @@ class CallbackHandler(TrainingCallback):
 
     def on_log(self, trainer, callback_input: CallbackInput, control: TrainingControl) -> None:
         self._dispatch("on_log", trainer, callback_input, control)
+
+    def on_status_change(self, trainer, callback_input: CallbackInput, control: TrainingControl) -> None:
+        self._dispatch("on_status_change", trainer, callback_input, control)

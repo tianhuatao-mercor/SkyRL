@@ -5,6 +5,7 @@ UID tracking, and the consumer's exhaustion-aware buffer drain.
 """
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 import skyrl.train.fully_async_trainer as fully_async_trainer_module
+import skyrl.train.trainer as trainer_module
 from skyrl.train.fully_async_trainer import (
     FullyAsyncRayPPOTrainer,
     GeneratedOutputGroup,
@@ -20,6 +22,154 @@ from skyrl.train.fully_async_trainer import (
     _AsyncStalenessManager,
     _needs_final_checkpoint,
 )
+from skyrl.train.utils.callbacks import CallbackHandler, TrainingCallback, TrainingControl
+
+
+class _StatusRecorder(TrainingCallback):
+    def __init__(self):
+        self.events = []
+        self.thread_ids = []
+
+    def on_status_change(self, trainer, callback_input, control):
+        self.events.append(callback_input)
+        self.thread_ids.append(threading.get_ident())
+
+
+def test_fully_async_trainer_supports_status_callbacks(monkeypatch):
+    """Status observers receive the same scalar transition written for the dashboard."""
+
+    progress_events = []
+    monkeypatch.setattr(
+        trainer_module,
+        "emit_progress_event",
+        lambda event, **payload: progress_events.append((event, payload)),
+    )
+
+    recorder = _StatusRecorder()
+    trainer = FullyAsyncRayPPOTrainer.__new__(FullyAsyncRayPPOTrainer)
+    trainer.global_step = 7
+    trainer.total_training_steps = 241
+    trainer._current_epoch = 0
+    trainer.train_dataloader = []
+    trainer.cfg = SimpleNamespace(
+        trainer=SimpleNamespace(
+            policy=SimpleNamespace(model=SimpleNamespace(path="Qwen/Qwen3.6-35B-A3B"))
+        )
+    )
+    trainer._callback_handler = CallbackHandler()
+    trainer._training_control = TrainingControl()
+    trainer.add_callback(recorder)
+
+    trainer._report_trainer_status(
+        "forward_backward",
+        detail="provider schedule in flight; internal microbatch progress unavailable",
+        model_role="policy",
+        update_epoch=1,
+        update_epochs_total=1,
+        mini_batch=2,
+        mini_batches_total=4,
+        progress_granularity="optimizer_minibatch",
+        policy_version=6,
+    )
+
+    assert len(recorder.events) == 1
+    callback_input = recorder.events[0]
+    assert callback_input.status == "forward_backward"
+    assert callback_input.mini_batch == 2
+    assert callback_input.mini_batches_total == 4
+    assert callback_input.progress_granularity == "optimizer_minibatch"
+    assert progress_events == [
+        (
+            "trainer_status_changed",
+            {
+                "global_step": 7,
+                "total_steps": 241,
+                "status": "forward_backward",
+                "status_detail": "provider schedule in flight; internal microbatch progress unavailable",
+                "model_name": "Qwen/Qwen3.6-35B-A3B",
+                "model_role": "policy",
+                "update_epoch": 1,
+                "update_epochs_total": 1,
+                "mini_batch": 2,
+                "mini_batches_total": 4,
+                "progress_granularity": "optimizer_minibatch",
+                "policy_version": 6,
+            },
+        )
+    ]
+
+
+def test_status_callback_from_provider_thread_is_marshaled_to_owner_loop(monkeypatch):
+    monkeypatch.setattr(trainer_module, "emit_progress_event", lambda *_args, **_kwargs: None)
+    recorder = _StatusRecorder()
+    trainer = FullyAsyncRayPPOTrainer.__new__(FullyAsyncRayPPOTrainer)
+    trainer.global_step = 3
+    trainer.total_training_steps = 10
+    trainer._current_epoch = 0
+    trainer.train_dataloader = []
+    trainer.cfg = SimpleNamespace(
+        trainer=SimpleNamespace(policy=SimpleNamespace(model=SimpleNamespace(path="test-model")))
+    )
+    trainer._callback_handler = CallbackHandler([recorder])
+    trainer._training_control = TrainingControl()
+
+    async def run_from_provider_thread():
+        owner_thread = threading.get_ident()
+        trainer._trainer_status_callback_loop = asyncio.get_running_loop()
+        trainer._trainer_status_callback_thread_id = owner_thread
+        await asyncio.to_thread(
+            trainer._report_trainer_status,
+            "forward_backward",
+            model_role="policy",
+            mini_batch=1,
+            mini_batches_total=2,
+        )
+        return owner_thread
+
+    owner_thread = asyncio.run(run_from_provider_thread())
+    assert recorder.thread_ids == [owner_thread]
+
+
+def test_train_wrapper_reports_failures_outside_the_main_step_loop(monkeypatch):
+    progress_events = []
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "emit_progress_event",
+        lambda event, **payload: progress_events.append((event, payload)),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "emit_progress_event",
+        lambda event, **payload: progress_events.append((event, payload)),
+    )
+
+    trainer = FullyAsyncRayPPOTrainer.__new__(FullyAsyncRayPPOTrainer)
+    trainer.global_step = 0
+    trainer.total_training_steps = 241
+    trainer._current_epoch = 0
+    trainer.train_dataloader = []
+    trainer.cfg = SimpleNamespace(
+        trainer=SimpleNamespace(policy=SimpleNamespace(model=SimpleNamespace(path="test-model")))
+    )
+    trainer.inference_engine_client = SimpleNamespace(weight_version=0)
+    trainer._callback_handler = CallbackHandler()
+    trainer._training_control = TrainingControl()
+    trainer._ray_gpu_monitor = None
+
+    async def fail_during_initialization():
+        raise RuntimeError("initial synchronization failed")
+
+    trainer._train_impl = fail_during_initialization
+
+    with pytest.raises(RuntimeError, match="initial synchronization failed"):
+        asyncio.run(trainer.train())
+
+    assert [event for event, _ in progress_events] == [
+        "training_run_failed",
+        "trainer_status_changed",
+    ]
+    assert progress_events[-1][1]["status"] == "failed"
+    assert progress_events[-1][1]["status_detail"] == "RuntimeError: training aborted"
 
 
 def _make_async_dataloader(
