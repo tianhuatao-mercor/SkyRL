@@ -769,6 +769,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         emit_progress_event("weight_sync_started", global_step=self.global_step, initial=False)
                         with self._phase_gauge.timed_phase("sync_weights", self.all_timings):
                             await self.dispatch.save_weights_for_sampler()
+                        # The outer timer includes pause/resume coordinator overhead;
+                        # retain the dispatcher's transfer-only timing alongside it.
+                        self.all_timings.update(self.dispatch.get_timing_metrics())
                         emit_progress_event("weight_sync_finished", global_step=self.global_step, initial=False)
                         self._report_trainer_status(
                             "idle",
