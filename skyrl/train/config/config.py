@@ -1179,9 +1179,10 @@ class InferenceEngineConfig(BaseConfig):
     """Model name for HTTP endpoint validation. If set, must be used in the ``model`` field of
     ``/chat/completions`` requests instead of the model path. If ``None``, the model path is used."""
     distributed_executor_backend: str = "ray"
-    """Distributed executor backend for vLLM. Set to ``"ray"`` to use the Ray backend
-    or ``"mp"`` to use the multiprocessing backend (single-node serving only). Per-engine 
-    placement groups are created when ``"mp"`` is used."""
+    """Distributed executor backend for vLLM. Set to ``"ray"`` to use the Ray backend,
+    ``"mp"`` to use the multiprocessing backend (single-node serving only), or ``"uni"``
+    for one-process TP1/PP1 engines. Per-engine placement groups are created when ``"mp"``
+    is used."""
     language_model_only: bool = False
     """When True, pass ``language_model_only=True`` to the vLLM engine so that
     multimodal models (e.g. Qwen3.5) skip vision encoder initialization."""

@@ -903,7 +903,13 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
             f"Got dp_size={dp_size}, tp_size={tp_size}, ep_size={ep_size}"
         )
 
-    assert ie_cfg.distributed_executor_backend in ("mp", "ray"), "invalid distributed executor backend"
+    assert ie_cfg.distributed_executor_backend in ("uni", "mp", "ray"), "invalid distributed executor backend"
+
+    if ie_cfg.distributed_executor_backend == "uni":
+        assert tp_size * ie_cfg.pipeline_parallel_size == 1, (
+            "the vLLM uni executor supports exactly one TP/PP worker per engine; "
+            f"got tp={tp_size}, pp={ie_cfg.pipeline_parallel_size}"
+        )
 
     if ie_cfg.enable_return_routed_experts:
         assert (

@@ -348,6 +348,24 @@ def test_offload_kv_for_weight_sync_rejects_colocated():
         validate_inference_engine_cfg(cfg)
 
 
+def test_uni_executor_accepts_tp1_pp1():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.distributed_executor_backend = "uni"
+    cfg.generator.inference_engine.tensor_parallel_size = 1
+    cfg.generator.inference_engine.pipeline_parallel_size = 1
+
+    validate_inference_engine_cfg(cfg)
+
+
+def test_uni_executor_rejects_parallel_engine():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.distributed_executor_backend = "uni"
+    cfg.generator.inference_engine.tensor_parallel_size = 2
+
+    with pytest.raises(AssertionError, match="exactly one TP/PP worker"):
+        validate_inference_engine_cfg(cfg)
+
+
 def test_offload_kv_for_weight_sync_rejects_lora():
     cfg = SkyRLTrainConfig()
     cfg.trainer.placement.colocate_all = False
