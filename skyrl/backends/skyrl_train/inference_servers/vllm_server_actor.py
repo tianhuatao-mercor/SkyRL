@@ -110,9 +110,13 @@ class VLLMServerActor(ServerActorProtocol):
         **kwargs,
     ) -> dict:
         # _gpu_ids is passed by ServerGroup from the cached ResolvedPlacementGroup.bundle_gpu_ids.
+        # Both local-process backends must be pinned explicitly because the server actor
+        # itself requests num_gpus=0: its placement-group bundle reserves the device, but
+        # Ray therefore does not narrow CUDA_VISIBLE_DEVICES for the actor.  Without this
+        # uni TP=1 engines on the same host all select physical GPU 0.
         gpu_ids = kwargs.pop("_gpu_ids", None)
-        if kwargs.get("distributed_executor_backend") == "mp" and gpu_ids is not None:
-            kwargs["mp_cuda_visible_devices"] = ",".join(str(g) for g in gpu_ids)
+        if kwargs.get("distributed_executor_backend") in {"mp", "uni"} and gpu_ids is not None:
+            kwargs["direct_cuda_visible_devices"] = ",".join(str(g) for g in gpu_ids)
         return kwargs
 
     def __init__(
@@ -129,7 +133,7 @@ class VLLMServerActor(ServerActorProtocol):
         nixl_side_channel_base: int = 5600,
         colocated_training: bool = False,
         distributed_executor_backend: str = "ray",
-        mp_cuda_visible_devices: Optional[str] = None,
+        direct_cuda_visible_devices: Optional[str] = None,
         enable_ray_prometheus_stats: bool = True,
     ):
         """
@@ -153,10 +157,9 @@ class VLLMServerActor(ServerActorProtocol):
                 ``"ray"`` spawns TP/PP workers as Ray tasks (default).
                 ``"mp"`` spawns workers as local processes using
                 CUDA_VISIBLE_DEVICES.
-            mp_cuda_visible_devices: Comma-separated physical GPU IDs for the
-                ``"mp"`` backend. Pre-computed by ServerGroup from the
-                per-server placement group. Only used when
-                ``distributed_executor_backend="mp"`` and TP*PP > 1.
+            direct_cuda_visible_devices: Comma-separated physical GPU IDs for
+                the local ``"mp"`` and ``"uni"`` backends. Pre-computed by
+                ServerGroup from the per-server placement group.
             enable_ray_prometheus_stats: If True, route vLLM engine metrics
                 through ``RayPrometheusStatLogger`` so they land in Ray's
                 per-node metrics agent (and thus Anyscale's hosted Prometheus +
@@ -171,7 +174,7 @@ class VLLMServerActor(ServerActorProtocol):
         self._port, self._port_reservation = find_and_reserve_port(start_port)
         self._server_idx = server_idx
         self._num_gpus_per_server = self.compute_num_gpus_per_server(vllm_cli_args)
-        self._use_mp_backend = distributed_executor_backend == "mp"
+        self._use_direct_cuda_backend = distributed_executor_backend in {"mp", "uni"}
         self._enable_ray_prometheus_stats = enable_ray_prometheus_stats
 
         # Ensure vLLM sleep endpoints are enabled by using dev mode
@@ -256,8 +259,8 @@ class VLLMServerActor(ServerActorProtocol):
             )
 
         # Configure GPU visibility for this server's TP/PP workers
-        if self._use_mp_backend:
-            self._setup_mp_gpu_visibility(mp_cuda_visible_devices)
+        if self._use_direct_cuda_backend:
+            self._setup_direct_gpu_visibility(direct_cuda_visible_devices)
         else:
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(0.2 if colocated_training else 1.0)
             # Set bundle indices for this server's TP/PP workers in the placement group.
@@ -273,24 +276,27 @@ class VLLMServerActor(ServerActorProtocol):
         # Initialized lazily to not block the actor initialization.
         self._server_task: Optional[asyncio.Task] = None
 
-    def _setup_mp_gpu_visibility(self, mp_cuda_visible_devices: Optional[str]) -> None:
-        """Set CUDA_VISIBLE_DEVICES for the mp backend.
+    def _setup_direct_gpu_visibility(self, direct_cuda_visible_devices: Optional[str]) -> None:
+        """Set CUDA_VISIBLE_DEVICES for a local-process backend.
 
-        When using the mp backend, vLLM spawns workers as local processes.
-        They discover GPUs via CUDA_VISIBLE_DEVICES rather than inheriting
-        from a placement group.
+        The mp and uni executors discover GPUs via CUDA_VISIBLE_DEVICES rather
+        than inheriting a Ray placement-group assignment.
         """
-        if mp_cuda_visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = mp_cuda_visible_devices
+        if direct_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = direct_cuda_visible_devices
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
             os.environ.pop("HIP_VISIBLE_DEVICES", None)
-            logger.info(f"Server {self._server_idx}: mp backend, " f"CUDA_VISIBLE_DEVICES={mp_cuda_visible_devices}")
+            logger.info(
+                f"Server {self._server_idx}: local executor, "
+                f"CUDA_VISIBLE_DEVICES={direct_cuda_visible_devices}"
+            )
         else:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
             os.environ.pop("HIP_VISIBLE_DEVICES", None)
             logger.info(
-                f"Server {self._server_idx}: mp backend, " f"cleared CUDA_VISIBLE_DEVICES (single-GPU or auto-detect)"
+                f"Server {self._server_idx}: local executor, "
+                f"cleared CUDA_VISIBLE_DEVICES (single-GPU or auto-detect)"
             )
 
     def _setup_nixl_side_channel(self, side_channel_port: int) -> None:
