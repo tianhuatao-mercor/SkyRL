@@ -31,6 +31,7 @@ from vllm.utils.system_utils import set_ulimit
 
 from skyrl.backends.skyrl_train.inference_servers.common import (
     ServerInfo,
+    UNIPROC_PORT_WINDOW,
     compute_dp_master_port,
     compute_uniproc_internal_port,
     find_and_reserve_port,
@@ -186,12 +187,24 @@ class VLLMServerActor(ServerActorProtocol):
         # TODO: delete once vllm#50969 lands -- see the removal checklist on
         # `compute_dp_master_port` in inference_servers/common.py.
         os.environ["VLLM_DP_MASTER_PORT"] = str(compute_dp_master_port(start_port))
+        self._uniproc_port_reservation = None
         # UniProcExecutor probes and releases a kernel-assigned TCPStore port
         # before binding it. Concurrent TP=1 engines can therefore select the
         # same port. VLLM_PORT makes each actor scan inside its own disjoint
         # internal window instead.
         if distributed_executor_backend == "uni":
-            uniproc_port = compute_uniproc_internal_port(start_port)
+            uniproc_window_start = compute_uniproc_internal_port(start_port)
+            uniproc_port, self._uniproc_port_reservation = find_and_reserve_port(
+                uniproc_window_start
+            )
+            if uniproc_port >= uniproc_window_start + UNIPROC_PORT_WINDOW:
+                self._uniproc_port_reservation.close()
+                self._uniproc_port_reservation = None
+                raise RuntimeError(
+                    "No free vLLM UniProc port in the actor's private window "
+                    f"[{uniproc_window_start}, "
+                    f"{uniproc_window_start + UNIPROC_PORT_WINDOW})"
+                )
             os.environ["VLLM_PORT"] = str(uniproc_port)
             # The B300 compatibility overlay for vLLM 0.26 intentionally reads
             # ParallelConfig.master_port instead of probing a released socket.
@@ -368,6 +381,10 @@ class VLLMServerActor(ServerActorProtocol):
         if self._port_reservation is not None:
             self._port_reservation.close()
             self._port_reservation = None
+
+        if self._uniproc_port_reservation is not None:
+            self._uniproc_port_reservation.close()
+            self._uniproc_port_reservation = None
 
         if self._nixl_port_reservation is not None:
             self._nixl_port_reservation.close()
