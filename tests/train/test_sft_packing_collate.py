@@ -7,6 +7,7 @@ Run with:
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from skyrl.train.config import MegatronConfig
 from skyrl.train.config.sft_config import SFTConfig, SFTPlacementConfig
@@ -24,6 +25,7 @@ def _make_collator(
     cp: int = 1,
     max_tokens_per_microbatch: int | None = None,
     fp8: object = None,
+    loss_reduction: str = "token_mean",
 ) -> PackedDataCollator:
     """Build a PackedDataCollator from config (no Ray, no workers)."""
     megatron_config = MegatronConfig(
@@ -42,6 +44,7 @@ def _make_collator(
         micro_train_batch_size_per_gpu=1,
         remove_microbatch_padding=True,
         use_sequence_packing=True,
+        loss_reduction=loss_reduction,
         max_tokens_per_microbatch=max_tokens_per_microbatch,
         placement=SFTPlacementConfig(num_nodes=1, num_gpus_per_node=num_gpus),
         megatron_config=megatron_config,
@@ -180,6 +183,30 @@ class TestPackingCollator:
         # Conservative bound: at most 7 non-zero positions, at least
         # 7 - num_boundaries = 7 - 2 = 5.
         assert 5 <= nonzero <= 7, f"Expected 5-7 nonzero loss positions, got {nonzero}"
+
+    def test_sequence_mean_survives_packing(self):
+        """Packed trajectories with unequal response lengths get equal weight."""
+        collator = _make_collator(
+            num_gpus=1,
+            batch_size=2,
+            max_length=64,
+            loss_reduction="sequence_mean",
+        )
+        examples = [
+            _make_example(5, 2, base_token=100),
+            _make_example(10, 8, base_token=200),
+        ]
+        batch = collator(examples, batch_size=2)
+
+        weights = []
+        for row, lengths in enumerate(batch["sub_seq_lengths"]):
+            offset = 0
+            for length in lengths.tolist():
+                weights.append(batch["loss_mask"][row, offset : offset + length - 1].sum())
+                offset += length
+        assert len(weights) == 2
+        assert torch.allclose(torch.stack(weights), torch.tensor([0.5, 0.5]))
+        assert torch.isclose(batch["loss_mask"].sum(), torch.tensor(1.0))
 
     def test_pp_padding_makes_rows_uniform(self):
         """With pp_size > 1, all packed rows are padded to the global max."""

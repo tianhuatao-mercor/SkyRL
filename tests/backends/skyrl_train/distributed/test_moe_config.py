@@ -17,7 +17,8 @@ class TestMegatronConfigMoEFields:
     def test_moe_field_defaults(self):
         cfg = MegatronConfig()
         assert cfg.moe_token_dispatcher_type == "alltoall"
-        assert cfg.moe_router_load_balancing_type == "none"
+        assert cfg.moe_router_load_balancing_type is None
+        assert cfg.moe_aux_loss_coeff is None
         assert cfg.moe_grouped_gemm is True
         assert cfg.moe_router_score_function is None
         assert cfg.moe_router_enable_expert_bias is None
@@ -52,11 +53,12 @@ class TestMegatronConfigMoEFields:
         assert cfg.moe_router_score_function == "sigmoid"
         assert cfg.moe_router_enable_expert_bias is True
 
-    def test_backward_compatible_defaults(self):
-        """Default values must match the old hardcoded values for backward compat."""
+    def test_model_specific_router_defaults_are_inherited(self):
+        """Unset overrides must not replace model-specific bridge settings."""
         cfg = MegatronConfig()
         assert cfg.moe_token_dispatcher_type == "alltoall"
-        assert cfg.moe_router_load_balancing_type == "none"
+        assert cfg.moe_router_load_balancing_type is None
+        assert cfg.moe_aux_loss_coeff is None
 
     def test_parallelism_fields_unchanged(self):
         """Existing parallelism fields should still work."""

@@ -191,6 +191,8 @@ class OptimizerConfig(BaseConfig):
 
     lr: float = 1e-6
     """Learning rate."""
+    min_lr: float = 0.0
+    """Minimum learning rate for decaying Megatron schedules."""
     adam_betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
     """Betas for the AdamW optimizer."""
     weight_decay: float = 1e-2
@@ -464,10 +466,20 @@ class MegatronConfig(BaseConfig):
     performance when ``expert_model_parallel_size > 1``."""
     # MoE runtime configuration flags
     moe_token_dispatcher_type: str = "alltoall"
-    moe_router_load_balancing_type: str = "none"
-    """Set to "aux_loss", "seq_aux_loss", or "global_aux_loss" to enable aux loss-based load balancing and logging."""
-    moe_aux_loss_coeff: float = 0.0
-    """Scaling coefficient for the moe load balancing loss if moe_router_load_balancing_type is not 'none'. Will disable aux loss in megatron-core if set to 0."""
+    moe_router_load_balancing_type: Optional[str] = None
+    """Optional explicit load-balancing override.
+
+    ``None`` preserves the model-specific value selected by Megatron-Bridge.
+    Set to ``"none"`` to explicitly disable load balancing, or to
+    ``"aux_loss"``, ``"seq_aux_loss"``, or ``"global_aux_loss"`` to override
+    the bridge.
+    """
+    moe_aux_loss_coeff: Optional[float] = None
+    """Optional explicit coefficient override for the MoE load-balancing loss.
+
+    ``None`` preserves the model-specific Megatron-Bridge coefficient. Setting
+    this to ``0`` explicitly disables the auxiliary loss contribution.
+    """
     moe_grouped_gemm: bool = True
     moe_router_score_function: Optional[str] = None
     moe_router_enable_expert_bias: Optional[bool] = None

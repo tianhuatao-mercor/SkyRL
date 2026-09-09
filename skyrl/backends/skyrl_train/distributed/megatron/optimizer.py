@@ -74,9 +74,17 @@ def get_megatron_optimizer_param_scheduler(
     """
     Get the optimizer parameter scheduler for Megatron.
     """
-    # TODO: support other schedulers for Megatron
-    if getattr(config, "scheduler", "constant_with_warmup") != "constant_with_warmup":
-        raise ValueError("Only constant_with_warmup scheduler is supported for Megatron")
+    scheduler = getattr(config, "scheduler", "constant_with_warmup")
+    decay_styles = {
+        "constant_with_warmup": "constant",
+        "linear": "linear",
+        "cosine": "cosine",
+    }
+    if scheduler not in decay_styles:
+        raise ValueError(
+            "Megatron scheduler must be one of "
+            f"{sorted(decay_styles)}, got {scheduler!r}"
+        )
 
     lr_warmup_steps = config.num_warmup_steps
     if getattr(config, "lr_decay_steps", None) is None:
@@ -93,7 +101,7 @@ def get_megatron_optimizer_param_scheduler(
         min_lr=getattr(config, "min_lr", 0.0),
         lr_warmup_steps=lr_warmup_steps,
         lr_decay_steps=lr_decay_steps,
-        lr_decay_style="constant",
+        lr_decay_style=decay_styles[scheduler],
         start_wd=config.weight_decay,
         end_wd=config.weight_decay,
         wd_incr_steps=num_training_steps,

@@ -648,12 +648,15 @@ class MegatronWorker:
         provider.attention_backend = "flash" if flash_attn else "fused"
         provider.variable_seq_lengths = True
         provider.masked_softmax_fusion = True
-        # Apply explicit MoE config fields to the provider.
-        # These replace the previously hardcoded values and can be further
-        # overridden by transformer_config_kwargs if needed.
+        # Apply explicit MoE config fields to the provider. Optional fields use
+        # None to inherit model-specific Megatron-Bridge settings; assigning
+        # generic defaults here would silently disable objectives such as
+        # Qwen3.5's global auxiliary router loss.
         provider.moe_token_dispatcher_type = megatron_config.moe_token_dispatcher_type
-        provider.moe_router_load_balancing_type = megatron_config.moe_router_load_balancing_type
-        provider.moe_aux_loss_coeff = megatron_config.moe_aux_loss_coeff
+        if megatron_config.moe_router_load_balancing_type is not None:
+            provider.moe_router_load_balancing_type = megatron_config.moe_router_load_balancing_type
+        if megatron_config.moe_aux_loss_coeff is not None:
+            provider.moe_aux_loss_coeff = megatron_config.moe_aux_loss_coeff
         provider.moe_router_dtype = megatron_config.moe_router_dtype
         provider.moe_grouped_gemm = megatron_config.moe_grouped_gemm
         if megatron_config.moe_router_score_function is not None:

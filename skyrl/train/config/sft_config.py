@@ -165,6 +165,14 @@ class SFTConfig(BaseConfig):
     full token-by-vocabulary logits tensor."""
     fused_lm_head_logprob_backend: str = "torch"
     """Fused LM-head backend: ``"torch"`` or ``"triton"``."""
+    loss_reduction: str = "token_mean"
+    """SFT loss reduction across supervised tokens and examples.
+
+    ``"token_mean"`` gives every supervised token equal weight. This is the
+    historical behavior. ``"sequence_mean"`` first averages the supervised
+    token losses within each non-empty sequence and then averages those
+    sequence losses, so long trajectories cannot dominate short ones.
+    """
     dataset_name: Optional[str] = None
     """Deprecated: use ``train_datasets`` instead. Translated to ``train_datasets=[dataset_name]``
     with a DeprecationWarning. Cannot be combined with ``train_datasets``."""
@@ -228,6 +236,12 @@ class SFTConfig(BaseConfig):
     when an eval dataset is configured. ``0`` disables periodic eval."""
     eval_before_train: bool = False
     """If True, run a baseline eval pass before training begins (logged at step 0)."""
+    eval_warmup_from_train_batch: bool = False
+    """Before a fresh step-0 eval, run one no-update forward on a packed training
+    batch to initialize model kernels. The train dataloader state is restored,
+    weights and optimizer are untouched, and the real eval is still logged at
+    step 0. Useful when heterogeneous unpacked eval shapes are a poor cold-start
+    path for long-context kernels."""
     max_length: Optional[int] = None
     """Maximum length of tokenized sequences. If specified, all sequences will be truncated to this value
     By default, no truncation is performed"""
@@ -590,6 +604,11 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
             "fused_lm_head_logprob_backend must be 'torch' or 'triton', "
             f"got {cfg.fused_lm_head_logprob_backend!r}."
         )
+    if cfg.loss_reduction not in ("token_mean", "sequence_mean"):
+        raise ValueError(
+            "loss_reduction must be 'token_mean' or 'sequence_mean', "
+            f"got {cfg.loss_reduction!r}."
+        )
     if cfg.micro_train_batch_size_per_gpu <= 0:
         raise ValueError(f"micro_train_batch_size_per_gpu must be > 0, got {cfg.micro_train_batch_size_per_gpu}")
     if cfg.batch_size <= 0:
@@ -613,6 +632,21 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         )
     if cfg.peak_tflops_per_gpu is not None and cfg.peak_tflops_per_gpu <= 0:
         raise ValueError(f"peak_tflops_per_gpu must be > 0, got {cfg.peak_tflops_per_gpu}.")
+    if cfg.optimizer_config.min_lr < 0 or cfg.optimizer_config.min_lr > cfg.optimizer_config.lr:
+        raise ValueError(
+            "optimizer_config.min_lr must be between 0 and optimizer_config.lr, "
+            f"got min_lr={cfg.optimizer_config.min_lr}, lr={cfg.optimizer_config.lr}."
+        )
+    if cfg.strategy == "megatron" and cfg.optimizer_config.scheduler not in (
+        "constant_with_warmup",
+        "linear",
+        "cosine",
+    ):
+        raise ValueError(
+            "Megatron SFT optimizer_config.scheduler must be one of "
+            "['constant_with_warmup', 'linear', 'cosine'], "
+            f"got {cfg.optimizer_config.scheduler!r}."
+        )
 
     # Dataloader / sampler config
     if cfg.sampler not in _VALID_SAMPLERS:
@@ -632,6 +666,8 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError("eval_interval > 0 requires eval_datasets or eval_pretokenized_dataset_paths to be set")
     if cfg.eval_before_train and not has_eval_dataset:
         raise ValueError("eval_before_train=True requires eval_datasets or eval_pretokenized_dataset_paths to be set")
+    if cfg.eval_warmup_from_train_batch and not cfg.eval_before_train:
+        raise ValueError("eval_warmup_from_train_batch=True requires eval_before_train=True")
 
     #  checks for megatron
     if cfg.strategy == "megatron":

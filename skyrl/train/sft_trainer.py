@@ -20,6 +20,7 @@ Or as a CLI entrypoint::
     python -m skyrl.train.main_sft strategy=megatron model.path=Qwen/Qwen3-0.6B
 """
 
+import copy
 import functools
 import json
 import multiprocessing as mp
@@ -937,11 +938,13 @@ class SFTTrainer:
                 dp_size=self._dp_size(),
                 batch_size=self.sft_cfg.batch_size,
                 micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+                loss_reduction=self.sft_cfg.loss_reduction,
                 fp8_enabled=is_fp8_enabled(transformer_config_kwargs.get("fp8")),
             )
         return DefaultCollator(
             tokenizer=tokenizer,
             micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+            loss_reduction=self.sft_cfg.loss_reduction,
         )
 
     def _dp_size(self) -> int:
@@ -1544,6 +1547,8 @@ class SFTTrainer:
         eval_collator = DefaultCollator(
             tokenizer=self.tokenizer,
             micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+            # Keep evaluation loss comparable across training experiments.
+            loss_reduction="token_mean",
         )
         collate_fn = functools.partial(
             collate_sft_examples,
@@ -1721,6 +1726,7 @@ class SFTTrainer:
         total_loss_weighted = 0.0
         total_tokens = 0
         num_eval_batches = 0
+        expected_eval_batches = len(eval_dataloader)
         for batch in eval_dataloader:
             num_eval_batches += 1
             # Pad the last (possibly-short) chunk so every dispatch sees exactly
@@ -1740,6 +1746,10 @@ class SFTTrainer:
             # was 0/1 before scaling. Recover the count from the batch by counting positive entries.
             # Padded rows have loss_mask=0 so they are excluded here.
             nonpad_tokens = int((batch["loss_mask"] > 0).sum().item())
+            logger.info(
+                f"Starting eval batch {num_eval_batches}/{expected_eval_batches}: "
+                f"rows={num_rows}, padded_rows={max(pad_rows, 0)}, nonpad_tokens={nonpad_tokens}"
+            )
             # Eval consumes metrics only; skip per-token loss_fn_outputs.
             output = self.dispatch.forward(
                 "policy",
@@ -1748,6 +1758,10 @@ class SFTTrainer:
                 return_per_token_outputs=False,
             )
             batch_loss = float(output.metrics.get("loss", float("nan")))
+            logger.info(
+                f"Finished eval batch {num_eval_batches}/{expected_eval_batches}: "
+                f"loss={batch_loss:.4f}, nonpad_tokens={nonpad_tokens}"
+            )
             total_loss_weighted += batch_loss * nonpad_tokens
             total_tokens += nonpad_tokens
 
@@ -1787,6 +1801,11 @@ class SFTTrainer:
             "loss": loss_val,
             "grad_norm": grad_norm,
             "timings": timings,
+            # Preserve scalar worker metrics (including Megatron MoE router
+            # auxiliary losses) for the outer logging loop. Historically SFT
+            # retained only ``loss`` here, so the objective was active but its
+            # diagnostics silently disappeared before reaching W&B.
+            "worker_metrics": metrics,
         }
 
     def _validate_batch_parallelism(self):
@@ -1902,6 +1921,13 @@ class SFTTrainer:
                     "train/actual_num_tokens": actual_num_tokens,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                log_dict.update(
+                    {
+                        f"train/{key}": value
+                        for key, value in step_result.get("worker_metrics", {}).items()
+                        if key not in {"loss", "final_loss"}
+                    }
+                )
                 if model_flops is not None:
                     log_dict.update(
                         _model_throughput_metrics(
@@ -2049,6 +2075,31 @@ class SFTTrainer:
         # Wandb's step counter starts at 0; the training loop's first commit
         # advances it to >=1, so step=0 here does not conflict with later steps.
         if self.sft_cfg.eval_before_train and self.eval_dataloaders is not None:
+            if self.sft_cfg.eval_warmup_from_train_batch and start_step == 0:
+                # Warm the exact packed training forward path without consuming
+                # sampler state or changing model/optimizer state. Long-context
+                # hybrid models can otherwise cold-start on many heterogeneous
+                # unpacked eval shapes, which is both slower and less reliable
+                # than initializing once on the fixed packed shape.
+                warmup_state = copy.deepcopy(self.train_dataloader.state_dict())
+                warmup_iter = iter(self.train_dataloader)
+                try:
+                    warmup_batch = next(warmup_iter)
+                    warmup_tokens = int((warmup_batch["loss_mask"] > 0).sum().item())
+                    logger.info(
+                        "Starting no-update packed forward warmup before step-0 eval: "
+                        f"rows={warmup_batch['sequences'].shape[0]}, nonpad_tokens={warmup_tokens}"
+                    )
+                    self.dispatch.forward(
+                        "policy",
+                        warmup_batch,
+                        loss_fn="cross_entropy",
+                        return_per_token_outputs=False,
+                    )
+                    logger.info("Finished no-update packed forward warmup; restoring train dataloader state")
+                finally:
+                    del warmup_iter
+                    self.train_dataloader.load_state_dict(warmup_state)
             self._fire("on_eval_start")
             eval_metrics, num_eval_batches = self.run_eval()
             self._fire("on_eval_end", metrics=eval_metrics)
@@ -2185,6 +2236,13 @@ class SFTTrainer:
                     "train/batch_padded_seq_len": batch_padded_seq_len,
                     "train/total_tokens_processed": self._total_tokens_processed,
                 }
+                log_dict.update(
+                    {
+                        f"train/{key}": value
+                        for key, value in step_result.get("worker_metrics", {}).items()
+                        if key not in {"loss", "final_loss"}
+                    }
+                )
                 if model_flops is not None:
                     log_dict.update(
                         _model_throughput_metrics(

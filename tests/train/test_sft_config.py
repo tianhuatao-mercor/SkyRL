@@ -515,6 +515,25 @@ class TestQwenLongContextSFTPlumbing:
         with pytest.raises(ValueError, match="must be 'torch' or 'triton'"):
             validate_sft_cfg(cfg)
 
+    def test_invalid_sft_loss_reduction_rejected(self):
+        cfg = SFTConfig(loss_reduction="prompt_mean")
+        with pytest.raises(ValueError, match="token_mean.*sequence_mean"):
+            validate_sft_cfg(cfg)
+
+    def test_megatron_cosine_schedule_and_min_lr_are_accepted(self):
+        cfg = SFTConfig()
+        cfg.optimizer_config.scheduler = "cosine"
+        cfg.optimizer_config.lr = 5e-7
+        cfg.optimizer_config.min_lr = 5e-8
+        validate_sft_cfg(cfg)
+
+    def test_megatron_min_lr_above_peak_rejected(self):
+        cfg = SFTConfig()
+        cfg.optimizer_config.lr = 5e-7
+        cfg.optimizer_config.min_lr = 1e-6
+        with pytest.raises(ValueError, match="min_lr.*optimizer_config.lr"):
+            validate_sft_cfg(cfg)
+
     def test_zero_checkpoint_retention_rejected(self):
         cfg = SFTConfig(max_ckpts_to_keep=0)
         with pytest.raises(ValueError, match="-1.*positive integer"):

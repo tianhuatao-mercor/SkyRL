@@ -443,6 +443,26 @@ def test_loss_norm_all_nonpad(tokenizer):
     assert abs(batch["loss_mask"].sum().item() - 1.0) < 1e-5
 
 
+def test_sequence_mean_gives_each_example_equal_weight(tokenizer):
+    """A two-token response and an eight-token response each carry 1/2."""
+    from skyrl.train.dataset.collators import DefaultCollator
+
+    examples = [
+        _make_example(list(range(5)), 2),
+        _make_example(list(range(10)), 8),
+    ]
+    collator = DefaultCollator(
+        tokenizer,
+        micro_train_batch_size_per_gpu=1,
+        loss_reduction="sequence_mean",
+    )
+    batch = collator(examples, batch_size=2)
+
+    per_sequence_weight = batch["loss_mask"].sum(dim=-1)
+    assert torch.allclose(per_sequence_weight, torch.tensor([0.5, 0.5]))
+    assert torch.isclose(batch["loss_mask"].sum(), torch.tensor(1.0))
+
+
 # ---------------------------------------------------------------------------
 # TrainOnWhat: LAST_ASSISTANT_MESSAGE tests
 # ---------------------------------------------------------------------------

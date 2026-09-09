@@ -3,7 +3,7 @@
 Two callables cover the two SFT data paths:
 
 - :class:`DefaultCollator` left-pads sequences to the batch maximum and applies
-  the per-non-pad-token loss normalization.
+  the selected token- or sequence-mean loss normalization.
 - :class:`PackedDataCollator` performs controller-level FFD bin-packing
   (Megatron-only): once per training step it packs sequences into bins of
   capacity ``max_tokens_per_microbatch``, rounds the bin count up to a multiple
@@ -40,9 +40,10 @@ class DefaultCollator:
     loss-contributing tokens in the batch.
     """
 
-    def __init__(self, tokenizer, micro_train_batch_size_per_gpu: int):
+    def __init__(self, tokenizer, micro_train_batch_size_per_gpu: int, loss_reduction: str = "token_mean"):
         self.tokenizer = tokenizer
         self.micro_train_batch_size_per_gpu = micro_train_batch_size_per_gpu
+        self.loss_reduction = loss_reduction
 
     def __call__(self, examples: list, batch_size: int) -> TrainingInputBatch:
         """Collate ``examples`` and scale the loss mask.
@@ -58,8 +59,17 @@ class DefaultCollator:
         from skyrl.train.sft_trainer import collate_sft_batch
 
         batch = collate_sft_batch(examples, self.tokenizer)
-        total_nonpad = max(batch["loss_mask"].sum().item(), 1)
-        batch["loss_mask"] = batch["loss_mask"].float() / total_nonpad
+        loss_mask = batch["loss_mask"].float()
+        if self.loss_reduction == "token_mean":
+            loss_mask.div_(max(loss_mask.sum().item(), 1))
+        elif self.loss_reduction == "sequence_mean":
+            token_counts = loss_mask.sum(dim=-1, keepdim=True)
+            live_sequences = int((token_counts > 0).sum().item())
+            loss_mask.div_(token_counts.clamp(min=1))
+            loss_mask.div_(max(live_sequences, 1))
+        else:
+            raise ValueError(f"Unsupported SFT loss_reduction: {self.loss_reduction!r}")
+        batch["loss_mask"] = loss_mask
         return batch
 
 
@@ -90,6 +100,7 @@ class PackedDataCollator:
         dp_size: int,
         batch_size: int,
         micro_train_batch_size_per_gpu: int,
+        loss_reduction: str = "token_mean",
         packing_strategy: str = "first_fit_decreasing",
         packing_quadratic_equivalent_length: int | None = None,
         fp8_enabled: bool = False,
@@ -105,6 +116,7 @@ class PackedDataCollator:
         self.dp_size = dp_size
         self.batch_size = batch_size
         self.fp8_enabled = fp8_enabled
+        self.loss_reduction = loss_reduction
         self._tokenizer = tokenizer
 
     @property
@@ -303,10 +315,28 @@ class PackedDataCollator:
         # ------------------------------------------------------------------
         # 5. Loss normalization
         # ------------------------------------------------------------------
-        # We do a sum loss in the workers - we scale the loss mask by total non-padding tokens
-        # to get the true loss value
-        scale = 1 / max(total_nonpad, 1)
-        loss_mask.mul_(scale)
+        # Workers sum the masked per-token loss. For token_mean, normalize by
+        # all supervised tokens. For sequence_mean, give each non-empty source
+        # sequence total weight 1/N even after multiple sequences are packed
+        # into the same row.
+        if self.loss_reduction == "token_mean":
+            loss_mask.mul_(1 / max(total_nonpad, 1))
+        elif self.loss_reduction == "sequence_mean":
+            sequence_token_counts = [float(mask[1:].sum()) for mask in full_loss_masks]
+            live_sequences = sum(count > 0 for count in sequence_token_counts)
+            if live_sequences:
+                for row_idx, bin_indices in enumerate(flat_bins):
+                    row_offset = 0
+                    for ex_idx in bin_indices:
+                        sequence_length = seq_lengths[ex_idx]
+                        count = sequence_token_counts[ex_idx]
+                        if count > 0:
+                            start = row_offset
+                            end = min(row_offset + sequence_length - 1, loss_mask.shape[1])
+                            loss_mask[row_idx, start:end].div_(count * live_sequences)
+                        row_offset += _round_up(sequence_length, align_size)
+        else:
+            raise ValueError(f"Unsupported SFT loss_reduction: {self.loss_reduction!r}")
 
         # ------------------------------------------------------------------
         # 6. Pack into TrainingInputBatch with sub_seq_lengths data field
@@ -334,5 +364,6 @@ class PackedDataCollator:
             "num_real_examples": n_real_samples,
             "num_padding_examples": n_samples - n_real_samples,
             "num_padding_tokens": 2 * (n_samples - n_real_samples),
+            "loss_reduction": self.loss_reduction,
         }
         return batch

@@ -73,6 +73,23 @@ def test_sft_train_step_opts_out_of_per_token_outputs(mock_dispatch):
     assert call.kwargs["return_per_token_outputs"] is False
 
 
+def test_sft_train_step_preserves_worker_metrics(mock_dispatch):
+    """Router diagnostics must survive the worker-to-trainer boundary."""
+    mock_dispatch.forward_backward.return_value.metrics = {
+        "loss": 0.42,
+        "final_loss": 0.42,
+        "load_balancing_loss": 0.003,
+        "policy_lr": 1.0e-6,
+    }
+    trainer = _build_minimal_trainer(mock_dispatch)
+    batch = trainer.collator(_dummy_tokenized(), batch_size=1)
+
+    result = trainer.train_step(batch, step=1)
+
+    assert result["worker_metrics"]["load_balancing_loss"] == 0.003
+    assert result["worker_metrics"]["policy_lr"] == 1.0e-6
+
+
 def test_sft_run_eval_opts_out_of_per_token_outputs(mock_dispatch):
     """run_eval reads only ``output.metrics["loss"]``; it skips per-token outputs."""
     trainer = _build_minimal_trainer(mock_dispatch)
