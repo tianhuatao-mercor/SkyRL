@@ -7,7 +7,7 @@ readonly IMAGE_REF="skyrl-megatron-b300-cu128-canary:7c528991c4f9-r1"
 readonly IMAGE_ID="sha256:e98a7978ad815edbd55d460f0f45ec059dcc2df4584e5c8da9c6183b99b2940c"
 readonly SOURCE_REVISION="7c528991c4f9d470dd9295e10589d99dc3e05053"
 readonly LOCK_SHA256="0f3a2126b68747e7d4b854574e9e418c0c4a8f6c9f605865600b04e5d0a2a537"
-readonly QUAL_ROOT="/shared/environments/b300/qualifications"
+readonly QUAL_ROOT="/shared/ubuntu/environments/b300/qualifications"
 readonly OWNER_LABEL="skyrl-serving-topology"
 readonly SERVER_PORT=18080
 
@@ -141,7 +141,7 @@ jq -Rse \
   "$qual_dir/pre-gpus.csv" >/dev/null || die "one or more GPUs are not idle"
 [[ ! -s "$qual_dir/pre-gpu-processes.csv" ]] || die "GPU processes already exist"
 
-/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python "$SCRIPT_DIR/prepare_model_snapshot.py" \
+/shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python "$SCRIPT_DIR/prepare_model_snapshot.py" \
   --repo-id "$MODEL_REPO" --revision "$MODEL_REVISION" --destination "$MODEL_PATH" \
   --image-ref "$IMAGE_REF" --image-id "$IMAGE_ID" --run-id "$run_id-validation" \
   >"$qual_dir/model-validation.json"
@@ -372,7 +372,7 @@ for shape in "${shapes[@]}"; do
   run_shape "$shape"
 done
 
-/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python "$SCRIPT_DIR/summarize_topology_results.py" \
+/shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python "$SCRIPT_DIR/summarize_topology_results.py" \
   --result-dir "$result_dir" --model-family "$model_family" --output "$qual_dir/topology-summary.json" \
   >"$qual_dir/topology-summary.stdout"
 capture_snapshot post

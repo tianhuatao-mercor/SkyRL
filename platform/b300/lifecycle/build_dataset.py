@@ -75,7 +75,7 @@ def _validate_existing(path: Path, manifest: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path("/shared/datasets"))
+    parser.add_argument("--root", type=Path, default=Path("/shared/ubuntu/datasets"))
     args = parser.parse_args()
 
     args.root.mkdir(parents=True, exist_ok=True)

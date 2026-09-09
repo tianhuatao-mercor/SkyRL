@@ -7,13 +7,13 @@ readonly EXPECTED_SOURCE_REV="7c528991c4f9d470dd9295e10589d99dc3e05053"
 readonly EXPECTED_LOCK_SHA="0f3a2126b68747e7d4b854574e9e418c0c4a8f6c9f605865600b04e5d0a2a537"
 readonly MODEL_DIR="/shared/models/qwen3-0.6b-c1899de"
 readonly MODEL_REV="c1899de289a04d12100db370d81485cdf75e47ca"
-readonly EXPECTED_DATASET_DIR="/shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4"
+readonly EXPECTED_DATASET_DIR="/shared/ubuntu/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4"
 readonly EXPECTED_DATASET_ID="ebcf5477cdd43cf42a380cc0ee168a5c7c4ddcc08521c95d133fa6d5cebaec59"
 readonly OWNER_LABEL="skyrl-lifecycle"
-readonly QUAL_ROOT="/shared/environments/b300/qualifications"
-readonly CHECKPOINT_ROOT="/shared/checkpoints/qualifications"
-readonly RECIPE_ROOT="/shared/environments/b300/recipes"
-readonly WORKTREE="/shared/code/SkyRL-b300-lifecycle"
+readonly QUAL_ROOT="/shared/ubuntu/environments/b300/qualifications"
+readonly CHECKPOINT_ROOT="/shared/ubuntu/checkpoints/qualifications"
+readonly RECIPE_ROOT="/shared/ubuntu/environments/b300/recipes"
+readonly WORKTREE="/shared/ubuntu/code/SkyRL-b300-lifecycle"
 readonly RESUME_SOURCE_RUN_ID="20260827T000439Z-skyrl-lifecycle-nccl-dense-2eng-r1"
 readonly RESUME_SOURCE_QUAL="$QUAL_ROOT/$RESUME_SOURCE_RUN_ID"
 readonly RESUME_SOURCE_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/$RESUME_SOURCE_RUN_ID"
@@ -27,7 +27,7 @@ die() {
 }
 
 usage() {
-  printf 'Usage: %s --execute --dataset-dir /shared/datasets/skyrl-multiply-lifecycle-<id> [--num-engines 1|2] [--gpus 0,1[,2]] [--resume-from %s]\n' "$0" "$RESUME_SOURCE_STEP"
+  printf 'Usage: %s --execute --dataset-dir /shared/ubuntu/datasets/skyrl-multiply-lifecycle-<id> [--num-engines 1|2] [--gpus 0,1[,2]] [--resume-from %s]\n' "$0" "$RESUME_SOURCE_STEP"
 }
 
 execute=false
@@ -135,7 +135,7 @@ if [[ -n "$resume_from" ]]; then
     --arg export "$RESUME_SOURCE_EXPORT" \
     --arg run_id "$RESUME_SOURCE_RUN_ID" \
     '{checkpoint:$checkpoint,export:$export,run_id:$run_id}' >"$qual_dir/resume-source.json"
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python - \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python - \
     "$RESUME_SOURCE_STEP/data.pt" "$qual_dir/resume-boundary-workaround.json" <<'PY'
 import json, os, sys
 from pathlib import Path
@@ -457,7 +457,7 @@ PYTHONPATH="$WORKTREE" \
 PYTHONDONTWRITEBYTECODE=1 \
 SKYRL_QUAL_RESULT_DIR="$result_dir" \
 SKYRL_CONFIG_PREFLIGHT_ONLY=1 \
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
   "$qual_dir/recipe/qualification_entrypoint.py" "${cmd[@]:2}"
 
 docker_args=(
@@ -574,7 +574,7 @@ if [[ -n "$resume_from" ]]; then
     sha256sum -c "$RESUME_SOURCE_QUAL/checkpoint-files.sha256"
   ) >"$qual_dir/resume-source-checkpoint-post.txt"
 
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
     "$qual_dir/recipe/verify_resume_artifacts.py" \
     --result-dir "$result_dir" \
     --checkpoint-dir "$checkpoint_dir" \
@@ -608,7 +608,7 @@ if [[ -n "$resume_from" ]]; then
   cmp -s "$qual_dir/resume-source-evidence-pre.txt" "$qual_dir/resume-source-evidence-final.txt" || die "source evidence changed during resume verification"
   cmp -s "$qual_dir/resume-source-checkpoint-pre.txt" "$qual_dir/resume-source-checkpoint-final.txt" || die "source checkpoint changed during resume verification"
 else
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
     "$qual_dir/recipe/verify_artifacts.py" \
     --result-dir "$result_dir" \
     --checkpoint-dir "$checkpoint_dir" \

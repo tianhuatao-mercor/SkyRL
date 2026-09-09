@@ -4,14 +4,14 @@ set -Eeuo pipefail
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly WORKTREE="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 readonly DEFAULT_TOPOLOGY="$SCRIPT_DIR/topologies/aws-b300-20260826-two-node.json"
-readonly PLATFORM_PYTHON="/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python"
+readonly PLATFORM_PYTHON="/shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python"
 readonly MODEL_DIR="/shared/models/qwen3-0.6b-c1899de"
 readonly MODEL_REV="c1899de289a04d12100db370d81485cdf75e47ca"
-readonly DATASET_DIR="/shared/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4"
+readonly DATASET_DIR="/shared/ubuntu/datasets/skyrl-multiply-lifecycle-ebcf5477cdd43cf4"
 readonly DATASET_ID="ebcf5477cdd43cf42a380cc0ee168a5c7c4ddcc08521c95d133fa6d5cebaec59"
-readonly QUAL_ROOT="/shared/environments/b300/qualifications"
-readonly CHECKPOINT_ROOT="/shared/checkpoints/qualifications"
-readonly RECIPE_ROOT="/shared/environments/b300/recipes"
+readonly QUAL_ROOT="/shared/ubuntu/environments/b300/qualifications"
+readonly CHECKPOINT_ROOT="/shared/ubuntu/checkpoints/qualifications"
+readonly RECIPE_ROOT="/shared/ubuntu/environments/b300/recipes"
 readonly RESUME_SOURCE_RUN_ID="20260827T011849Z-skyrl-lifecycle-2node-2eng-r1"
 readonly RESUME_SOURCE_QUAL="$QUAL_ROOT/$RESUME_SOURCE_RUN_ID"
 readonly RESUME_SOURCE_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/$RESUME_SOURCE_RUN_ID"
@@ -242,7 +242,7 @@ if [[ -n "$resume_from" ]]; then
     --arg export "$RESUME_SOURCE_EXPORT" \
     --arg run_id "$RESUME_SOURCE_RUN_ID" \
     '{checkpoint:$checkpoint,export:$export,run_id:$run_id}' >"$qual_dir/resume-source.json"
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python - \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python - \
     "$RESUME_SOURCE_STEP/data.pt" "$qual_dir/resume-boundary-workaround.json" <<'PY'
 import json
 import os
@@ -329,7 +329,7 @@ done
 
 [[ -f "$MODEL_DIR/MODEL_MANIFEST.json" ]] || die "model manifest missing"
 [[ -f "$DATASET_DIR/manifest.json" ]] || die "dataset manifest missing"
-/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+/shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
   "$WORKTREE/platform/b300/lifecycle/validate_pinned_inputs.py" \
   --model-dir "$MODEL_DIR" \
   --model-revision "$MODEL_REV" \
@@ -482,7 +482,7 @@ PYTHONPATH="$WORKTREE" \
 PYTHONDONTWRITEBYTECODE=1 \
 SKYRL_QUAL_RESULT_DIR="$result_dir" \
 SKYRL_CONFIG_PREFLIGHT_ONLY=1 \
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
   "$qual_dir/recipe/qualification_entrypoint.py" "${cmd[@]:2}"
 
 for spec in "$HEAD_ALIAS:$head_scratch" "$WORKER_ALIAS:$worker_scratch"; do
@@ -696,7 +696,7 @@ if [[ -n "$resume_from" ]]; then
     sha256sum -c "$RESUME_SOURCE_QUAL/checkpoint-files.sha256"
   ) >"$qual_dir/resume-source-checkpoint-post.txt"
 
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
     "$qual_dir/recipe/verify_resume_artifacts.py" \
     --result-dir "$result_dir" \
     --checkpoint-dir "$checkpoint_dir" \
@@ -731,7 +731,7 @@ if [[ -n "$resume_from" ]]; then
   cmp -s "$qual_dir/resume-source-evidence-pre.txt" "$qual_dir/resume-source-evidence-final.txt" || die "source evidence changed during resume verification"
   cmp -s "$qual_dir/resume-source-checkpoint-pre.txt" "$qual_dir/resume-source-checkpoint-final.txt" || die "source checkpoint changed during resume verification"
 else
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
     "$qual_dir/recipe/verify_artifacts.py" \
     --result-dir "$result_dir" \
     --checkpoint-dir "$checkpoint_dir" \
@@ -748,7 +748,7 @@ else
     tee "$qual_dir/artifact-verification.stdout"
 fi
 
-/shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
+/shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python \
   "$qual_dir/recipe/verify_multinode_artifacts.py" \
   --result-dir "$result_dir" \
   --nccl-log-dir "$qual_dir" \

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly WORKTREE="/shared/code/SkyRL-b300-lifecycle"
-readonly QUAL_ROOT="/shared/environments/b300/qualifications"
-readonly CHECKPOINT_ROOT="/shared/checkpoints/qualifications"
+readonly WORKTREE="/shared/ubuntu/code/SkyRL-b300-lifecycle"
+readonly QUAL_ROOT="/shared/ubuntu/environments/b300/qualifications"
+readonly CHECKPOINT_ROOT="/shared/ubuntu/checkpoints/qualifications"
 readonly SOURCE_RUN_ID="20260827T000439Z-skyrl-lifecycle-nccl-dense-2eng-r1"
 readonly RESUME_RUN_ID="20260827T002835Z-skyrl-lifecycle-resume-2eng-r1"
 readonly SOURCE_RUN="$QUAL_ROOT/$SOURCE_RUN_ID"
@@ -52,7 +52,7 @@ git -C "$WORKTREE" status --short >"$audit_dir/worktree-status.txt"
 git -C "$WORKTREE" remote -v >"$audit_dir/worktree-remotes.txt"
 
 verify_cmd=(
-  /shared/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python
+  /shared/ubuntu/environments/b300/venvs/skyrl-megatron-0f3a2126/bin/python
   "$audit_dir/verify_resume_artifacts.py"
   --result-dir "$RESUME_RUN/results"
   --checkpoint-dir "$RESUME_CHECKPOINT/checkpoints"

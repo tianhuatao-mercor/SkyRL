@@ -5,7 +5,7 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly WORKTREE="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 readonly IMAGE_REF="skyrl-megatron-b300-cu128-canary:7c528991c4f9-r1"
 readonly IMAGE_ID="sha256:e98a7978ad815edbd55d460f0f45ec059dcc2df4584e5c8da9c6183b99b2940c"
-readonly QUAL_ROOT="/shared/environments/b300/qualifications"
+readonly QUAL_ROOT="/shared/ubuntu/environments/b300/qualifications"
 readonly OWNER_LABEL="skyrl-serving-topology"
 
 die() {

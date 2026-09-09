@@ -22,11 +22,11 @@ from typing import Any
 
 
 EXPECTED_EXPORT = Path(
-    "/shared/checkpoints/qualifications/"
+    "/shared/ubuntu/checkpoints/qualifications/"
     "20260826T233354Z-skyrl-lifecycle-nccl-dense-r1/exports/global_step_1/policy"
 )
 EXPECTED_TRAJECTORY = Path(
-    "/shared/environments/b300/qualifications/"
+    "/shared/ubuntu/environments/b300/qualifications/"
     "20260826T233354Z-skyrl-lifecycle-nccl-dense-r1/results/trajectory-eval-step-1.json"
 )
 EXPECTED_SERVED_MODEL = "b300-qwen3-0.6b-lifecycle-step1"
