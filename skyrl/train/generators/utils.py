@@ -525,6 +525,7 @@ def prepare_generator_input(
     default_env_class: str,
     training_phase: TrainingPhase,
     global_step: int,
+    generation_id: Optional[str] = None,
 ) -> Tuple[GeneratorInput, List[str]]:
     """Prepares the generator input for training and eval
 
@@ -535,6 +536,8 @@ def prepare_generator_input(
         default_env_class (str): env class to use if env class missing from prompts
         training_phase (TrainingPhase): training or eval
         global_step (int): current global step
+        generation_id (Optional[str]): stable identity for this generation
+            attempt, when supplied by an asynchronous scheduler
 
     Returns:
         Tuple[GeneratorInput, List[str]]: generator input and list of uuids
@@ -568,7 +571,11 @@ def prepare_generator_input(
         "env_extras": env_extras,
         "sampling_params": sampling_params,
         "trajectory_ids": trajectory_ids,
-        "batch_metadata": BatchMetadata(global_step=global_step, training_phase=training_phase),
+        "batch_metadata": BatchMetadata(
+            global_step=global_step,
+            training_phase=training_phase,
+            generation_id=generation_id,
+        ),
     }
 
     return generator_input, uids

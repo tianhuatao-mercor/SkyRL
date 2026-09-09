@@ -487,6 +487,11 @@ async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
         "emit_progress_event",
         lambda event, **payload: progress_events.append((event, payload)),
     )
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "uuid4",
+        lambda: SimpleNamespace(hex="generation-1"),
+    )
 
     staleness_manager = _AsyncStalenessManager(
         max_concurrent_generation_groups=1,
@@ -520,13 +525,118 @@ async def test_generation_worker_failure_releases_staleness_slot(monkeypatch):
     assert progress_events == [
         (
             "group_scheduled",
-            {"global_step": 1, "group_uid": "uid-1", "group_size": 4},
+            {
+                "global_step": 1,
+                "training_phase": "train",
+                "generation_id": "generation-1",
+                "group_uid": "uid-1",
+                "group_size": 4,
+            },
         ),
         (
             "group_failed",
-            {"global_step": 1, "group_uid": "uid-1"},
+            {
+                "global_step": 1,
+                "training_phase": "train",
+                "generation_id": "generation-1",
+                "group_uid": "uid-1",
+            },
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_generation_step_and_identity_are_bound_after_admission(monkeypatch):
+    """Admission waits cannot split group and trajectory event identity."""
+
+    progress_events = []
+    prepared = {}
+
+    class OnePromptDataloader:
+        def __init__(self):
+            self.returned = False
+
+        async def get_next_non_consumed_data(self):
+            if self.returned:
+                return None
+            self.returned = True
+            return [{"uid": "uid-1"}]
+
+    class AdvancingAdmissionManager:
+        async def acquire_submission_slot(self):
+            trainer.global_step = 6
+
+        async def on_rollout_accepted(self):
+            return None
+
+        async def on_rollout_rejected(self):
+            return None
+
+    class SuccessfulGenerator:
+        async def generate(self, generator_input):
+            prepared["metadata"] = generator_input["batch_metadata"]
+            return {"response_ids": [[]]}
+
+    def fake_prepare(*args):
+        prepared["global_step"] = args[5]
+        prepared["generation_id"] = args[6]
+        return (
+            {
+                "prompts": ["prompt"],
+                "batch_metadata": SimpleNamespace(global_step=args[5], generation_id=args[6]),
+            },
+            ["uid-1"],
+        )
+
+    monkeypatch.setattr(fully_async_trainer_module, "prepare_generator_input", fake_prepare)
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "get_sampling_params_for_backend",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "emit_progress_event",
+        lambda event, **payload: progress_events.append((event, payload)),
+    )
+    monkeypatch.setattr(
+        fully_async_trainer_module,
+        "uuid4",
+        lambda: SimpleNamespace(hex="generation-after-wait"),
+    )
+
+    trainer = SimpleNamespace(
+        async_train_dataloader=OnePromptDataloader(),
+        cfg=SimpleNamespace(
+            generator=SimpleNamespace(
+                n_samples_per_prompt=1,
+                inference_engine=SimpleNamespace(backend="test"),
+                sampling_params=object(),
+            ),
+            environment=SimpleNamespace(env_class="test"),
+        ),
+        _staleness_manager=AdvancingAdmissionManager(),
+        generator=SuccessfulGenerator(),
+        global_step=1,
+    )
+    output = asyncio.Queue(maxsize=1)
+
+    await FullyAsyncRayPPOTrainer._run_generate_for_a_group_loop(trainer, output)
+
+    assert prepared == {
+        "global_step": 6,
+        "generation_id": "generation-after-wait",
+        "metadata": SimpleNamespace(global_step=6, generation_id="generation-after-wait"),
+    }
+    generated = output.get_nowait()
+    assert generated.global_step_when_scheduled == 6
+    assert generated.generation_id == "generation-after-wait"
+    assert [event for event, _ in progress_events] == [
+        "group_scheduled",
+        "group_completed",
+    ]
+    assert all(payload["global_step"] == 6 for _, payload in progress_events)
+    assert all(payload["generation_id"] == "generation-after-wait" for _, payload in progress_events)
 
 
 # --------------------------------------------------------------------------------------

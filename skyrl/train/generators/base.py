@@ -23,6 +23,11 @@ class TrajectoryID:
 class BatchMetadata:
     global_step: int
     training_phase: TrainingPhase
+    # Stable identity for one scheduled generation attempt. Dataset instance
+    # IDs repeat across epochs and ``global_step`` can advance while a fully
+    # async worker waits for admission, so neither is sufficient on its own to
+    # correlate group- and trajectory-level telemetry.
+    generation_id: Optional[str] = None
 
 
 class GeneratorInput(TypedDict):

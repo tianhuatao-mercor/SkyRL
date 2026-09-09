@@ -19,6 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Set, Tuple
+from uuid import uuid4
 
 import torch
 from loguru import logger
@@ -76,6 +77,9 @@ class GeneratedOutputGroup:
             group, one per trajectory (parallel to ``generator_output["response_ids"]``). Retained so
             the trajectory logger can render prompt + response, mirroring the synchronous trainer which
             logs ``generator_input["prompts"]``. None if not captured.
+
+        generation_id (Optional[str]): Immutable identity shared by every
+            lifecycle and trajectory event for this scheduling attempt.
     """
 
     generator_output: GeneratorOutput
@@ -83,6 +87,7 @@ class GeneratedOutputGroup:
     global_step_when_scheduled: int
     group_completion_time_s: Optional[float] = None
     prompts: Optional[List[Any]] = None
+    generation_id: Optional[str] = None
 
 
 @dataclass
@@ -1117,6 +1122,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     emit_progress_event(
                         "group_accepted",
                         global_step=self.global_step,
+                        training_phase="train",
+                        generation_id=group.generation_id,
                         group_uid=group.uid,
                         group_size=len(group.generator_output["response_ids"]),
                         accepted_count=len(kept_groups),
@@ -1134,6 +1141,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         emit_progress_event(
                             "group_accepted",
                             global_step=self.global_step,
+                            training_phase="train",
+                            generation_id=group.generation_id,
                             group_uid=group.uid,
                             group_size=len(group.generator_output["response_ids"]),
                             accepted_count=len(kept_groups),
@@ -1150,6 +1159,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         emit_progress_event(
                             "group_filtered",
                             global_step=self.global_step,
+                            training_phase="train",
+                            generation_id=group.generation_id,
                             group_uid=group.uid,
                             group_size=len(group.generator_output["response_ids"]),
                             filtered_count=len(dropped_groups),
@@ -1238,6 +1249,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         slot_acquired = False
         active_group_uid: str | None = None
         active_group_step: int | None = None
+        active_generation_id: str | None = None
         try:
             while True:
                 # 0. Pull next batch from dataloader. If returns None, then dataloader is exhausted.
@@ -1245,8 +1257,21 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 if rand_prompts is None:
                     return
 
-                # 1. Prepare generator input
+                # 1. Reserve generation capacity before binding the rollout to
+                # a policy step. A worker may wait here across several trainer
+                # updates; preparing BatchMetadata before this wait used to
+                # give trajectory events an older global_step than the matching
+                # group_scheduled/group_completed events.
                 assert len(rand_prompts) == 1
+
+                await self._staleness_manager.acquire_submission_slot()
+                slot_acquired = True
+
+                # 2. Capture one immutable identity and step after admission,
+                # then propagate both through the generator and all lifecycle
+                # events. Dataset UIDs are not unique across epochs.
+                global_step_at_start = self.global_step  # for staleness control
+                generation_id = uuid4().hex
                 generator_input, uids = prepare_generator_input(
                     rand_prompts,
                     self.cfg.generator.n_samples_per_prompt,
@@ -1256,21 +1281,20 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     ),
                     self.cfg.environment.env_class,
                     "train",
-                    self.global_step,
+                    global_step_at_start,
+                    generation_id,
                 )
                 assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
 
-                # 2. Acquire capacity slot.
-                await self._staleness_manager.acquire_submission_slot()
-                slot_acquired = True
-
                 # 3. Generate one rollout group
-                global_step_at_start = self.global_step  # for staleness control
                 active_group_uid = uids[0]
                 active_group_step = global_step_at_start
+                active_generation_id = generation_id
                 emit_progress_event(
                     "group_scheduled",
                     global_step=global_step_at_start,
+                    training_phase="train",
+                    generation_id=generation_id,
                     group_uid=uids[0],
                     group_size=self.cfg.generator.n_samples_per_prompt,
                 )
@@ -1288,6 +1312,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 emit_progress_event(
                     "group_completed",
                     global_step=global_step_at_start,
+                    training_phase="train",
+                    generation_id=generation_id,
                     group_uid=uids[0],
                     group_size=len(cur_generator_output["response_ids"]),
                     duration_s=group_completion_time_s,
@@ -1302,6 +1328,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             global_step_when_scheduled=global_step_at_start,
                             group_completion_time_s=group_completion_time_s,
                             prompts=generator_input["prompts"],
+                            generation_id=generation_id,
                         )
                     )
                 except asyncio.QueueFull:
@@ -1310,11 +1337,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 slot_acquired = False
                 active_group_uid = None
                 active_group_step = None
+                active_generation_id = None
         except Exception:
             if active_group_uid is not None:
                 emit_progress_event(
                     "group_failed",
                     global_step=active_group_step,
+                    training_phase="train",
+                    generation_id=active_generation_id,
                     group_uid=active_group_uid,
                 )
             logger.exception("Generator worker errored out")
