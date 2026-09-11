@@ -1,6 +1,7 @@
+import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -749,3 +750,22 @@ def test_hosted_empty_node_cleanup_does_not_initialize_ray(monkeypatch) -> None:
     )
 
     assert run_on_each_node([], lambda: None) == []
+
+
+def test_sampler_publication_supports_trainer_timing_collection() -> None:
+    """Both trainers collect dispatch timings immediately after publishing weights."""
+    runtime = SimpleNamespace(
+        publish_sampler_weights=AsyncMock(
+            return_value=SimpleNamespace(
+                version=1, snapshot_path="snapshot", sampling_session_id="session", model_path="model"
+            )
+        ),
+    )
+    dispatch = FireworksPolicyDispatch(_cfg(), runtime)
+    timings = {"sync_weights": 12.5}
+    for _ in range(2):
+        asyncio.run(dispatch.save_weights_for_sampler())
+        timings.update(dispatch.get_timing_metrics())
+    assert runtime.publish_sampler_weights.await_count == 2
+    # Preserve measured end-to-end time; unavailable transfer-only telemetry is absent.
+    assert timings == {"sync_weights": 12.5}

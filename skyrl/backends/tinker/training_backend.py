@@ -147,6 +147,14 @@ class TinkerPolicyDispatch:
             identity.model_path or "<ephemeral>",
         )
 
+    def get_timing_metrics(self) -> dict[str, float]:
+        """No transfer-only timing is exposed by this hosted backend.
+
+        The trainer measures end-to-end ``sync_weights`` itself. Omit unavailable
+        dispatch timings rather than reporting a zero or mislabeling publish time.
+        """
+        return {}
+
     def init_weight_sync_state(self, inference_engine_client) -> None:
         if getattr(inference_engine_client, "runtime", None) is not self.runtime:
             raise ValueError("Tinker training and inference adapters must share one runtime")
